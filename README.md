@@ -155,6 +155,38 @@ you can execute the following command. The routes will be automatically deleted 
 sudo ip link del tun0
 ```
 
+## Process-based bypass (breaking loopback-proxy loops)
+
+When the upstream proxy is itself a **local service** (for example another tunnel listening on `127.0.0.1:1080`),
+a global `--setup` tunnel creates a routing loop: the proxy's own outbound traffic to the real servers is captured
+by the TUN's catch-all route and fed straight back into the proxy, forever. `--bypass <IP/CIDR>` only helps when
+the real destinations are known and fixed; it cannot cover the proxy's dynamic, arbitrary upstream connections.
+
+`--bypass-process` solves this the way clash/mihomo's `PROCESS-NAME` rule does. For every new session arriving from
+the TUN, tun2proxy looks up the local process that owns the originating socket and, if its executable name matches,
+relays that session **directly to its destination** instead of forwarding it to the proxy — breaking the loop:
+
+```bash
+# Linux: send everything to a local proxy, but let the proxy's own traffic out directly.
+sudo ./target/release/tun2proxy-bin --setup --proxy "socks5://127.0.0.1:1080" --bypass-process my-proxy
+```
+
+```powershell
+# Windows (run elevated): same idea, match the proxy's executable name.
+tun2proxy-bin.exe --setup --proxy "http://127.0.0.1:8080" --bypass-process my-proxy.exe
+```
+
+Notes:
+
+- The match is on the executable **file name** and is case-insensitive; a trailing `.exe` is ignored, so
+  `--bypass-process curl` matches both `curl` and `curl.exe`. The flag is repeatable.
+- A bypassed session is relayed directly **and** its outbound socket is pinned to the physical network interface
+  (`SO_BINDTODEVICE` on Linux, `IP_UNICAST_IF` on Windows). This is required: otherwise the direct relay would be
+  re-captured by the TUN and the loop would merely move one hop. The interface is auto-detected from the default
+  route; override it with `--bind-interface <name>` if detection picks the wrong one.
+- Only implemented on **Windows and Linux**. On other platforms the flag is accepted but ignored (with a warning).
+- Not compatible with the Linux `--unshare` socket-transfer path; use it with a normal `--setup` run.
+
 ## CLI
 ```
 Tunnel interface to proxy.
@@ -186,6 +218,14 @@ Options:
       --virtual-dns-pool <CIDR>            IP address pool to be used by virtual DNS in CIDR notation [default: 198.18.0.0/15]
   -b, --bypass <IP/CIDR>                   IPs used in routing setup which should bypass the tunnel, in the form of IP or IP/CIDR.
                                            Multiple IPs can be specified, e.g. --bypass 3.4.5.0/24 --bypass 5.6.7.8
+      --bypass-process <PROCESS>           Relay sessions originating from the named local process directly to their destination
+                                           instead of forwarding them to the proxy. The match is on the executable file name
+                                           (case-insensitive), e.g. --bypass-process curl or --bypass-process my-proxy.exe.
+                                           Repeatable. Primarily breaks routing loops when the upstream proxy is a local loopback
+                                           service. Only implemented on Windows and Linux; ignored elsewhere
+      --bind-interface <name>              Physical network interface used to egress process-bypass direct relays. When omitted, the
+                                           default route interface is auto-detected. Only relevant on Windows and Linux
+      --mtu <bytes>                        MTU of the TUN device
       --tcp-timeout <seconds>              TCP timeout in seconds [default: 600]
       --udp-timeout <seconds>              UDP timeout in seconds [default: 10]
   -v, --verbosity <level>                  Verbosity level [default: info] [possible values: off, error, warn, info, debug, trace]

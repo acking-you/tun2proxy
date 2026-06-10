@@ -1,6 +1,6 @@
 [package]
 name = "tun2proxy"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/tun2proxy/tun2proxy"
@@ -63,8 +63,21 @@ jni = { version = "0.22.4", default-features = false }
 [target.'cfg(target_os="linux")'.dependencies]
 bincode-next = "2.1.0"
 
+# Process-based bypass feature (`--bypass-process`): only built on the platforms
+# that implement source-process lookup and physical-interface binding. Keeping
+# these here avoids pulling them (and breaking the build) on iOS/macOS/Android.
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+netdev = "0.44.0"
+netstat2 = "0.11.2"
+socket2 = "0.6.4"
+
 [target.'cfg(target_os="windows")'.dependencies]
 windows-service = "0.8.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5.0"

@@ -47,6 +47,8 @@ pub const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 
 mod android;
 mod args;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod direct;
 mod directions;
 mod dns;
 mod dump_logger;
@@ -54,6 +56,8 @@ mod error;
 mod general_api;
 mod http;
 mod no_proxy;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+mod process;
 mod proxy_handler;
 mod session_info;
 pub mod socket_transfer;
@@ -66,6 +70,17 @@ mod virtual_dns;
 pub mod win_svc;
 
 const DNS_PORT: u16 = 53;
+
+/// Physical interface a process-bypass direct relay egresses through. On
+/// platforms without the feature this is an uninhabited type, so the threaded
+/// `Option<DirectBind>` is always `None` and carries zero cost.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+type DirectBind = Arc<direct::BindInterface>;
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+type DirectBind = std::convert::Infallible;
+
+/// Outcome of constructing a per-session proxy handler.
+type HandlerResult = std::io::Result<Arc<Mutex<dyn ProxyHandler>>>;
 
 #[allow(unused)]
 #[derive(Hash, Copy, Clone, Eq, PartialEq, Debug)]
@@ -130,14 +145,42 @@ impl SocketQueue {
     }
 }
 
-async fn create_tcp_stream(socket_queue: &Option<Arc<SocketQueue>>, peer: SocketAddr) -> std::io::Result<TcpStream> {
+async fn create_tcp_stream(
+    socket_queue: &Option<Arc<SocketQueue>>,
+    peer: SocketAddr,
+    bind: Option<&DirectBind>,
+) -> std::io::Result<TcpStream> {
+    // Process-bypass direct relays must egress through the physical interface so
+    // they are not re-captured by the TUN. This only applies on the normal
+    // (non-socket-transfer) path.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if let Some(iface) = bind {
+        if socket_queue.is_none() {
+            return direct::connect_tcp_bound(peer, iface).await;
+        }
+        log::warn!("process-bypass direct relay is incompatible with socket transfer; using default routing");
+    }
+    let _ = &bind;
     match &socket_queue {
         None => TcpStream::connect(peer).await,
         Some(queue) => queue.recv_tcp(peer.ip().into()).await?.connect(peer).await,
     }
 }
 
-async fn create_udp_stream(socket_queue: &Option<Arc<SocketQueue>>, peer: SocketAddr) -> std::io::Result<UdpStream> {
+async fn create_udp_stream(
+    socket_queue: &Option<Arc<SocketQueue>>,
+    peer: SocketAddr,
+    bind: Option<&DirectBind>,
+) -> std::io::Result<UdpStream> {
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if let Some(iface) = bind {
+        if socket_queue.is_none() {
+            let socket = direct::bind_udp_bound(peer, iface)?;
+            return UdpStream::from_tokio(socket, peer).await;
+        }
+        log::warn!("process-bypass direct relay is incompatible with socket transfer; using default routing");
+    }
+    let _ = &bind;
     match &socket_queue {
         None => {
             let bind_addr = match peer {
@@ -239,6 +282,28 @@ where
         ProxyType::None => Arc::new(NoProxyManager::new()),
     };
 
+    // Process-based bypass: sessions whose originating local process matches
+    // `--bypass-process` are relayed directly to their destination through the
+    // physical interface instead of being forwarded to the proxy.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let (process_matcher, direct_bind, no_proxy_mgr) = match process::ProcessMatcher::new(&args.bypass_process) {
+        Some(matcher) => {
+            let iface = direct::detect(args.bind_interface.as_deref())?;
+            log::info!(
+                "Process bypass enabled for {:?}; direct relays egress via {}",
+                args.bypass_process,
+                iface
+            );
+            let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
+            (Some(Arc::new(matcher)), Some(Arc::new(iface) as DirectBind), Some(no_proxy_mgr))
+        }
+        None => (None, None, None),
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    if !args.bypass_process.is_empty() {
+        log::warn!("--bypass-process is not supported on this platform; ignoring it");
+    }
+
     let mut ipstack_config = ipstack::IpStackConfig::default();
     ipstack_config.mtu(mtu)?;
     let mut tcp_cfg = ipstack::TcpConfig::default();
@@ -297,18 +362,49 @@ where
                 }
                 log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
                 let info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
-                let domain_name = if let Some(virtual_dns) = &virtual_dns {
-                    let mut virtual_dns = virtual_dns.lock().await;
-                    virtual_dns.touch_ip(&tcp.peer_addr().ip());
-                    virtual_dns.resolve_ip(&tcp.peer_addr().ip()).cloned()
-                } else {
-                    None
-                };
-                let proxy_handler = mgr.new_proxy_handler(info, domain_name, false).await?;
+                let mgr = mgr.clone();
                 let socket_queue = socket_queue.clone();
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                let process_matcher = process_matcher.clone();
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                let direct_bind = direct_bind.clone();
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                let no_proxy_mgr = no_proxy_mgr.clone();
+                // The source-process lookup may briefly touch the OS, so the
+                // bypass decision and handler creation run inside the per-session
+                // task rather than on the accept loop.
                 tokio::spawn(async move {
-                    if let Err(err) = handle_tcp_session(tcp, proxy_handler, socket_queue).await {
-                        log::error!("{info} error \"{err}\"");
+                    let domain_name = if let Some(virtual_dns) = &virtual_dns {
+                        let mut virtual_dns = virtual_dns.lock().await;
+                        virtual_dns.touch_ip(&tcp.peer_addr().ip());
+                        virtual_dns.resolve_ip(&tcp.peer_addr().ip()).cloned()
+                    } else {
+                        None
+                    };
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let (handler_result, bind): (HandlerResult, Option<DirectBind>) = {
+                        let bypass = match &process_matcher {
+                            Some(matcher) => matcher.matches(IpProtocol::Tcp, info.src).await,
+                            None => false,
+                        };
+                        match (bypass, &no_proxy_mgr) {
+                            (true, Some(no_proxy_mgr)) => {
+                                (no_proxy_mgr.new_proxy_handler(info, domain_name, false).await, direct_bind.clone())
+                            }
+                            _ => (mgr.new_proxy_handler(info, domain_name, false).await, None),
+                        }
+                    };
+                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                    let (handler_result, bind): (HandlerResult, Option<DirectBind>) =
+                        (mgr.new_proxy_handler(info, domain_name, false).await, None);
+
+                    match handler_result {
+                        Ok(proxy_handler) => {
+                            if let Err(err) = handle_tcp_session(tcp, proxy_handler, socket_queue, bind).await {
+                                log::error!("{info} error \"{err}\"");
+                            }
+                        }
+                        Err(err) => log::error!("{info} failed to create proxy handler: {err}"),
                     }
                     log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
                 });
@@ -382,21 +478,49 @@ where
                     });
                     continue;
                 }
-                match mgr.new_proxy_handler(info, domain_name, true).await {
-                    Ok(proxy_handler) => {
-                        let socket_queue = socket_queue.clone();
-                        tokio::spawn(async move {
-                            let ty = args.proxy.proxy_type;
-                            if let Err(err) = handle_udp_associate_session(udp, ty, proxy_handler, socket_queue, ipv6_enabled).await {
+                let mgr = mgr.clone();
+                let socket_queue = socket_queue.clone();
+                let proxy_type = args.proxy.proxy_type;
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                let process_matcher = process_matcher.clone();
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                let direct_bind = direct_bind.clone();
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                let no_proxy_mgr = no_proxy_mgr.clone();
+                tokio::spawn(async move {
+                    // A bypassed UDP session is relayed raw (no SOCKS5 UDP header
+                    // wrapping), so it is driven as a `None` proxy type.
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let (handler_result, bind, proxy_type): (HandlerResult, Option<DirectBind>, ProxyType) = {
+                        let bypass = match &process_matcher {
+                            Some(matcher) => matcher.matches(IpProtocol::Udp, info.src).await,
+                            None => false,
+                        };
+                        match (bypass, &no_proxy_mgr) {
+                            (true, Some(no_proxy_mgr)) => (
+                                no_proxy_mgr.new_proxy_handler(info, domain_name, true).await,
+                                direct_bind.clone(),
+                                ProxyType::None,
+                            ),
+                            _ => (mgr.new_proxy_handler(info, domain_name, true).await, None, proxy_type),
+                        }
+                    };
+                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                    let (handler_result, bind, proxy_type): (HandlerResult, Option<DirectBind>, ProxyType) =
+                        (mgr.new_proxy_handler(info, domain_name, true).await, None, proxy_type);
+
+                    match handler_result {
+                        Ok(proxy_handler) => {
+                            if let Err(err) =
+                                handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled, bind).await
+                            {
                                 log::info!("Ending {info} with \"{err}\"");
                             }
-                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
-                        });
+                        }
+                        Err(e) => log::error!("Failed to create UDP connection: {e}"),
                     }
-                    Err(e) => {
-                        log::error!("Failed to create UDP connection: {e}");
-                    }
-                }
+                    log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                });
             }
             IpStackStream::UnknownTransport(u) => {
                 let len = u.payload().len();
@@ -460,6 +584,7 @@ async fn handle_tcp_session(
     mut tcp_stack: IpStackTcpStream,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
+    bind: Option<DirectBind>,
 ) -> crate::Result<()> {
     let (session_info, server_addr) = {
         let handler = proxy_handler.lock().await;
@@ -467,7 +592,10 @@ async fn handle_tcp_session(
         (handler.get_session_info(), handler.get_server_addr())
     };
 
-    let mut server = create_tcp_stream(&socket_queue, server_addr).await?;
+    // For a process-bypass session `server_addr` is the original destination and
+    // `bind` pins the egress to the physical interface; otherwise it is the proxy
+    // and `bind` is `None` (normal routing).
+    let mut server = create_tcp_stream(&socket_queue, server_addr, bind.as_ref()).await?;
 
     log::info!("Beginning {session_info}");
 
@@ -523,7 +651,7 @@ async fn handle_udp_gateway_session(
                 }
             }
             None => {
-                let mut tcp_server_stream = create_tcp_stream(&socket_queue, proxy_server_addr).await?;
+                let mut tcp_server_stream = create_tcp_stream(&socket_queue, proxy_server_addr, None).await?;
                 if let Err(e) = handle_proxy_session(&mut tcp_server_stream, proxy_handler).await {
                     return Err(format!("udpgw connection error: {e}").into());
                 }
@@ -628,6 +756,7 @@ async fn handle_udp_associate_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    bind: Option<DirectBind>,
 ) -> crate::Result<()> {
     use socks5_impl::protocol::{Address, StreamOperation, UdpHeader};
 
@@ -645,16 +774,19 @@ async fn handle_udp_associate_session(
 
     // `_server` is meaningful here, it must be alive all the time
     // to ensure that UDP transmission will not be interrupted accidentally.
+    // The bypass path always reports a udp-associate address (its destination),
+    // so the proxy-handshake branch below is only taken for real proxies, where
+    // `bind` is `None`.
     let (_server, udp_addr) = match udp_addr {
         Some(udp_addr) => (None, udp_addr),
         None => {
-            let mut server = create_tcp_stream(&socket_queue, server_addr).await?;
+            let mut server = create_tcp_stream(&socket_queue, server_addr, None).await?;
             let udp_addr = handle_proxy_session(&mut server, proxy_handler).await?;
             (Some(server), udp_addr.ok_or("udp associate failed")?)
         }
     };
 
-    let mut udp_server = create_udp_stream(&socket_queue, udp_addr).await?;
+    let mut udp_server = create_udp_stream(&socket_queue, udp_addr, bind.as_ref()).await?;
 
     let mut buf1 = [0_u8; 4096];
     let mut buf2 = [0_u8; 4096];
@@ -735,7 +867,7 @@ async fn handle_dns_over_tcp_session(
         (handler.get_session_info(), handler.get_server_addr())
     };
 
-    let mut server = create_tcp_stream(&socket_queue, server_addr).await?;
+    let mut server = create_tcp_stream(&socket_queue, server_addr, None).await?;
 
     log::info!("Beginning {session_info}");
 

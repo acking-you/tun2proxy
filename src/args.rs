@@ -104,6 +104,26 @@ pub struct Args {
     #[arg(short, long, value_name = "IP/CIDR")]
     pub bypass: Vec<IpCidr>,
 
+    /// Relay sessions originating from the named local process directly to their
+    /// destination instead of forwarding them to the proxy. The match is on the
+    /// executable file name (case-insensitive), e.g. `--bypass-process curl` or
+    /// `--bypass-process my-proxy.exe`. Repeatable. This is primarily meant to
+    /// break routing loops when the upstream proxy is a local loopback service:
+    /// the proxy's own outbound traffic gets captured by the TUN, and without
+    /// this option it would be fed back into the proxy forever. Only implemented
+    /// on Windows and Linux; ignored elsewhere.
+    #[arg(long, value_name = "PROCESS")]
+    pub bypass_process: Vec<String>,
+
+    /// Physical network interface used to egress process-bypass direct relays
+    /// (see `--bypass-process`). Direct-relayed sockets must leave through the
+    /// real interface, otherwise they are re-captured by the TUN and the loop is
+    /// merely moved one hop. When omitted, the default route interface is
+    /// auto-detected. Only relevant on Windows and Linux.
+    #[arg(long, value_name = "name")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind_interface: Option<String>,
+
     /// MTU of the TUN device. Userspace TCP stack uses (MTU - 40) as the
     /// effective MSS for synthesized segments going to the kernel side, so
     /// lower this when the kernel forwards the traffic onwards through a
@@ -189,6 +209,8 @@ impl Default for Args {
             dns: ArgDns::default(),
             dns_addr: "8.8.8.8".parse().unwrap(),
             bypass: vec![],
+            bypass_process: vec![],
+            bind_interface: None,
             mtu: tun::DEFAULT_MTU,
             tcp_timeout: 600,
             udp_timeout: 10,
