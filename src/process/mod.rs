@@ -1,8 +1,8 @@
 //! Source-process lookup used by the `--bypass-process` feature.
 //!
-//! Given a session whose source address was observed on the TUN device, we map
-//! the `(protocol, local addr, local port)` tuple back to the owning OS process
-//! and compare its executable name against a user-supplied bypass list. This is
+//! Given a session observed on the TUN device, we map its socket endpoints back
+//! to the owning OS process and compare its executable name against a
+//! user-supplied bypass list. This is
 //! the tun2proxy equivalent of clash/mihomo's `PROCESS-NAME` rule and is used to
 //! relay a local loopback proxy's own outbound traffic directly, breaking the
 //! routing loop it would otherwise create.
@@ -10,34 +10,20 @@
 //! Only implemented on Windows and Linux; the module is not compiled elsewhere.
 
 use crate::session_info::IpProtocol;
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Mutex, time::Instant};
 
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
 #[cfg_attr(target_os = "windows", path = "windows.rs")]
 mod imp;
-
-/// How long a socket-table snapshot is proactively reused before it is
-/// refreshed. The OS table walk costs a few milliseconds, so we avoid doing it
-/// on every session while still reacting quickly to newly-spawned connections.
-const SNAPSHOT_TTL: Duration = Duration::from_millis(1_000);
-
-/// On a lookup *miss*, the cached snapshot may simply predate a just-created
-/// socket (the kernel registers the socket at `connect()` time, before the
-/// packet ever reaches the TUN). We then force one extra refresh-and-retry,
-/// but no more often than this, so a flood of genuinely non-matching sessions
-/// cannot turn every lookup into a table walk.
-const MISS_REFRESH_MIN_AGE: Duration = Duration::from_millis(50);
 
 /// One row of the OS socket table relevant to bypass matching.
 #[derive(Debug, Clone)]
 struct SocketEntry {
     protocol: IpProtocol,
     local: SocketAddr,
+    /// TCP needs the complete tuple to distinguish sockets that reuse a local
+    /// port. `netstat2` does not expose a remote endpoint for UDP.
+    remote: Option<SocketAddr>,
     pids: Vec<u32>,
 }
 
@@ -63,6 +49,11 @@ pub(crate) struct ProcessMatcher {
 }
 
 impl ProcessMatcher {
+    /// Whether the supplied list contains at least one usable process name.
+    pub(crate) fn is_configured(names: &[String]) -> bool {
+        names.iter().any(|name| !normalize_name(name).is_empty())
+    }
+
     /// Build a matcher from the raw `--bypass-process` values. Returns `None`
     /// when the list is empty (feature disabled, zero overhead).
     pub(crate) fn new(names: &[String]) -> Option<Self> {
@@ -79,9 +70,14 @@ impl ProcessMatcher {
     /// Returns true if the session originating at `src` belongs to a process in
     /// the bypass list. Runs the (briefly blocking) OS table walk on the
     /// blocking pool so it never stalls the async accept loop.
-    pub(crate) async fn matches(self: &std::sync::Arc<Self>, protocol: IpProtocol, src: SocketAddr) -> bool {
+    pub(crate) async fn matches(self: &std::sync::Arc<Self>, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr) -> bool {
+        // Any snapshot taken after this instant necessarily includes this
+        // socket: the packet has already reached the TUN before lookup starts.
+        // Concurrent lookups can therefore share one refresh without allowing
+        // a time-based stale-cache window.
+        let requested_at = Instant::now();
         let this = self.clone();
-        match tokio::task::spawn_blocking(move || this.matches_blocking(protocol, src)).await {
+        match tokio::task::spawn_blocking(move || this.matches_blocking(protocol, src, dst, requested_at)).await {
             Ok(result) => result,
             Err(err) => {
                 log::warn!("process bypass lookup task failed: {err}");
@@ -90,32 +86,23 @@ impl ProcessMatcher {
         }
     }
 
-    fn matches_blocking(&self, protocol: IpProtocol, src: SocketAddr) -> bool {
+    fn matches_blocking(&self, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr, requested_at: Instant) -> bool {
         let mut cache = match self.cache.lock() {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
         };
-        self.refresh_if_stale(&mut cache);
-        if self.match_in_cache(&mut cache, protocol, src) {
-            return true;
-        }
-        // A miss may just mean our cached table predates this freshly-created
-        // socket. Since misrouting the proxy's own connection re-creates the very
-        // loop this feature prevents, force one bounded refresh and retry.
-        let stale_enough = cache.fetched_at.map(|at| at.elapsed() >= MISS_REFRESH_MIN_AGE).unwrap_or(true);
-        if stale_enough {
+        if !snapshot_covers_request(cache.fetched_at, requested_at) {
             self.refresh(&mut cache);
-            return self.match_in_cache(&mut cache, protocol, src);
         }
-        false
+        self.match_in_cache(&mut cache, protocol, src, dst)
     }
 
     /// Look the session up against the current snapshot, resolving and memoizing
     /// candidate process names. Does not refresh the snapshot.
-    fn match_in_cache(&self, cache: &mut Cache, protocol: IpProtocol, src: SocketAddr) -> bool {
+    fn match_in_cache(&self, cache: &mut Cache, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr) -> bool {
         // Collect candidate PIDs first to avoid borrowing `cache.entries` and
         // `cache.pid_names` simultaneously.
-        let pids = candidate_pids(&cache.entries, protocol, src);
+        let pids = candidate_pids(&cache.entries, protocol, src, dst);
         for pid in pids {
             let name = cache
                 .pid_names
@@ -131,28 +118,31 @@ impl ProcessMatcher {
         false
     }
 
-    fn refresh_if_stale(&self, cache: &mut Cache) {
-        let fresh = cache.fetched_at.map(|at| at.elapsed() < SNAPSHOT_TTL).unwrap_or(false);
-        if !fresh {
-            self.refresh(cache);
-        }
-    }
-
     fn refresh(&self, cache: &mut Cache) {
+        // Timestamp the beginning, not the end, of the table walk. A socket
+        // lookup that starts while the snapshot is being collected may not be
+        // represented in it and must trigger the next refresh.
+        let snapshot_started_at = Instant::now();
         match snapshot() {
             Ok(entries) => {
                 cache.entries = entries;
                 cache.pid_names.clear();
-                cache.fetched_at = Some(Instant::now());
+                cache.fetched_at = Some(snapshot_started_at);
             }
             Err(err) => {
-                // Keep the previous snapshot (if any) rather than failing the
-                // session; log once per refresh attempt.
                 log::warn!("failed to read OS socket table for process bypass: {err}");
-                cache.fetched_at = Some(Instant::now());
+                // Never reuse an older positive match after a refresh failure;
+                // that could leak an unrelated, port-reusing connection direct.
+                cache.entries.clear();
+                cache.pid_names.clear();
+                cache.fetched_at = Some(snapshot_started_at);
             }
         }
     }
+}
+
+fn snapshot_covers_request(fetched_at: Option<Instant>, requested_at: Instant) -> bool {
+    fetched_at.is_some_and(|fetched_at| fetched_at >= requested_at)
 }
 
 /// Take a fresh snapshot of the host TCP/UDP socket tables (IPv4 + IPv6) via
@@ -168,11 +158,20 @@ fn snapshot() -> crate::Result<Vec<SocketEntry>> {
         .into_iter()
         .map(|si| {
             let pids = si.associated_pids;
-            let (protocol, local) = match si.protocol_socket_info {
-                ProtocolSocketInfo::Tcp(tcp) => (IpProtocol::Tcp, SocketAddr::new(tcp.local_addr, tcp.local_port)),
-                ProtocolSocketInfo::Udp(udp) => (IpProtocol::Udp, SocketAddr::new(udp.local_addr, udp.local_port)),
+            let (protocol, local, remote) = match si.protocol_socket_info {
+                ProtocolSocketInfo::Tcp(tcp) => (
+                    IpProtocol::Tcp,
+                    SocketAddr::new(tcp.local_addr, tcp.local_port),
+                    Some(SocketAddr::new(tcp.remote_addr, tcp.remote_port)),
+                ),
+                ProtocolSocketInfo::Udp(udp) => (IpProtocol::Udp, SocketAddr::new(udp.local_addr, udp.local_port), None),
             };
-            SocketEntry { protocol, local, pids }
+            SocketEntry {
+                protocol,
+                local,
+                remote,
+                pids,
+            }
         })
         .collect();
     Ok(entries)
@@ -187,16 +186,20 @@ fn normalize_name(name: &str) -> String {
 
 /// PIDs of the socket(s) that plausibly originated `src`.
 ///
-/// A TCP outbound socket always carries a concrete local IP, so we require an
-/// exact IP+port match and never fall back to a wildcard (`0.0.0.0`/`::`) row —
-/// that avoids matching an unrelated listener that merely shares the port. UDP
-/// table rows often lack a concrete local IP (Windows reports `0.0.0.0` for
-/// connected client sockets), so for UDP we prefer a concrete-IP match but fall
-/// back to unspecified-IP rows on the same port when none is found.
-fn candidate_pids(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr) -> Vec<u32> {
+/// TCP requires the complete local+remote tuple and never falls back to a
+/// wildcard (`0.0.0.0`/`::`) row. UDP table rows often lack a concrete local IP
+/// (Windows reports `0.0.0.0` for connected client sockets), so for UDP we
+/// prefer a concrete-IP match but fall back to unspecified-IP rows on the same
+/// port when none is found.
+fn candidate_pids(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr, dst: SocketAddr) -> Vec<u32> {
     let concrete: Vec<u32> = entries
         .iter()
-        .filter(|e| e.protocol == protocol && e.local.port() == src.port() && e.local.ip() == src.ip())
+        .filter(|e| {
+            e.protocol == protocol
+                && e.local.port() == src.port()
+                && e.local.ip() == src.ip()
+                && (protocol == IpProtocol::Udp || e.remote == Some(dst))
+        })
         .flat_map(|e| e.pids.iter().copied())
         .collect();
     if !concrete.is_empty() || protocol != IpProtocol::Udp {
@@ -213,6 +216,21 @@ fn candidate_pids(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
+
+    #[test]
+    fn snapshot_must_start_after_the_lookup_request() {
+        let requested_at = Instant::now();
+        assert!(!snapshot_covers_request(None, requested_at));
+        assert!(!snapshot_covers_request(
+            Some(requested_at - Duration::from_millis(1)),
+            requested_at
+        ));
+        assert!(snapshot_covers_request(
+            requested_at.checked_add(Duration::from_millis(1)),
+            requested_at
+        ));
+    }
 
     #[test]
     fn normalize_name_is_case_and_extension_insensitive() {
@@ -230,10 +248,27 @@ mod tests {
         assert_eq!(matcher.names, vec!["curl".to_string(), "wget".to_string()]);
     }
 
-    fn entry(protocol: IpProtocol, ip: std::net::IpAddr, port: u16, pid: u32) -> SocketEntry {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matcher_resolves_a_live_tcp_socket_owner() {
+        let process_name = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        let matcher = std::sync::Arc::new(ProcessMatcher::new(&[process_name]).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(destination).await.unwrap();
+        let (_server, _) = listener.accept().await.unwrap();
+
+        assert!(
+            matcher
+                .matches(IpProtocol::Tcp, client.local_addr().unwrap(), client.peer_addr().unwrap())
+                .await
+        );
+    }
+
+    fn entry(protocol: IpProtocol, ip: std::net::IpAddr, port: u16, remote: Option<SocketAddr>, pid: u32) -> SocketEntry {
         SocketEntry {
             protocol,
             local: SocketAddr::new(ip, port),
+            remote,
             pids: vec![pid],
         }
     }
@@ -241,39 +276,49 @@ mod tests {
     #[test]
     fn tcp_candidate_requires_exact_ip_and_port() {
         let src = SocketAddr::new(Ipv4Addr::new(198, 18, 0, 1).into(), 5000);
+        let dst = SocketAddr::new(Ipv4Addr::new(203, 0, 113, 10).into(), 443);
         let entries = vec![
             // Exact match -> selected.
-            entry(IpProtocol::Tcp, src.ip(), 5000, 11),
+            entry(IpProtocol::Tcp, src.ip(), 5000, Some(dst), 11),
             // Wildcard listener on the same port -> must NOT be selected for TCP.
-            entry(IpProtocol::Tcp, Ipv4Addr::UNSPECIFIED.into(), 5000, 22),
+            entry(IpProtocol::Tcp, Ipv4Addr::UNSPECIFIED.into(), 5000, None, 22),
             // Same port, different concrete ip -> not selected.
-            entry(IpProtocol::Tcp, Ipv4Addr::new(10, 0, 0, 1).into(), 5000, 33),
+            entry(IpProtocol::Tcp, Ipv4Addr::new(10, 0, 0, 1).into(), 5000, Some(dst), 33),
+            // Same local endpoint, different remote -> not selected.
+            entry(
+                IpProtocol::Tcp,
+                src.ip(),
+                5000,
+                Some(SocketAddr::new(Ipv4Addr::new(203, 0, 113, 20).into(), 443)),
+                34,
+            ),
             // Right ip+port but UDP -> protocol mismatch.
-            entry(IpProtocol::Udp, src.ip(), 5000, 44),
+            entry(IpProtocol::Udp, src.ip(), 5000, None, 44),
         ];
-        assert_eq!(candidate_pids(&entries, IpProtocol::Tcp, src), vec![11]);
+        assert_eq!(candidate_pids(&entries, IpProtocol::Tcp, src, dst), vec![11]);
         // A pure wildcard listener never matches a TCP session.
-        let wildcard_only = vec![entry(IpProtocol::Tcp, Ipv4Addr::UNSPECIFIED.into(), 5000, 22)];
-        assert!(candidate_pids(&wildcard_only, IpProtocol::Tcp, src).is_empty());
+        let wildcard_only = vec![entry(IpProtocol::Tcp, Ipv4Addr::UNSPECIFIED.into(), 5000, None, 22)];
+        assert!(candidate_pids(&wildcard_only, IpProtocol::Tcp, src, dst).is_empty());
     }
 
     #[test]
     fn udp_candidate_prefers_concrete_then_falls_back_to_wildcard() {
         let src = SocketAddr::new(Ipv4Addr::new(198, 18, 0, 1).into(), 5300);
+        let dst = SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53);
         // Concrete-IP row is preferred and the wildcard row is ignored when present.
         let with_concrete = vec![
-            entry(IpProtocol::Udp, src.ip(), 5300, 11),
-            entry(IpProtocol::Udp, Ipv4Addr::UNSPECIFIED.into(), 5300, 22),
+            entry(IpProtocol::Udp, src.ip(), 5300, None, 11),
+            entry(IpProtocol::Udp, Ipv4Addr::UNSPECIFIED.into(), 5300, None, 22),
         ];
-        assert_eq!(candidate_pids(&with_concrete, IpProtocol::Udp, src), vec![11]);
+        assert_eq!(candidate_pids(&with_concrete, IpProtocol::Udp, src, dst), vec![11]);
         // Windows-style: only a 0.0.0.0/[::] row exists for a connected UDP client.
         let wildcard_only = vec![
-            entry(IpProtocol::Udp, Ipv4Addr::UNSPECIFIED.into(), 5300, 22),
-            entry(IpProtocol::Udp, Ipv6Addr::UNSPECIFIED.into(), 5300, 23),
+            entry(IpProtocol::Udp, Ipv4Addr::UNSPECIFIED.into(), 5300, None, 22),
+            entry(IpProtocol::Udp, Ipv6Addr::UNSPECIFIED.into(), 5300, None, 23),
         ];
-        let pids = candidate_pids(&wildcard_only, IpProtocol::Udp, src);
+        let pids = candidate_pids(&wildcard_only, IpProtocol::Udp, src, dst);
         assert!(pids.contains(&22) && pids.contains(&23));
         // Different port never matches.
-        assert!(candidate_pids(&wildcard_only, IpProtocol::Udp, SocketAddr::new(src.ip(), 5301)).is_empty());
+        assert!(candidate_pids(&wildcard_only, IpProtocol::Udp, SocketAddr::new(src.ip(), 5301), dst).is_empty());
     }
 }

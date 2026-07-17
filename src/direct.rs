@@ -17,28 +17,80 @@ use tokio::net::TcpStream;
 /// The physical interface direct relays egress through.
 #[derive(Debug, Clone)]
 pub(crate) struct BindInterface {
-    /// Interface index, used by Windows `IP_UNICAST_IF`/`IPV6_UNICAST_IF`.
-    pub index: u32,
+    /// IPv4 interface index, used by Windows `IP_UNICAST_IF`.
+    pub ipv4_index: u32,
+    /// IPv6 interface index, used by Windows `IPV6_UNICAST_IF`.
+    pub ipv6_index: u32,
     /// Interface name, used by Linux `SO_BINDTODEVICE`.
     pub name: String,
 }
 
 impl std::fmt::Display for BindInterface {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{} (index {})", self.name, self.index)
+        write!(f, "{} (IPv4 index {}, IPv6 index {})", self.name, self.ipv4_index, self.ipv6_index)
     }
 }
 
 impl BindInterface {
     fn from_netdev(iface: netdev::Interface) -> crate::Result<Self> {
-        if iface.index == 0 {
+        #[cfg(target_os = "windows")]
+        let (ipv4_index, ipv6_index) = windows_interface_indices(&iface)?;
+        #[cfg(target_os = "linux")]
+        let (ipv4_index, ipv6_index) = (iface.index, iface.index);
+
+        if ipv4_index == 0 && ipv6_index == 0 {
             return Err(format!("network interface `{}` has an invalid index 0", iface.name).into());
         }
         Ok(Self {
-            index: iface.index,
+            ipv4_index,
+            ipv6_index,
             name: iface.name,
         })
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_interface_indices(iface: &netdev::Interface) -> std::io::Result<(u32, u32)> {
+    use std::ffi::CStr;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS},
+        NetworkManagement::IpHelper::{GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH},
+        Networking::WinSock::AF_UNSPEC,
+    };
+
+    let mut size = 0_u32;
+    let result = unsafe { GetAdaptersAddresses(AF_UNSPEC as u32, 0, std::ptr::null(), std::ptr::null_mut(), &mut size) };
+    if result != ERROR_BUFFER_OVERFLOW {
+        return Err(std::io::Error::from_raw_os_error(result as i32));
+    }
+
+    let word_size = std::mem::size_of::<usize>();
+    let mut storage = vec![0_usize; (size as usize).div_ceil(word_size)];
+    let addresses = storage.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    let result = unsafe { GetAdaptersAddresses(AF_UNSPEC as u32, 0, std::ptr::null(), addresses, &mut size) };
+    if result != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(result as i32));
+    }
+
+    let mut current = addresses;
+    while !current.is_null() {
+        let adapter = unsafe { &*current };
+        let ipv4_index = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
+        let adapter_name = if adapter.AdapterName.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(adapter.AdapterName.cast()) }.to_string_lossy())
+        };
+        if (iface.index != 0 && ipv4_index == iface.index) || adapter_name.as_deref() == Some(iface.name.as_str()) {
+            return Ok((ipv4_index, adapter.Ipv6IfIndex));
+        }
+        current = adapter.Next;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("network interface `{}` was not found by GetAdaptersAddresses", iface.name),
+    ))
 }
 
 /// Resolve the interface used for direct relays: an explicit `--bind-interface`
@@ -93,9 +145,21 @@ fn apply_device_bind(socket: &Socket, peer: SocketAddr, iface: &BindInterface) -
     // IP_UNICAST_IF takes the interface index in network byte order for IPv4 but
     // host byte order for IPv6 — a well-known Win32 asymmetry.
     let (level, optname, value) = if peer.is_ipv4() {
-        (IPPROTO_IP, IP_UNICAST_IF, iface.index.to_be())
+        if iface.ipv4_index == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("interface `{}` has no IPv4 index", iface.name),
+            ));
+        }
+        (IPPROTO_IP, IP_UNICAST_IF, iface.ipv4_index.to_be())
     } else {
-        (IPPROTO_IPV6, IPV6_UNICAST_IF, iface.index)
+        if iface.ipv6_index == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("interface `{}` has no IPv6 index", iface.name),
+            ));
+        }
+        (IPPROTO_IPV6, IPV6_UNICAST_IF, iface.ipv6_index)
     };
     // SAFETY: `value` is a live `u32` for the duration of the call and `optlen`
     // matches its size; `raw` is this socket's valid handle.

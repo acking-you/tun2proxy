@@ -374,18 +374,24 @@ where
                 // bypass decision and handler creation run inside the per-session
                 // task rather than on the accept loop.
                 tokio::spawn(async move {
-                    let domain_name = if let Some(virtual_dns) = &virtual_dns {
-                        let mut virtual_dns = virtual_dns.lock().await;
-                        virtual_dns.touch_ip(&tcp.peer_addr().ip());
-                        virtual_dns.resolve_ip(&tcp.peer_addr().ip()).cloned()
-                    } else {
-                        None
-                    };
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let (handler_result, bind): (HandlerResult, Option<DirectBind>) = {
+                        let mut info = info;
                         let bypass = match &process_matcher {
-                            Some(matcher) => matcher.matches(IpProtocol::Tcp, info.src).await,
+                            Some(matcher) => matcher.matches(IpProtocol::Tcp, info.src, info.dst).await,
                             None => false,
+                        };
+                        if bypass && info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
+                            info.dst.set_ip(dns_addr);
+                        }
+                        let domain_name = if bypass {
+                            None
+                        } else if let Some(virtual_dns) = &virtual_dns {
+                            let mut virtual_dns = virtual_dns.lock().await;
+                            virtual_dns.touch_ip(&info.dst.ip());
+                            virtual_dns.resolve_ip(&info.dst.ip()).cloned()
+                        } else {
+                            None
                         };
                         match (bypass, &no_proxy_mgr) {
                             (true, Some(no_proxy_mgr)) => {
@@ -395,8 +401,16 @@ where
                         }
                     };
                     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-                    let (handler_result, bind): (HandlerResult, Option<DirectBind>) =
-                        (mgr.new_proxy_handler(info, domain_name, false).await, None);
+                    let (handler_result, bind): (HandlerResult, Option<DirectBind>) = {
+                        let domain_name = if let Some(virtual_dns) = &virtual_dns {
+                            let mut virtual_dns = virtual_dns.lock().await;
+                            virtual_dns.touch_ip(&info.dst.ip());
+                            virtual_dns.resolve_ip(&info.dst.ip()).cloned()
+                        } else {
+                            None
+                        };
+                        (mgr.new_proxy_handler(info, domain_name, false).await, None)
+                    };
 
                     match handler_result {
                         Ok(proxy_handler) => {
@@ -419,105 +433,95 @@ where
                     continue;
                 }
                 log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
-                let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
-                if info.dst.port() == DNS_PORT {
-                    if is_private_ip(info.dst.ip()) {
-                        info.dst.set_ip(dns_addr); // !!! Here we change the destination address to remote DNS server!!!
-                    }
-                    if args.dns == ArgDns::OverTcp {
-                        info.protocol = IpProtocol::Tcp;
-                        let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
-                        let socket_queue = socket_queue.clone();
-                        tokio::spawn(async move {
-                            if let Err(err) = handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled).await {
-                                log::error!("{info} error \"{err}\"");
-                            }
-                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
-                        });
-                        continue;
-                    }
-                    if args.dns == ArgDns::Virtual {
-                        tokio::spawn(async move {
-                            if let Some(virtual_dns) = virtual_dns {
-                                if let Err(err) = handle_virtual_dns_session(udp, virtual_dns).await {
-                                    log::error!("{info} error \"{err}\"");
-                                }
-                            }
-                            log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
-                        });
-                        continue;
-                    }
-                    assert_eq!(args.dns, ArgDns::Direct);
-                }
-                let domain_name = if let Some(virtual_dns) = &virtual_dns {
-                    let mut virtual_dns = virtual_dns.lock().await;
-                    virtual_dns.touch_ip(&udp.peer_addr().ip());
-                    virtual_dns.resolve_ip(&udp.peer_addr().ip()).cloned()
-                } else {
-                    None
-                };
-                #[cfg(feature = "udpgw")]
-                if let Some(udpgw) = udpgw_client.clone() {
-                    let tcp_src = match udp.peer_addr() {
-                        SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-                        SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
-                    };
-                    let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
-                    let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
-                    let queue = socket_queue.clone();
-                    tokio::spawn(async move {
-                        let dst = info.dst; // real UDP destination address
-                        let dst_addr = match domain_name {
-                            Some(ref d) => socks5_impl::protocol::Address::from((d.clone(), dst.port())),
-                            None => dst.into(),
-                        };
-                        if let Err(e) = handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, queue, ipv6_enabled).await {
-                            log::info!("Ending {info} with \"{e}\"");
-                        }
-                        log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
-                    });
-                    continue;
-                }
                 let mgr = mgr.clone();
                 let socket_queue = socket_queue.clone();
                 let proxy_type = args.proxy.proxy_type;
+                let dns = args.dns;
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 let process_matcher = process_matcher.clone();
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 let direct_bind = direct_bind.clone();
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 let no_proxy_mgr = no_proxy_mgr.clone();
+                #[cfg(feature = "udpgw")]
+                let udpgw_client = udpgw_client.clone();
                 tokio::spawn(async move {
-                    // A bypassed UDP session is relayed raw (no SOCKS5 UDP header
-                    // wrapping), so it is driven as a `None` proxy type.
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
-                    let (handler_result, bind, proxy_type): (HandlerResult, Option<DirectBind>, ProxyType) = {
+                    let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
+                    let result: crate::Result<()> = async {
+                        // Decide process bypass before DNS or UdpGW handling. A
+                        // bypassed process must see real DNS answers and raw UDP;
+                        // otherwise its own traffic can recurse through the local
+                        // proxy or attempt to connect to a virtual-DNS fake IP.
+                        #[cfg(any(target_os = "windows", target_os = "linux"))]
                         let bypass = match &process_matcher {
-                            Some(matcher) => matcher.matches(IpProtocol::Udp, info.src).await,
+                            Some(matcher) => matcher.matches(IpProtocol::Udp, info.src, info.dst).await,
                             None => false,
                         };
-                        match (bypass, &no_proxy_mgr) {
-                            (true, Some(no_proxy_mgr)) => (
-                                no_proxy_mgr.new_proxy_handler(info, domain_name, true).await,
-                                direct_bind.clone(),
-                                ProxyType::None,
-                            ),
-                            _ => (mgr.new_proxy_handler(info, domain_name, true).await, None, proxy_type),
-                        }
-                    };
-                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-                    let (handler_result, bind, proxy_type): (HandlerResult, Option<DirectBind>, ProxyType) =
-                        (mgr.new_proxy_handler(info, domain_name, true).await, None, proxy_type);
 
-                    match handler_result {
-                        Ok(proxy_handler) => {
-                            if let Err(err) =
-                                handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled, bind).await
-                            {
-                                log::info!("Ending {info} with \"{err}\"");
+                        #[cfg(any(target_os = "windows", target_os = "linux"))]
+                        if bypass {
+                            if info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
+                                info.dst.set_ip(dns_addr);
                             }
+                            let no_proxy_mgr = no_proxy_mgr.as_ref().ok_or("process bypass manager is unavailable")?;
+                            let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
+                            return handle_udp_associate_session(
+                                udp,
+                                ProxyType::None,
+                                proxy_handler,
+                                socket_queue,
+                                ipv6_enabled,
+                                direct_bind,
+                            )
+                            .await;
                         }
-                        Err(e) => log::error!("Failed to create UDP connection: {e}"),
+
+                        if info.dst.port() == DNS_PORT {
+                            if is_private_ip(info.dst.ip()) {
+                                info.dst.set_ip(dns_addr);
+                            }
+                            if dns == ArgDns::OverTcp {
+                                info.protocol = IpProtocol::Tcp;
+                                let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
+                                return handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled).await;
+                            }
+                            if dns == ArgDns::Virtual {
+                                let virtual_dns = virtual_dns.ok_or("virtual DNS manager is unavailable")?;
+                                return handle_virtual_dns_session(udp, virtual_dns).await;
+                            }
+                            assert_eq!(dns, ArgDns::Direct);
+                        }
+
+                        let domain_name = if let Some(virtual_dns) = &virtual_dns {
+                            let mut virtual_dns = virtual_dns.lock().await;
+                            virtual_dns.touch_ip(&info.dst.ip());
+                            virtual_dns.resolve_ip(&info.dst.ip()).cloned()
+                        } else {
+                            None
+                        };
+
+                        #[cfg(feature = "udpgw")]
+                        if let Some(udpgw) = udpgw_client {
+                            let tcp_src = match info.dst {
+                                SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+                                SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+                            };
+                            let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
+                            let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
+                            let dst_addr = match domain_name {
+                                Some(ref domain) => socks5_impl::protocol::Address::from((domain.clone(), info.dst.port())),
+                                None => info.dst.into(),
+                            };
+                            return handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, socket_queue, ipv6_enabled).await;
+                        }
+
+                        let proxy_handler = mgr.new_proxy_handler(info, domain_name, true).await?;
+                        handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled, None).await
+                    }
+                    .await;
+
+                    if let Err(err) = result {
+                        log::info!("Ending {info} with \"{err}\"");
                     }
                     log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
                 });

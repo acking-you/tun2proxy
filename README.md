@@ -181,9 +181,12 @@ Notes:
 - The match is on the executable **file name** and is case-insensitive; a trailing `.exe` is ignored, so
   `--bypass-process curl` matches both `curl` and `curl.exe`. The flag is repeatable.
 - A bypassed session is relayed directly **and** its outbound socket is pinned to the physical network interface
-  (`SO_BINDTODEVICE` on Linux, `IP_UNICAST_IF` on Windows). This is required: otherwise the direct relay would be
-  re-captured by the TUN and the loop would merely move one hop. The interface is auto-detected from the default
-  route; override it with `--bind-interface <name>` if detection picks the wrong one.
+  (`SO_BINDTODEVICE` on Linux, `IP_UNICAST_IF`/`IPV6_UNICAST_IF` on Windows). This is required: otherwise the relay
+  would be re-captured by the TUN and the loop would merely move one hop. The interface is auto-detected from the
+  default route before `--setup` installs the TUN routes; override it with `--bind-interface <name>` if detection
+  picks the wrong one.
+- Process bypass takes precedence over virtual/over-TCP DNS and UdpGW handling. In particular, DNS requests from a
+  bypassed process are sent directly so the process receives real addresses rather than virtual-DNS fake IPs.
 - Only implemented on **Windows and Linux**. On other platforms the flag is accepted but ignored (with a warning).
 - Not compatible with the Linux `--unshare` socket-transfer path; use it with a normal `--setup` run.
 

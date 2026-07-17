@@ -96,6 +96,19 @@ pub async fn general_run_async(
     _packet_information: bool,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<usize> {
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let mut args = args;
+
+    // Resolve the physical egress before `tproxy_setup` installs the TUN
+    // catch-all routes. Re-resolving the default interface afterwards would
+    // select the TUN itself and send direct relays back into the tunnel.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if crate::process::ProcessMatcher::is_configured(&args.bypass_process) {
+        let iface = crate::direct::detect(args.bind_interface.as_deref()).map_err(std::io::Error::from)?;
+        log::info!("Process-bypass physical interface selected before route setup: {iface}");
+        args.bind_interface = Some(iface.name);
+    }
+
     let mut tun_config = tun::Configuration::default();
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
