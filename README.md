@@ -92,10 +92,26 @@ cargo install tun2proxy
 > It's `%USERPROFILE%\.cargo\bin` by default.
 
 ## Setup
+
+For a local HTTP or SOCKS5 proxy listening on a loopback address, see the
+[local proxy to TUN setup guide (Simplified Chinese)](docs/local-proxy-tun-setup.zh-CN.md).
+
 ## Automated Setup
 Using `--setup`, you can have tun2proxy configure your system to automatically route all traffic through the
 specified proxy. This requires running the tool as root and will roughly perform the steps outlined in the section
 describing the manual setup, except that a bind mount is used to overlay the `/etc/resolv.conf` file.
+
+On Windows, the executable detects an unelevated `--setup` run and relaunches itself through the UAC prompt while
+preserving all command-line arguments, the working directory, and the current console. It does not open another console
+window, so an administrator terminal does not need to be opened in advance. Linux and macOS users must still start the
+command with the required privileges.
+
+Windows auto-elevation is intended for interactive console sessions. The unelevated launcher remains alive while the
+elevated child runs, so two `tun2proxy-bin.exe` processes are expected. The child reconnects its standard streams to the
+original console; as a result, output redirection or pipelines may not be preserved. Headless launches, scheduled tasks,
+and Windows services should be configured to run with the required privileges directly instead of relying on interactive
+UAC. Keep the original terminal open and use `Ctrl+C` for normal route cleanup; a forced termination can leave setup
+changes behind.
 
 You would then run the tool as follows:
 ```bash
@@ -214,8 +230,9 @@ Options:
       --unshare-pidfile <UNSHARE_PIDFILE>  Create a pidfile of `unshare` process when using `--unshare`
   -6, --ipv6-enabled                       IPv6 enabled
   -s, --setup                              Routing and system setup, which decides whether to setup the routing and system
-                                           configuration. This option requires root-like privileges on every platform.
-                                           It is very important on Linux, see `capabilities(7)`
+                                           configuration. This option requires root-like privileges on every platform. The
+                                           Windows binary automatically requests elevation through UAC when necessary. It is
+                                           very important on Linux, see `capabilities(7)`
   -d, --dns <strategy>                     DNS handling strategy [default: direct] [possible values: virtual, over-tcp, direct]
       --dns-addr <IP>                      DNS resolver address [default: 8.8.8.8]
       --virtual-dns-pool <CIDR>            IP address pool to be used by virtual DNS in CIDR notation [default: 198.18.0.0/15]

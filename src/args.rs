@@ -81,10 +81,18 @@ pub struct Args {
     pub ipv6_enabled: bool,
 
     /// Routing and system setup, which decides whether to setup the routing and system configuration.
-    /// This option requires root-like privileges on every platform.
+    /// This option requires root-like privileges on every platform. The Windows
+    /// binary automatically requests elevation through UAC when necessary.
     /// It is very important on Linux, see `capabilities(7)`.
     #[arg(short, long)]
     pub setup: bool,
+
+    /// Internal console owner used while a Windows child is elevating.
+    #[cfg(windows)]
+    #[doc(hidden)]
+    #[arg(long, hide = true, value_name = "PID")]
+    #[serde(skip)]
+    pub elevated_console_pid: Option<u32>,
 
     /// DNS handling strategy
     #[arg(short, long, value_name = "strategy", value_enum, default_value = "direct")]
@@ -206,6 +214,8 @@ impl Default for Args {
             admin_command: Vec::new(),
             ipv6_enabled: false,
             setup,
+            #[cfg(windows)]
+            elevated_console_pid: None,
             dns: ArgDns::default(),
             dns_addr: "8.8.8.8".parse().unwrap(),
             bypass: vec![],

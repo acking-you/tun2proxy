@@ -1,8 +1,23 @@
 use tun2proxy::{ArgVerbosity, Args, BoxError};
 
+#[cfg(windows)]
+mod windows_elevation;
+
 fn main() -> Result<(), BoxError> {
     dotenvy::dotenv().ok();
     let args = Args::parse_args();
+
+    #[cfg(windows)]
+    if let Some(parent_pid) = args.elevated_console_pid {
+        windows_elevation::attach_to_parent_console(parent_pid)?;
+    }
+
+    #[cfg(windows)]
+    if args.setup {
+        if let Some(exit_code) = windows_elevation::relaunch_if_needed()? {
+            std::process::exit(exit_code as i32);
+        }
+    }
 
     #[cfg(unix)]
     if args.daemonize {
