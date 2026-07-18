@@ -68,6 +68,8 @@ mod dump_logger;
 mod error;
 mod general_api;
 mod http;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+mod network_config;
 mod no_proxy;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod process;
@@ -86,6 +88,8 @@ pub mod win_svc;
 #[doc(hidden)]
 #[path = "bin/windows_elevation/mod.rs"]
 pub mod windows_elevation;
+#[cfg(windows)]
+mod windows_network_config;
 
 const DNS_PORT: u16 = 53;
 
@@ -327,6 +331,12 @@ where
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
     let ipv6_enabled = args.ipv6_enabled;
+    // Keep every task created by this forwarding instance under one owner.
+    // Dropping a bare tokio JoinHandle detaches its task, which previously let
+    // old TCP/UDP sessions survive a TUN stop or hot switch. JoinSet aborts all
+    // remaining children on drop and also lets normal shutdown await their
+    // cancellation before route and DNS teardown begins.
+    let mut managed_tasks = tokio::task::JoinSet::new();
     let virtual_dns = if args.dns == ArgDns::Virtual {
         Some(match virtual_dns_state {
             Some(state) => state.resolver(),
@@ -335,56 +345,6 @@ where
     } else {
         None
     };
-
-    #[cfg(target_os = "linux")]
-    let socket_queue = match args.socket_transfer_fd {
-        None => None,
-        Some(fd) => {
-            use crate::socket_transfer::{reconstruct_socket, reconstruct_transfer_socket, request_sockets};
-            use tokio::sync::mpsc::channel;
-
-            let fd = reconstruct_socket(fd)?;
-            let socket = reconstruct_transfer_socket(fd)?;
-            let socket = Arc::new(Mutex::new(socket));
-
-            macro_rules! create_socket_queue {
-                ($domain:ident) => {{
-                    const SOCKETS_PER_REQUEST: usize = 64;
-
-                    let socket = socket.clone();
-                    let (tx, rx) = channel(SOCKETS_PER_REQUEST);
-                    tokio::spawn(async move {
-                        loop {
-                            let sockets =
-                                match request_sockets(socket.lock().await, SocketDomain::$domain, SOCKETS_PER_REQUEST as u32).await {
-                                    Ok(sockets) => sockets,
-                                    Err(err) => {
-                                        log::warn!("Socket allocation request failed: {err}");
-                                        continue;
-                                    }
-                                };
-                            for s in sockets {
-                                if let Err(_) = tx.send(s).await {
-                                    return;
-                                }
-                            }
-                        }
-                    });
-                    Mutex::new(rx)
-                }};
-            }
-
-            Some(Arc::new(SocketQueue {
-                tcp_v4: create_socket_queue!(IpV4),
-                tcp_v6: create_socket_queue!(IpV6),
-                udp_v4: create_socket_queue!(IpV4),
-                udp_v6: create_socket_queue!(IpV6),
-            }))
-        }
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let socket_queue = None;
 
     use socks5_impl::protocol::Version::{V4, V5};
     let mgr: Arc<dyn ProxyHandlerManager> = match args.proxy.proxy_type {
@@ -425,6 +385,59 @@ where
 
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, device);
 
+    // Delay spawning socket-transfer producers until all fallible forwarding
+    // initialization above has succeeded. From this point onward every return
+    // path goes through the common JoinSet drain below.
+    #[cfg(target_os = "linux")]
+    let socket_queue = match args.socket_transfer_fd {
+        None => None,
+        Some(fd) => {
+            use crate::socket_transfer::{reconstruct_socket, reconstruct_transfer_socket, request_sockets};
+            use tokio::sync::mpsc::channel;
+
+            let fd = reconstruct_socket(fd)?;
+            let socket = reconstruct_transfer_socket(fd)?;
+            let socket = Arc::new(Mutex::new(socket));
+
+            macro_rules! create_socket_queue {
+                ($domain:ident) => {{
+                    const SOCKETS_PER_REQUEST: usize = 64;
+
+                    let socket = socket.clone();
+                    let (tx, rx) = channel(SOCKETS_PER_REQUEST);
+                    managed_tasks.spawn(async move {
+                        loop {
+                            let sockets =
+                                match request_sockets(socket.lock().await, SocketDomain::$domain, SOCKETS_PER_REQUEST as u32).await {
+                                    Ok(sockets) => sockets,
+                                    Err(err) => {
+                                        log::warn!("Socket allocation request failed: {err}");
+                                        continue;
+                                    }
+                                };
+                            for s in sockets {
+                                if tx.send(s).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                    Mutex::new(rx)
+                }};
+            }
+
+            Some(Arc::new(SocketQueue {
+                tcp_v4: create_socket_queue!(IpV4),
+                tcp_v6: create_socket_queue!(IpV6),
+                udp_v4: create_socket_queue!(IpV4),
+                udp_v6: create_socket_queue!(IpV6),
+            }))
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let socket_queue = None;
+
     #[cfg(feature = "udpgw")]
     let udpgw_client = args.udpgw_server.map(|addr| {
         log::info!("UDP Gateway enabled, server: {addr}");
@@ -438,7 +451,7 @@ where
         ));
         let client_keepalive = client.clone();
         let shutdown_clone = shutdown_token.clone();
-        tokio::spawn(async move {
+        managed_tasks.spawn(async move {
             if let Err(err) = client_keepalive.heartbeat_task(shutdown_clone).await {
                 log::error!("UDP Gateway heartbeat task error: {err}");
             }
@@ -449,16 +462,30 @@ where
     let task_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     use std::sync::atomic::Ordering::Relaxed;
 
-    loop {
+    let forwarding_result: crate::Result<()> = loop {
+        // JoinSet keeps completed task outputs until they are observed. Reap
+        // them continuously so a long-lived TUN with many short connections
+        // does not accumulate completed task records.
+        while let Some(result) = managed_tasks.try_join_next() {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                log::error!("Managed TUN child task failed: {error}");
+            }
+        }
+
         let task_count = task_count.clone();
         let virtual_dns = virtual_dns.clone();
         let ip_stack_stream = tokio::select! {
             _ = shutdown_token.cancelled() => {
                 log::info!("Shutdown received");
-                break;
+                break Ok(());
             }
             ip_stack_stream = ip_stack.accept() => {
-                ip_stack_stream?
+                match ip_stack_stream {
+                    Ok(stream) => stream,
+                    Err(error) => break Err(error.into()),
+                }
             }
         };
         let max_sessions = args.max_sessions;
@@ -467,7 +494,7 @@ where
                 if task_count.load(Relaxed) >= max_sessions {
                     if args.exit_on_fatal_error {
                         log::info!("Too many sessions that over {max_sessions}, exiting...");
-                        break;
+                        break Ok(());
                     }
                     log::warn!("Too many sessions that over {max_sessions}, dropping new session");
                     continue;
@@ -485,7 +512,7 @@ where
                 // The source-process lookup may briefly touch the OS, so the
                 // bypass decision and handler creation run inside the per-session
                 // task rather than on the accept loop.
-                tokio::spawn(async move {
+                managed_tasks.spawn(async move {
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let (handler_result, bind, bypass, policy_changes): (
                         HandlerResult,
@@ -566,7 +593,7 @@ where
                 if task_count.load(Relaxed) >= max_sessions {
                     if args.exit_on_fatal_error {
                         log::info!("Too many sessions that over {max_sessions}, exiting...");
-                        break;
+                        break Ok(());
                     }
                     log::warn!("Too many sessions that over {max_sessions}, dropping new session");
                     continue;
@@ -584,7 +611,7 @@ where
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 #[cfg(feature = "udpgw")]
                 let udpgw_client = udpgw_client.clone();
-                tokio::spawn(async move {
+                managed_tasks.spawn(async move {
                     let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
                     let original_src = info.src;
                     let original_dst = info.dst;
@@ -693,8 +720,21 @@ where
                 continue;
             }
         }
+    };
+    let active_sessions = task_count.load(Relaxed);
+    if !managed_tasks.is_empty() {
+        log::debug!("Stopping {} managed TUN child task(s) before network teardown", managed_tasks.len());
+        managed_tasks.abort_all();
+        while let Some(result) = managed_tasks.join_next().await {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                log::error!("Managed TUN child task failed during shutdown: {error}");
+            }
+        }
     }
-    Ok(task_count.load(Relaxed))
+    forwarding_result?;
+    Ok(active_sessions)
 }
 
 async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<VirtualDns>>) -> crate::Result<()> {

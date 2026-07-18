@@ -124,13 +124,15 @@ impl VirtualDns {
     }
 
     fn find_or_allocate_ip(&mut self, name: String) -> Result<IpAddr> {
-        // This function is a search and creation function.
-        // Thus, it is sufficient to canonicalize the name here.
+        // This function is a search and creation function, so canonicalizing
+        // once here keeps the forward and reverse maps consistent. DNS names
+        // are ASCII case-insensitive and a terminal root dot is equivalent.
         let insert_name = if name.ends_with('.') && !self.trailing_dot {
             String::from(name.trim_end_matches('.'))
         } else {
             name
-        };
+        }
+        .to_ascii_lowercase();
 
         let now = Instant::now();
 
@@ -170,11 +172,15 @@ impl VirtualDns {
                 self.name_to_ip.insert(name0, self.next_addr);
                 return Ok(self.next_addr);
             }
-            self.next_addr = Self::increment_ip(self.next_addr)?;
-            if self.next_addr == self.broadcast_addr {
-                // Wrap around.
-                self.next_addr = self.network_addr;
-            }
+            // Wrap before incrementing the final address. Comparing the
+            // current address is essential for a one-address /32 or /128
+            // pool: incrementing first would escape the configured CIDR and
+            // could scan the entire address space before exhaustion is seen.
+            self.next_addr = if self.next_addr == self.broadcast_addr {
+                self.network_addr
+            } else {
+                Self::increment_ip(self.next_addr)?
+            };
             if self.next_addr == started_at {
                 return Err("Virtual IP space for DNS exhausted".into());
             }
@@ -197,6 +203,59 @@ mod tests {
         assert_eq!(
             restarted_resolver.lock().await.resolve_ip(&address),
             Some(&"cached.example".to_string())
+        );
+    }
+
+    #[test]
+    fn increment_ip_carries_for_ipv4_and_ipv6() {
+        assert_eq!(
+            VirtualDns::increment_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 255))).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(198, 18, 1, 0))
+        );
+        assert_eq!(
+            VirtualDns::increment_ip("2001:db8::ffff".parse().unwrap()).unwrap(),
+            "2001:db8::1:0".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_name_reuses_mapping_and_reverse_lookup() {
+        let mut dns = VirtualDns::new("198.18.0.0/15".parse::<IpCidr>().unwrap());
+
+        let first = dns.find_or_allocate_ip("example.com.".to_string()).unwrap();
+        let same = dns.find_or_allocate_ip("EXAMPLE.COM".to_string()).unwrap();
+        let other = dns.find_or_allocate_ip("www.example.com".to_string()).unwrap();
+
+        assert_eq!(first, same);
+        assert_ne!(first, other);
+        assert_eq!(dns.resolve_ip(&first).map(String::as_str), Some("example.com"));
+        assert_eq!(dns.resolve_ip(&other).map(String::as_str), Some("www.example.com"));
+    }
+
+    #[test]
+    fn single_address_pools_exhaust_without_leaving_the_cidr() {
+        for cidr in ["198.18.0.1/32", "2001:db8::1/128"] {
+            let mut dns = VirtualDns::new(cidr.parse::<IpCidr>().unwrap());
+            let allocated = dns.find_or_allocate_ip("first.example".to_string()).unwrap();
+
+            let error = dns.find_or_allocate_ip("second.example".to_string()).unwrap_err();
+
+            assert_eq!(error.to_string(), "Virtual IP space for DNS exhausted");
+            assert_eq!(dns.resolve_ip(&allocated).map(String::as_str), Some("first.example"));
+        }
+    }
+
+    #[test]
+    fn allocation_can_use_the_last_address_before_wrapping() {
+        let mut dns = VirtualDns::new("198.18.0.0/31".parse::<IpCidr>().unwrap());
+        let first = dns.find_or_allocate_ip("first.example".to_string()).unwrap();
+        let second = dns.find_or_allocate_ip("second.example".to_string()).unwrap();
+
+        assert_eq!(first, "198.18.0.0".parse::<IpAddr>().unwrap());
+        assert_eq!(second, "198.18.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            dns.find_or_allocate_ip("third.example".to_string()).unwrap_err().to_string(),
+            "Virtual IP space for DNS exhausted"
         );
     }
 }

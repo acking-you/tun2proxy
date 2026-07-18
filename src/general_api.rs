@@ -218,8 +218,18 @@ async fn general_run_async_with_process_bypass_setup(
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     {
-        use tproxy_config::{TUN_GATEWAY, TUN_IPV4, TUN_NETMASK};
+        use tproxy_config::{TUN_IPV4, TUN_NETMASK};
         tun_config.address(TUN_IPV4).netmask(TUN_NETMASK).mtu(tun_mtu).up();
+    }
+
+    // On Windows, tun::Configuration::destination creates an unmanaged 0/0
+    // route inside the tun crate. The transactional setup below must be the
+    // sole owner of capture routes so teardown can remove exactly what it
+    // created. Unix platforms still use destination for their native point-
+    // to-point/interface setup.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use tproxy_config::TUN_GATEWAY;
         tun_config.destination(TUN_GATEWAY);
     }
 
@@ -288,22 +298,27 @@ async fn general_run_async_with_process_bypass_setup(
         tproxy_args = tproxy_args.tun_name(&tun_name);
     }
 
-    // TproxyState implements the Drop trait to restore network configuration,
-    // so we need to assign it to a variable, even if it is not used.
+    // Keep the platform setup guard alive for the forwarding lifetime. On
+    // Windows its Drop implementation synchronously retries owned-route and
+    // DNS cleanup if explicit teardown cannot complete.
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-    let mut restore: Option<tproxy_config::TproxyState> = None;
+    let mut restore: Option<crate::network_config::NetworkConfigState> = None;
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     if args.setup {
         #[cfg(target_os = "windows")]
         {
-            restore = Some(tproxy_config::tproxy_setup(&tproxy_args).await.map_err(|error| {
-                windows_tun_setup_error("install the Windows default route and DNS settings", error, &preexisting_tunnels)
+            restore = Some(crate::network_config::setup(&tproxy_args).await.map_err(|error| {
+                windows_tun_setup_error(
+                    "install the transactional Windows routes and DNS settings",
+                    error,
+                    &preexisting_tunnels,
+                )
             })?);
         }
         #[cfg(not(target_os = "windows"))]
         {
-            restore = Some(tproxy_config::tproxy_setup(&tproxy_args).await?);
+            restore = Some(crate::network_config::setup(&tproxy_args).await?);
         }
     }
 
@@ -336,20 +351,56 @@ async fn general_run_async_with_process_bypass_setup(
         }
     }
 
-    let join_handle = tokio::spawn(crate::run_with_process_bypass_and_virtual_dns(
+    // A plain JoinHandle permanently detaches its task when this outer future
+    // is dropped. AbortOnDropHandle propagates cancellation instead; the
+    // forwarding loop's JoinSet then owns and aborts all of its session tasks.
+    // Tokio abort is cooperative, so this prevents leaked background work but
+    // does not claim an instantaneous ordering against synchronous Drop.
+    let join_handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(crate::run_with_process_bypass_and_virtual_dns(
         device,
         tun_mtu,
         args.clone(),
         shutdown_token.clone(),
         process_bypass,
         virtual_dns_state,
-    ));
+    )));
 
-    match join_handle.await? {
+    // Preserve JoinError instead of returning through `?`: route/DNS cleanup
+    // must also run when the forwarding task panics or is aborted.
+    let forwarding_task_result = join_handle.await;
+
+    // Restore routes and DNS on every normal task completion, including
+    // forwarding errors. Relying only on Drop would hide teardown failures
+    // behind the original forwarding error and could leave owned routes in
+    // place until the next reboot.
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    let cleanup_result = crate::network_config::remove(restore).await;
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    let cleanup_result: std::io::Result<()> = Ok(());
+
+    let forwarding_result = match forwarding_task_result {
+        Ok(result) => result,
+        Err(join_error) => {
+            return match cleanup_result {
+                Ok(()) => Err(std::io::Error::other(format!("TUN forwarding task failed: {join_error}"))),
+                Err(cleanup_error) => Err(std::io::Error::other(format!(
+                    "TUN forwarding task failed: {join_error}; network teardown also failed: {cleanup_error}"
+                ))),
+            };
+        }
+    };
+
+    if let Err(cleanup_error) = cleanup_result {
+        return match forwarding_result {
+            Ok(_) => Err(cleanup_error),
+            Err(forwarding_error) => Err(std::io::Error::other(format!(
+                "TUN forwarding failed: {forwarding_error}; network teardown also failed: {cleanup_error}"
+            ))),
+        };
+    }
+
+    match forwarding_result {
         Ok(sessions) => {
-            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
-            tproxy_config::tproxy_remove(restore).await?;
-
             let max_sessions = args.max_sessions;
             if args.exit_on_fatal_error && sessions >= max_sessions {
                 let info = format!("Forced exit due to max sessions reached ({sessions}/{max_sessions})");

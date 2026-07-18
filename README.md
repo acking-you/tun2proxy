@@ -113,6 +113,13 @@ and Windows services should be configured to run with the required privileges di
 UAC. Keep the original terminal open and use `Ctrl+C` for normal route cleanup; a forced termination can leave setup
 changes behind.
 
+Windows `--setup` preserves every existing physical/VPN default route. It captures IPv4 with two more-specific `/1`
+routes created through the IP Helper API, records only rows created by the current session, and rolls those exact rows
+back together with the TUN DNS setting. It never performs an unqualified deletion of `0.0.0.0/0`. Bypass routes are
+resolved before capture is enabled and retain both the physical interface and next hop, which avoids selecting the TUN
+itself. Windows 10 version 2004 (build 19041) or newer is required for transactional DNS setup. See the
+[local proxy to TUN setup guide](docs/local-proxy-tun-setup.zh-CN.md#24-windows-安全路由) for limitations and diagnostics.
+
 You would then run the tool as follows:
 ```bash
 sudo ./target/release/tun2proxy-bin --setup --proxy "socks5://1.2.3.4:1080"

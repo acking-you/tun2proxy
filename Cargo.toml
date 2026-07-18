@@ -52,7 +52,7 @@ socks5-impl = { version = "0.8.3", default-features = false, features = [
 ] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
-tokio-util = "0.7.18"
+tokio-util = { version = "0.7.18", features = ["rt"] }
 tproxy-config = { version = "^7.0.7", default-features = false }
 tun = { version = "0.8.10", features = ["async"] }
 udp-stream = { version = "0.0.12", default-features = false }
@@ -85,6 +85,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",
