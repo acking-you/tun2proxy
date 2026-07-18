@@ -36,7 +36,10 @@ digest_auth = "0.3.1"
 dotenvy = "0.15.7"
 env_logger = "0.11.10"
 hashlink = "0.12.0"
-hickory-proto = "0.26.1"
+# Keep the DNS wire API aligned with embedders that still use the 0.26 alpha
+# resolver API. Cargo otherwise unifies both dependencies on stable 0.26 and
+# breaks those embedders at compile time.
+hickory-proto = "=0.26.0-alpha.1"
 httparse = "1.10.1"
 ipstack = { version = "1.0.0" }
 log = { version = "0.4.30", features = ["std"] }

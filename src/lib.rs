@@ -70,6 +70,10 @@ pub mod udpgw;
 mod virtual_dns;
 #[doc(hidden)]
 pub mod win_svc;
+#[cfg(windows)]
+#[doc(hidden)]
+#[path = "bin/windows_elevation/mod.rs"]
+pub mod windows_elevation;
 
 const DNS_PORT: u16 = 53;
 

@@ -1,5 +1,5 @@
 use hickory_proto::{
-    op::{Message, MessageType, ResponseCode},
+    op::{Message, ResponseCode},
     rr::{
         Name, RData, Record,
         rdata::{A, AAAA},
@@ -16,23 +16,23 @@ pub fn build_dns_response(mut request: Message, domain: &str, ip: IpAddr, ttl: u
 
     // We must indicate that this message is a response. Otherwise, implementations may not
     // recognize it.
-    request.metadata.message_type = MessageType::Response;
+    request = request.to_response();
 
     request.add_answer(record);
     Ok(request)
 }
 
 pub fn remove_ipv6_entries(message: &mut Message) {
-    message.answers.retain(|answer| !matches!(&answer.data, RData::AAAA(_)));
+    message.answers_mut().retain(|answer| !matches!(answer.data(), RData::AAAA(_)));
 }
 
 pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, String> {
-    if message.metadata.response_code != ResponseCode::NoError {
-        return Err(format!("{:?}", message.metadata.response_code));
+    if message.response_code() != ResponseCode::NoError {
+        return Err(format!("{:?}", message.response_code()));
     }
     let mut cname = None;
-    for answer in &message.answers {
-        match &answer.data {
+    for answer in message.answers() {
+        match answer.data() {
             RData::A(addr) => {
                 return Ok(IpAddr::V4((*addr).into()));
             }
@@ -48,11 +48,11 @@ pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, Stri
     if let Some(cname) = cname {
         return Err(cname);
     }
-    Err(format!("{:?}", message.answers))
+    Err(format!("{:?}", message.answers()))
 }
 
 pub fn extract_domain_from_dns_message(message: &Message) -> Result<String, String> {
-    let query = message.queries.first().ok_or("DnsRequest no query body")?;
+    let query = message.queries().first().ok_or("DnsRequest no query body")?;
     let name = query.name().to_string();
     Ok(name)
 }
