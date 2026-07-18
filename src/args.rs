@@ -137,7 +137,7 @@ pub struct Args {
     /// lower this when the kernel forwards the traffic onwards through a
     /// link with a smaller MTU (e.g. a WireGuard tunnel at 1420) to avoid
     /// having the bigger segments silently dropped.
-    #[arg(long, value_name = "bytes", default_value_t = tun::DEFAULT_MTU)]
+    #[arg(long, value_name = "bytes", default_value_t = crate::DEFAULT_MTU)]
     pub mtu: u16,
 
     /// TCP timeout in seconds
@@ -221,7 +221,7 @@ impl Default for Args {
             bypass: vec![],
             bypass_process: vec![],
             bind_interface: None,
-            mtu: tun::DEFAULT_MTU,
+            mtu: crate::DEFAULT_MTU,
             tcp_timeout: 600,
             udp_timeout: 10,
             verbosity: ArgVerbosity::Info,
@@ -512,5 +512,21 @@ impl std::fmt::Display for ProxyType {
             ProxyType::Http => write!(f, "http"),
             ProxyType::None => write!(f, "none"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn cli_and_programmatic_defaults_use_a_routable_mtu() {
+        let cli = Args::parse_from(["tun2proxy", "--proxy", "socks5://127.0.0.1:1080"]);
+
+        assert_eq!(crate::DEFAULT_MTU, 1500);
+        assert_eq!(cli.mtu, crate::DEFAULT_MTU);
+        assert_eq!(Args::default().mtu, crate::DEFAULT_MTU);
     }
 }

@@ -78,7 +78,7 @@ fn run_service(_arguments: Vec<std::ffi::OsString>) -> Result<(), crate::BoxErro
             }
             unsafe { crate::tun2proxy_set_traffic_status_callback(1, Some(traffic_cb), std::ptr::null_mut()) };
 
-            let ret = crate::general_run_async(args.clone(), tun::DEFAULT_MTU, false, shutdown_token).await;
+            let ret = crate::general_run_async(args.clone(), crate::DEFAULT_MTU, false, shutdown_token).await;
             match &ret {
                 Ok(sessions) => log::debug!("tun2proxy exited normally, current session count: {sessions}"),
                 Err(e) => log::error!("failed to run tun2proxy with error: {e:?}"),

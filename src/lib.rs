@@ -30,7 +30,6 @@ use tokio::{
 };
 pub use tokio_util::sync::CancellationToken;
 use tproxy_config::is_private_ip;
-pub use tun::DEFAULT_MTU;
 use udp_stream::UdpStream;
 #[cfg(feature = "udpgw")]
 use udpgw::{UDPGW_KEEPALIVE_TIME, UDPGW_MAX_CONNECTIONS, UdpGwClientStream, UdpGwResponse};
@@ -40,11 +39,24 @@ pub use {
     error::{BoxError, Error, Result},
     process_bypass::{ProcessBypass, normalize_process_name},
     traffic_status::{TrafficStatus, tun2proxy_set_traffic_status_callback},
+    virtual_dns::VirtualDnsState,
 };
 
-pub use general_api::{general_run_async, general_run_async_with_process_bypass, general_run_async_with_process_bypass_and_ready};
+pub use general_api::{
+    general_run_async, general_run_async_with_process_bypass, general_run_async_with_process_bypass_and_ready,
+    general_run_async_with_process_bypass_and_ready_and_virtual_dns,
+};
 
 pub const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Packet MTU used by tun2proxy unless the caller explicitly overrides it.
+///
+/// The `tun` crate exposes Wintun's maximum packet size (`u16::MAX`) as its
+/// Windows default. That is a driver buffer limit, not a generally routable
+/// interface MTU. In particular, WSL mirrored networking presents the Wintun
+/// route through a 1500-byte virtual NIC and silently loses oversized TCP
+/// packets. Keep the default at the Ethernet-safe value on every platform.
+pub const DEFAULT_MTU: u16 = 1500;
 
 mod android;
 mod args;
@@ -289,6 +301,25 @@ pub async fn run_with_process_bypass<D>(
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    run_with_process_bypass_and_virtual_dns(device, mtu, args, shutdown_token, process_bypass, None).await
+}
+
+/// Run with an optional fake-IP state owned by an embedding application.
+///
+/// The regular CLI leaves this as `None` and receives an isolated resolver.
+/// Long-running embedders can reuse one state across route restarts so cached
+/// fake IPs do not become unreachable during an upstream hot switch.
+pub async fn run_with_process_bypass_and_virtual_dns<D>(
+    device: D,
+    mtu: u16,
+    args: Args,
+    shutdown_token: CancellationToken,
+    process_bypass: ProcessBypass,
+    virtual_dns_state: Option<VirtualDnsState>,
+) -> crate::Result<usize>
+where
+    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     log::info!("{} {} starting...", env!("CARGO_PKG_NAME"), version_info!());
     log::info!("Proxy {} server: {}", args.proxy.proxy_type, args.proxy.addr);
 
@@ -297,7 +328,10 @@ where
     let dns_addr = args.dns_addr;
     let ipv6_enabled = args.ipv6_enabled;
     let virtual_dns = if args.dns == ArgDns::Virtual {
-        Some(Arc::new(Mutex::new(VirtualDns::new(args.virtual_dns_pool))))
+        Some(match virtual_dns_state {
+            Some(state) => state.resolver(),
+            None => Arc::new(Mutex::new(VirtualDns::new(args.virtual_dns_pool))),
+        })
     } else {
         None
     };

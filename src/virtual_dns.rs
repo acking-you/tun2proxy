@@ -3,9 +3,12 @@ use hashlink::{LruCache, linked_hash_map::RawEntryMut};
 use std::{
     collections::HashMap,
     convert::TryInto,
+    fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::Mutex;
 use tproxy_config::IpCidr;
 
 const MAPPING_TIMEOUT: u64 = 60; // Mapping timeout in seconds
@@ -25,6 +28,36 @@ pub struct VirtualDns {
     network_addr: IpAddr,
     broadcast_addr: IpAddr,
     next_addr: IpAddr,
+}
+
+/// Share fake-IP allocations across restarts of the same embedded TUN session.
+///
+/// Operating systems and applications may retain DNS answers after routes are
+/// recreated. Keeping this state at the embedding handle level ensures those
+/// cached addresses still resolve to the same domain after a node hot switch.
+#[derive(Clone)]
+pub struct VirtualDnsState(Arc<Mutex<VirtualDns>>);
+
+impl VirtualDnsState {
+    pub fn new(ip_pool: IpCidr) -> Self {
+        Self(Arc::new(Mutex::new(VirtualDns::new(ip_pool))))
+    }
+
+    pub(crate) fn resolver(&self) -> Arc<Mutex<VirtualDns>> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Default for VirtualDnsState {
+    fn default() -> Self {
+        Self::new(crate::Args::default().virtual_dns_pool)
+    }
+}
+
+impl fmt::Debug for VirtualDnsState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("VirtualDnsState").finish_non_exhaustive()
+    }
 }
 
 impl VirtualDns {
@@ -146,5 +179,24 @@ impl VirtualDns {
                 return Err("Virtual IP space for DNS exhausted".into());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cloned_state_preserves_fake_ip_mapping() {
+        let state = VirtualDnsState::default();
+        let resolver = state.resolver();
+        let address = resolver.lock().await.find_or_allocate_ip("cached.example".to_string()).unwrap();
+
+        let restarted_resolver = state.clone().resolver();
+        assert!(Arc::ptr_eq(&resolver, &restarted_resolver));
+        assert_eq!(
+            restarted_resolver.lock().await.resolve_ip(&address),
+            Some(&"cached.example".to_string())
+        );
     }
 }

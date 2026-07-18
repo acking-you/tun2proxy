@@ -1,4 +1,4 @@
-use crate::{Args, ProcessBypass};
+use crate::{Args, ProcessBypass, VirtualDnsState};
 use std::os::raw::{c_char, c_int, c_ushort};
 
 /// # Safety
@@ -109,7 +109,7 @@ pub async fn general_run_async_with_process_bypass(
     shutdown_token: tokio_util::sync::CancellationToken,
     process_bypass: ProcessBypass,
 ) -> std::io::Result<usize> {
-    general_run_async_with_process_bypass_inner(args, tun_mtu, _packet_information, shutdown_token, process_bypass, None).await
+    general_run_async_with_process_bypass_inner(args, tun_mtu, _packet_information, shutdown_token, process_bypass, None, None).await
 }
 
 /// Run tun2proxy and report when the adapter and operating-system routes are
@@ -128,7 +128,31 @@ pub async fn general_run_async_with_process_bypass_and_ready(
     process_bypass: ProcessBypass,
     ready: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) -> std::io::Result<usize> {
-    general_run_async_with_process_bypass_inner(args, tun_mtu, packet_information, shutdown_token, process_bypass, Some(ready)).await
+    general_run_async_with_process_bypass_inner(args, tun_mtu, packet_information, shutdown_token, process_bypass, Some(ready), None).await
+}
+
+/// Run an embedded TUN session with readiness reporting and reusable fake-DNS
+/// mappings. Reusing the state keeps cached fake IPs valid across route-only
+/// restarts such as an upstream node hot switch.
+pub async fn general_run_async_with_process_bypass_and_ready_and_virtual_dns(
+    args: Args,
+    tun_mtu: u16,
+    packet_information: bool,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    process_bypass: ProcessBypass,
+    ready: tokio::sync::oneshot::Sender<Result<(), String>>,
+    virtual_dns_state: VirtualDnsState,
+) -> std::io::Result<usize> {
+    general_run_async_with_process_bypass_inner(
+        args,
+        tun_mtu,
+        packet_information,
+        shutdown_token,
+        process_bypass,
+        Some(ready),
+        Some(virtual_dns_state),
+    )
+    .await
 }
 
 async fn general_run_async_with_process_bypass_inner(
@@ -138,9 +162,18 @@ async fn general_run_async_with_process_bypass_inner(
     shutdown_token: tokio_util::sync::CancellationToken,
     process_bypass: ProcessBypass,
     mut ready: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    virtual_dns_state: Option<VirtualDnsState>,
 ) -> std::io::Result<usize> {
-    let result =
-        general_run_async_with_process_bypass_setup(args, tun_mtu, _packet_information, shutdown_token, process_bypass, &mut ready).await;
+    let result = general_run_async_with_process_bypass_setup(
+        args,
+        tun_mtu,
+        _packet_information,
+        shutdown_token,
+        process_bypass,
+        virtual_dns_state,
+        &mut ready,
+    )
+    .await;
     if let Err(error) = &result {
         if let Some(ready) = ready.take() {
             let _ = ready.send(Err(error.to_string()));
@@ -155,6 +188,7 @@ async fn general_run_async_with_process_bypass_setup(
     _packet_information: bool,
     shutdown_token: tokio_util::sync::CancellationToken,
     process_bypass: ProcessBypass,
+    virtual_dns_state: Option<VirtualDnsState>,
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> std::io::Result<usize> {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -234,6 +268,20 @@ async fn general_run_async_with_process_bypass_setup(
     #[cfg(not(target_os = "windows"))]
     let device = tun::create_as_async(&tun_config)?;
 
+    match tun::AbstractDevice::mtu(&*device) {
+        Ok(device_mtu) if device_mtu == tun_mtu => {
+            log::info!("TUN adapter effective MTU is {device_mtu} bytes");
+        }
+        Ok(device_mtu) => {
+            log::warn!(
+                "TUN adapter reported MTU {device_mtu}, but tun2proxy requested {tun_mtu}; oversized packets may be dropped by downstream virtual interfaces"
+            );
+        }
+        Err(error) => {
+            log::warn!("Could not read the effective TUN adapter MTU after requesting {tun_mtu}: {error}");
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     if let Ok(tun_name) = tun::AbstractDevice::tun_name(&*device) {
         // Above line is equivalent to: `use tun::AbstractDevice; if let Ok(tun_name) = device.tun_name() {`
@@ -288,12 +336,13 @@ async fn general_run_async_with_process_bypass_setup(
         }
     }
 
-    let join_handle = tokio::spawn(crate::run_with_process_bypass(
+    let join_handle = tokio::spawn(crate::run_with_process_bypass_and_virtual_dns(
         device,
         tun_mtu,
         args.clone(),
         shutdown_token.clone(),
         process_bypass,
+        virtual_dns_state,
     ));
 
     match join_handle.await? {
