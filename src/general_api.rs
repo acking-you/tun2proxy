@@ -160,6 +160,16 @@ async fn general_run_async_with_process_bypass_setup(
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     let mut args = args;
 
+    // Capture this before creating our adapter. If setup later fails, the
+    // diagnostic can identify tunnel software that was already active rather
+    // than mistakenly reporting the adapter created by this invocation.
+    #[cfg(target_os = "windows")]
+    let preexisting_tunnels = active_windows_tunnel_adapters();
+    #[cfg(target_os = "windows")]
+    if args.setup && !preexisting_tunnels.is_empty() {
+        return Err(preexisting_windows_tunnel_error(&preexisting_tunnels));
+    }
+
     // Resolve the physical egress before `tproxy_setup` installs the TUN
     // catch-all routes. Re-resolving the default interface afterwards would
     // select the TUN itself and send direct relays back into the tunnel.
@@ -218,6 +228,10 @@ async fn general_run_async_with_process_bypass_setup(
         .bypass_ips(&args.bypass)
         .ipv6_default_route(args.ipv6_enabled);
 
+    #[cfg(target_os = "windows")]
+    let device = tun::create_as_async(&tun_config)
+        .map_err(|error| windows_tun_setup_error("create or open the Wintun adapter", error.into(), &preexisting_tunnels))?;
+    #[cfg(not(target_os = "windows"))]
     let device = tun::create_as_async(&tun_config)?;
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -233,7 +247,16 @@ async fn general_run_async_with_process_bypass_setup(
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     if args.setup {
-        restore = Some(tproxy_config::tproxy_setup(&tproxy_args).await?);
+        #[cfg(target_os = "windows")]
+        {
+            restore = Some(tproxy_config::tproxy_setup(&tproxy_args).await.map_err(|error| {
+                windows_tun_setup_error("install the Windows default route and DNS settings", error, &preexisting_tunnels)
+            })?);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            restore = Some(tproxy_config::tproxy_setup(&tproxy_args).await?);
+        }
     }
 
     log::info!("TUN adapter and system routes are ready");
@@ -289,10 +312,91 @@ async fn general_run_async_with_process_bypass_setup(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn active_windows_tunnel_adapters() -> Vec<String> {
+    const TUNNEL_MARKERS: &[&str] = &["tun", "tap", "vpn", "wireguard", "wintun", "tailscale", "zerotier", "openvpn"];
+
+    let mut adapters = netdev::get_interfaces()
+        .into_iter()
+        .filter(|interface| interface.is_up() || interface.is_oper_up())
+        .filter_map(|interface| {
+            let friendly = interface.friendly_name.as_deref().unwrap_or(&interface.name);
+            let description = interface.description.as_deref().unwrap_or_default();
+            let searchable = format!("{friendly} {description}").to_ascii_lowercase();
+            // Do not use the generic point-to-point heuristic on Windows: its
+            // always-present WAN Miniport adapters satisfy it and would block
+            // TUN mode on otherwise normal systems. Product/driver markers are
+            // narrower and still cover Wintun, WireGuard, OpenVPN, and common
+            // third-party tunnel adapters.
+            let looks_like_tunnel = TUNNEL_MARKERS.iter().any(|marker| searchable.contains(marker));
+            looks_like_tunnel.then(|| {
+                if description.is_empty() || description.eq_ignore_ascii_case(friendly) {
+                    friendly.to_string()
+                } else {
+                    format!("{friendly} ({description})")
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    adapters.sort();
+    adapters.dedup();
+    adapters
+}
+
+#[cfg(target_os = "windows")]
+fn windows_tun_setup_error(operation: &str, error: std::io::Error, preexisting_tunnels: &[String]) -> std::io::Error {
+    let conflict = if preexisting_tunnels.is_empty() {
+        "No pre-existing tunnel adapter was detected; inspect the Windows detail below.".to_string()
+    } else {
+        format!(
+            "Active tunnel/VPN adapters were already present: {}. Stop the other VPN/TUN application (or another proxy-everything instance) and retry.",
+            preexisting_tunnels.join(", ")
+        )
+    };
+    std::io::Error::new(error.kind(), format!("Failed to {operation}. {conflict} Windows detail: {error}"))
+}
+
+#[cfg(target_os = "windows")]
+fn preexisting_windows_tunnel_error(adapters: &[String]) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "TUN startup was stopped before changing routes because another active tunnel/VPN adapter was detected: {}. Stop the owning VPN/TUN application (or another proxy-everything instance), then retry.",
+            adapters.join(", ")
+        ),
+    )
+}
+
 /// # Safety
 ///
 /// Shutdown the tun2proxy component.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tun2proxy_stop() -> c_int {
     tun2proxy_stop_internal()
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_error_names_preexisting_tunnel_and_recovery_action() {
+        let error = windows_tun_setup_error(
+            "install routes",
+            std::io::Error::other("route already exists"),
+            &["Other VPN (Example Tunnel)".to_string()],
+        );
+        let message = error.to_string();
+        assert!(message.contains("Other VPN (Example Tunnel)"));
+        assert!(message.contains("Stop the other VPN/TUN application"));
+        assert!(message.contains("route already exists"));
+    }
+
+    #[test]
+    fn preflight_conflict_error_is_actionable() {
+        let error = preexisting_windows_tunnel_error(&["wintun (wintun Tunnel)".to_string()]);
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(error.to_string().contains("before changing routes"));
+        assert!(error.to_string().contains("wintun (wintun Tunnel)"));
+    }
 }

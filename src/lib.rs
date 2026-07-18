@@ -88,6 +88,35 @@ type DirectBind = std::convert::Infallible;
 /// Outcome of constructing a per-session proxy handler.
 type HandlerResult = std::io::Result<Arc<Mutex<dyn ProxyHandler>>>;
 
+/// Run one established relay until it finishes normally or a live process
+/// policy update changes whether its source process should bypass the proxy.
+/// Dropping the relay future closes both halves; the application can then
+/// reconnect and receive a fresh handler on the new route.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+async fn run_until_process_policy_change<F, T>(
+    relay: F,
+    matcher: Option<Arc<process::ProcessMatcher>>,
+    changes: Option<tokio::sync::watch::Receiver<u64>>,
+    protocol: IpProtocol,
+    src: SocketAddr,
+    dst: SocketAddr,
+    initial_bypass: bool,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(matcher) = matcher else {
+        return Some(relay.await);
+    };
+    let Some(changes) = changes else {
+        return Some(relay.await);
+    };
+    tokio::select! {
+        result = relay => Some(result),
+        _ = matcher.wait_for_routing_change(changes, protocol, src, dst, initial_bypass) => None,
+    }
+}
+
 #[allow(unused)]
 #[derive(Hash, Copy, Clone, Eq, PartialEq, Debug)]
 #[cfg_attr(
@@ -396,8 +425,14 @@ where
                 // task rather than on the accept loop.
                 tokio::spawn(async move {
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
-                    let (handler_result, bind): (HandlerResult, Option<DirectBind>) = {
+                    let (handler_result, bind, bypass, policy_changes): (
+                        HandlerResult,
+                        Option<DirectBind>,
+                        bool,
+                        Option<tokio::sync::watch::Receiver<u64>>,
+                    ) = {
                         let mut info = info;
+                        let policy_changes = process_matcher.as_ref().map(|matcher| matcher.subscribe());
                         let bypass = match &process_matcher {
                             Some(matcher) => matcher.matches(IpProtocol::Tcp, info.src, info.dst).await,
                             None => false,
@@ -415,10 +450,13 @@ where
                             None
                         };
                         match (bypass, &no_proxy_mgr) {
-                            (true, Some(no_proxy_mgr)) => {
-                                (no_proxy_mgr.new_proxy_handler(info, domain_name, false).await, direct_bind.clone())
-                            }
-                            _ => (mgr.new_proxy_handler(info, domain_name, false).await, None),
+                            (true, Some(no_proxy_mgr)) => (
+                                no_proxy_mgr.new_proxy_handler(info, domain_name, false).await,
+                                direct_bind.clone(),
+                                bypass,
+                                policy_changes,
+                            ),
+                            _ => (mgr.new_proxy_handler(info, domain_name, false).await, None, bypass, policy_changes),
                         }
                     };
                     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -435,7 +473,21 @@ where
 
                     match handler_result {
                         Ok(proxy_handler) => {
-                            if let Err(err) = handle_tcp_session(tcp, proxy_handler, socket_queue, bind).await {
+                            #[cfg(any(target_os = "windows", target_os = "linux"))]
+                            let result = run_until_process_policy_change(
+                                handle_tcp_session(tcp, proxy_handler, socket_queue, bind),
+                                process_matcher,
+                                policy_changes,
+                                IpProtocol::Tcp,
+                                info.src,
+                                info.dst,
+                                bypass,
+                            )
+                            .await;
+                            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                            let result = Some(handle_tcp_session(tcp, proxy_handler, socket_queue, bind).await);
+
+                            if let Some(Err(err)) = result {
                                 log::error!("{info} error \"{err}\"");
                             }
                         }
@@ -468,17 +520,21 @@ where
                 let udpgw_client = udpgw_client.clone();
                 tokio::spawn(async move {
                     let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
-                    let result: crate::Result<()> = async {
-                        // Decide process bypass before DNS or UdpGW handling. A
-                        // bypassed process must see real DNS answers and raw UDP;
-                        // otherwise its own traffic can recurse through the local
-                        // proxy or attempt to connect to a virtual-DNS fake IP.
-                        #[cfg(any(target_os = "windows", target_os = "linux"))]
-                        let bypass = match &process_matcher {
-                            Some(matcher) => matcher.matches(IpProtocol::Udp, info.src, info.dst).await,
-                            None => false,
-                        };
+                    let original_src = info.src;
+                    let original_dst = info.dst;
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let policy_changes = process_matcher.as_ref().map(|matcher| matcher.subscribe());
+                    // Decide process bypass before DNS or UdpGW handling. A
+                    // bypassed process must see real DNS answers and raw UDP;
+                    // otherwise its own traffic can recurse through the local
+                    // proxy or attempt to connect to a virtual-DNS fake IP.
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let bypass = match &process_matcher {
+                        Some(matcher) => matcher.matches(IpProtocol::Udp, info.src, info.dst).await,
+                        None => false,
+                    };
 
+                    let relay = async {
                         #[cfg(any(target_os = "windows", target_os = "linux"))]
                         if bypass {
                             if info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
@@ -538,10 +594,23 @@ where
 
                         let proxy_handler = mgr.new_proxy_handler(info, domain_name, true).await?;
                         handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled, None).await
-                    }
-                    .await;
+                    };
 
-                    if let Err(err) = result {
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let result = run_until_process_policy_change(
+                        relay,
+                        process_matcher,
+                        policy_changes,
+                        IpProtocol::Udp,
+                        original_src,
+                        original_dst,
+                        bypass,
+                    )
+                    .await;
+                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                    let result = Some(relay.await);
+
+                    if let Some(Err(err)) = result {
                         log::info!("Ending {info} with \"{err}\"");
                     }
                     log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));

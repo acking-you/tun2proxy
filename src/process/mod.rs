@@ -80,6 +80,37 @@ impl ProcessMatcher {
         }
     }
 
+    /// Subscribe before evaluating a session so a policy update racing with
+    /// the initial socket-table lookup cannot be missed.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.names.subscribe()
+    }
+
+    /// Wait until a policy update changes this established session's routing
+    /// decision. Callers then close the relay so the application reconnects
+    /// through the newly selected path.
+    pub(crate) async fn wait_for_routing_change(
+        self: &std::sync::Arc<Self>,
+        mut changes: tokio::sync::watch::Receiver<u64>,
+        protocol: IpProtocol,
+        src: SocketAddr,
+        dst: SocketAddr,
+        initial_bypass: bool,
+    ) -> bool {
+        loop {
+            if changes.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            let bypass = self.matches(protocol, src, dst).await;
+            if bypass != initial_bypass {
+                log::info!(
+                    "process bypass policy changed established {protocol} session {src} -> {dst} from bypass={initial_bypass} to bypass={bypass}; closing it so the application reconnects"
+                );
+                return bypass;
+            }
+        }
+    }
+
     fn matches_blocking(&self, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr, requested_at: Instant) -> bool {
         let mut cache = match self.cache.lock() {
             Ok(cache) => cache,
@@ -97,6 +128,11 @@ impl ProcessMatcher {
         // Collect candidate PIDs first to avoid borrowing `cache.entries` and
         // `cache.pid_names` simultaneously.
         let pids = candidate_pids(&cache.entries, protocol, src, dst);
+        if pids.is_empty() {
+            log::debug!("process bypass found no socket owner for {protocol} session {src} -> {dst}");
+            return false;
+        }
+        let candidate_count = pids.len();
         for pid in pids {
             let name = cache
                 .pid_names
@@ -109,6 +145,10 @@ impl ProcessMatcher {
                 }
             }
         }
+        log::debug!(
+            "process bypass checked {candidate_count} socket owner candidate(s) for {protocol} session {src} -> {dst}; none matched {:?}",
+            self.names.names()
+        );
         false
     }
 
@@ -173,11 +213,12 @@ fn snapshot() -> crate::Result<Vec<SocketEntry>> {
 
 /// PIDs of the socket(s) that plausibly originated `src`.
 ///
-/// TCP requires the complete local+remote tuple and never falls back to a
-/// wildcard (`0.0.0.0`/`::`) row. UDP table rows often lack a concrete local IP
-/// (Windows reports `0.0.0.0` for connected client sockets), so for UDP we
-/// prefer a concrete-IP match but fall back to unspecified-IP rows on the same
-/// port when none is found.
+/// TCP prefers the complete local+remote tuple, then tolerates a different
+/// concrete local IP while still requiring the same port and remote endpoint.
+/// Windows can expose the physical-interface address in the socket table while
+/// the packet observed by TUN carries its translated virtual address. UDP table
+/// rows do not expose a remote endpoint, so matching falls back from the exact
+/// IP to an unspecified address and finally to another same-family local IP.
 fn candidate_pids(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr, dst: SocketAddr) -> Vec<u32> {
     let concrete: Vec<u32> = entries
         .iter()
@@ -189,12 +230,32 @@ fn candidate_pids(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr
         })
         .flat_map(|e| e.pids.iter().copied())
         .collect();
-    if !concrete.is_empty() || protocol != IpProtocol::Udp {
+    if !concrete.is_empty() {
         return concrete;
     }
-    entries
+
+    if protocol == IpProtocol::Tcp {
+        return entries
+            .iter()
+            .filter(|e| {
+                e.protocol == protocol && e.local.port() == src.port() && e.local.is_ipv4() == src.is_ipv4() && e.remote == Some(dst)
+            })
+            .flat_map(|e| e.pids.iter().copied())
+            .collect();
+    }
+
+    let unspecified: Vec<u32> = entries
         .iter()
         .filter(|e| e.protocol == protocol && e.local.port() == src.port() && e.local.ip().is_unspecified())
+        .flat_map(|e| e.pids.iter().copied())
+        .collect();
+    if !unspecified.is_empty() {
+        return unspecified;
+    }
+
+    entries
+        .iter()
+        .filter(|e| e.protocol == protocol && e.local.port() == src.port() && e.local.is_ipv4() == src.is_ipv4())
         .flat_map(|e| e.pids.iter().copied())
         .collect()
 }
@@ -277,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_candidate_requires_exact_ip_and_port() {
+    fn tcp_candidate_prefers_exact_ip_then_accepts_tun_address_translation() {
         let src = SocketAddr::new(Ipv4Addr::new(198, 18, 0, 1).into(), 5000);
         let dst = SocketAddr::new(Ipv4Addr::new(203, 0, 113, 10).into(), 443);
         let entries = vec![
@@ -299,9 +360,13 @@ mod tests {
             entry(IpProtocol::Udp, src.ip(), 5000, None, 44),
         ];
         assert_eq!(candidate_pids(&entries, IpProtocol::Tcp, src, dst), vec![11]);
-        // A pure wildcard listener never matches a TCP session.
+        // A pure wildcard listener never matches a TCP session because it has
+        // no remote endpoint.
         let wildcard_only = vec![entry(IpProtocol::Tcp, Ipv4Addr::UNSPECIFIED.into(), 5000, None, 22)];
         assert!(candidate_pids(&wildcard_only, IpProtocol::Tcp, src, dst).is_empty());
+
+        let physical_ip_only = vec![entry(IpProtocol::Tcp, Ipv4Addr::new(192, 168, 1, 20).into(), 5000, Some(dst), 55)];
+        assert_eq!(candidate_pids(&physical_ip_only, IpProtocol::Tcp, src, dst), vec![55]);
     }
 
     #[test]
@@ -323,5 +388,8 @@ mod tests {
         assert!(pids.contains(&22) && pids.contains(&23));
         // Different port never matches.
         assert!(candidate_pids(&wildcard_only, IpProtocol::Udp, SocketAddr::new(src.ip(), 5301), dst).is_empty());
+
+        let physical_ip_only = vec![entry(IpProtocol::Udp, Ipv4Addr::new(192, 168, 1, 20).into(), 5300, None, 24)];
+        assert_eq!(candidate_pids(&physical_ip_only, IpProtocol::Udp, src, dst), vec![24]);
     }
 }

@@ -5,11 +5,23 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
+use tokio::sync::watch;
 
 /// Thread-safe process bypass list shared by TUN session matchers.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ProcessBypass {
     names: Arc<RwLock<Vec<String>>>,
+    changes: watch::Sender<u64>,
+}
+
+impl Default for ProcessBypass {
+    fn default() -> Self {
+        let (changes, _) = watch::channel(0);
+        Self {
+            names: Arc::new(RwLock::new(Vec::new())),
+            changes,
+        }
+    }
 }
 
 impl ProcessBypass {
@@ -20,8 +32,12 @@ impl ProcessBypass {
         bypass
     }
 
-    /// Atomically replace the names used for all subsequently accepted
-    /// sessions. Existing relays keep their original routing decision.
+    /// Atomically replace the names used for new and established sessions.
+    ///
+    /// Established sessions are notified through [`Self::subscribe`]. Their
+    /// relay is closed only when the updated policy changes that session's
+    /// decision, allowing the originating application to reconnect on the new
+    /// route without recreating the TUN adapter.
     pub fn set_names(&self, names: impl IntoIterator<Item = String>) {
         let names = names
             .into_iter()
@@ -30,9 +46,24 @@ impl ProcessBypass {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        match self.names.write() {
-            Ok(mut current) => *current = names,
-            Err(poisoned) => *poisoned.into_inner() = names,
+        let changed = match self.names.write() {
+            Ok(mut current) if *current != names => {
+                *current = names;
+                true
+            }
+            Err(poisoned) => {
+                let mut current = poisoned.into_inner();
+                if *current == names {
+                    false
+                } else {
+                    *current = names;
+                    true
+                }
+            }
+            Ok(_) => false,
+        };
+        if changed {
+            self.changes.send_modify(|revision| *revision = revision.wrapping_add(1));
         }
     }
 
@@ -58,6 +89,12 @@ impl ProcessBypass {
             Err(poisoned) => poisoned.into_inner().iter().any(|candidate| candidate == name),
         }
     }
+
+    /// Subscribe to effective policy changes. The revision itself is opaque;
+    /// receivers only use it as an inexpensive wake-up signal.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
 }
 
 /// Lower-case and drop a trailing `.exe` so names behave consistently across
@@ -80,5 +117,22 @@ mod tests {
         assert_eq!(bypass.names(), vec!["other"]);
         assert!(bypass.contains_normalized("other"));
         assert!(!bypass.contains_normalized("curl"));
+    }
+
+    #[tokio::test]
+    async fn subscribers_are_notified_only_when_policy_changes() {
+        let bypass = ProcessBypass::new(["curl.exe".to_string()]);
+        let mut changes = bypass.subscribe();
+
+        bypass.set_names(["CURL".to_string()]);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), changes.changed())
+                .await
+                .is_err()
+        );
+
+        bypass.set_names(["wget.exe".to_string()]);
+        changes.changed().await.unwrap();
+        assert_eq!(bypass.names(), vec!["wget"]);
     }
 }
