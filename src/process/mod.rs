@@ -9,7 +9,7 @@
 //!
 //! Only implemented on Windows and Linux; the module is not compiled elsewhere.
 
-use crate::session_info::IpProtocol;
+use crate::{ProcessBypass, process_bypass::normalize_process_name, session_info::IpProtocol};
 use std::{collections::HashMap, net::SocketAddr, sync::Mutex, time::Instant};
 
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
@@ -43,22 +43,16 @@ struct Cache {
 
 /// Matches sessions against a set of process names to be relayed directly.
 pub(crate) struct ProcessMatcher {
-    /// Normalized (lower-cased, `.exe` stripped) names to match against.
-    names: Vec<String>,
+    names: ProcessBypass,
     cache: Mutex<Cache>,
 }
 
 impl ProcessMatcher {
     /// Whether the supplied list contains at least one usable process name.
-    pub(crate) fn is_configured(names: &[String]) -> bool {
-        names.iter().any(|name| !normalize_name(name).is_empty())
-    }
-
-    /// Build a matcher from the raw `--bypass-process` values. Returns `None`
-    /// when the list is empty (feature disabled, zero overhead).
-    pub(crate) fn new(names: &[String]) -> Option<Self> {
-        let names: Vec<String> = names.iter().map(|n| normalize_name(n)).filter(|n| !n.is_empty()).collect();
-        if names.is_empty() {
+    /// Build a matcher around a runtime-updatable list. Returns `None` when the
+    /// initial list is empty, avoiding socket-table work when bypass is unused.
+    pub(crate) fn new(names: ProcessBypass) -> Option<Self> {
+        if !names.is_configured() {
             return None;
         }
         Some(Self {
@@ -107,9 +101,9 @@ impl ProcessMatcher {
             let name = cache
                 .pid_names
                 .entry(pid)
-                .or_insert_with(|| imp::process_name(pid).map(|n| normalize_name(&n)));
+                .or_insert_with(|| imp::process_name(pid).map(|n| normalize_process_name(&n)));
             if let Some(name) = name {
-                if self.names.iter().any(|wanted| wanted == name) {
+                if self.names.contains_normalized(name) {
                     log::debug!("bypassing {protocol} session from {src} owned by process `{name}` (pid {pid})");
                     return true;
                 }
@@ -177,13 +171,6 @@ fn snapshot() -> crate::Result<Vec<SocketEntry>> {
     Ok(entries)
 }
 
-/// Lower-case and drop a trailing `.exe` so `curl` matches `curl.exe` and vice
-/// versa across platforms.
-fn normalize_name(name: &str) -> String {
-    let lower = name.trim().to_ascii_lowercase();
-    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
-}
-
 /// PIDs of the socket(s) that plausibly originated `src`.
 ///
 /// TCP requires the complete local+remote tuple and never falls back to a
@@ -234,24 +221,24 @@ mod tests {
 
     #[test]
     fn normalize_name_is_case_and_extension_insensitive() {
-        assert_eq!(normalize_name("Curl.EXE"), "curl");
-        assert_eq!(normalize_name("curl"), "curl");
-        assert_eq!(normalize_name("  My-Proxy.exe "), "my-proxy");
-        assert_eq!(normalize_name(".exe"), "");
+        assert_eq!(normalize_process_name("Curl.EXE"), "curl");
+        assert_eq!(normalize_process_name("curl"), "curl");
+        assert_eq!(normalize_process_name("  My-Proxy.exe "), "my-proxy");
+        assert_eq!(normalize_process_name(".exe"), "");
     }
 
     #[test]
     fn matcher_rejects_empty_and_normalizes() {
-        assert!(ProcessMatcher::new(&[]).is_none());
-        assert!(ProcessMatcher::new(&["   ".to_string()]).is_none());
-        let matcher = ProcessMatcher::new(&["Curl.exe".to_string(), "wget".to_string()]).unwrap();
-        assert_eq!(matcher.names, vec!["curl".to_string(), "wget".to_string()]);
+        assert!(ProcessMatcher::new(ProcessBypass::default()).is_none());
+        assert!(ProcessMatcher::new(ProcessBypass::new(["   ".to_string()])).is_none());
+        let matcher = ProcessMatcher::new(ProcessBypass::new(["Curl.exe".to_string(), "wget".to_string()])).unwrap();
+        assert_eq!(matcher.names.names(), vec!["curl".to_string(), "wget".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn matcher_resolves_a_live_tcp_socket_owner() {
         let process_name = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
-        let matcher = std::sync::Arc::new(ProcessMatcher::new(&[process_name]).unwrap());
+        let matcher = std::sync::Arc::new(ProcessMatcher::new(ProcessBypass::new([process_name])).unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let destination = listener.local_addr().unwrap();
         let client = tokio::net::TcpStream::connect(destination).await.unwrap();
@@ -262,6 +249,22 @@ mod tests {
                 .matches(IpProtocol::Tcp, client.local_addr().unwrap(), client.peer_addr().unwrap())
                 .await
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matcher_uses_process_names_replaced_at_runtime() {
+        let process_name = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        let names = ProcessBypass::new(["definitely-not-this-process".to_string()]);
+        let matcher = std::sync::Arc::new(ProcessMatcher::new(names.clone()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(destination).await.unwrap();
+        let (_server, _) = listener.accept().await.unwrap();
+        let source = client.local_addr().unwrap();
+
+        assert!(!matcher.matches(IpProtocol::Tcp, source, destination).await);
+        names.set_names([process_name]);
+        assert!(matcher.matches(IpProtocol::Tcp, source, destination).await);
     }
 
     fn entry(protocol: IpProtocol, ip: std::net::IpAddr, port: u16, remote: Option<SocketAddr>, pid: u32) -> SocketEntry {

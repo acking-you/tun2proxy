@@ -1,4 +1,4 @@
-use crate::Args;
+use crate::{Args, ProcessBypass};
 use std::os::raw::{c_char, c_int, c_ushort};
 
 /// # Safety
@@ -96,6 +96,19 @@ pub async fn general_run_async(
     _packet_information: bool,
     shutdown_token: tokio_util::sync::CancellationToken,
 ) -> std::io::Result<usize> {
+    let process_bypass = ProcessBypass::new(args.bypass_process.clone());
+    general_run_async_with_process_bypass(args, tun_mtu, _packet_information, shutdown_token, process_bypass).await
+}
+
+/// Run tun2proxy with a process bypass list that an embedding application may
+/// update while the TUN device remains active.
+pub async fn general_run_async_with_process_bypass(
+    args: Args,
+    tun_mtu: u16,
+    _packet_information: bool,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    process_bypass: ProcessBypass,
+) -> std::io::Result<usize> {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     let mut args = args;
 
@@ -103,7 +116,7 @@ pub async fn general_run_async(
     // catch-all routes. Re-resolving the default interface afterwards would
     // select the TUN itself and send direct relays back into the tunnel.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    if crate::process::ProcessMatcher::is_configured(&args.bypass_process) {
+    if process_bypass.is_configured() {
         let iface = crate::direct::detect(args.bind_interface.as_deref()).map_err(std::io::Error::from)?;
         log::info!("Process-bypass physical interface selected before route setup: {iface}");
         args.bind_interface = Some(iface.name);
@@ -199,7 +212,13 @@ pub async fn general_run_async(
         }
     }
 
-    let join_handle = tokio::spawn(crate::run(device, tun_mtu, args.clone(), shutdown_token.clone()));
+    let join_handle = tokio::spawn(crate::run_with_process_bypass(
+        device,
+        tun_mtu,
+        args.clone(),
+        shutdown_token.clone(),
+        process_bypass,
+    ));
 
     match join_handle.await? {
         Ok(sessions) => {

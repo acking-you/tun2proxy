@@ -38,10 +38,11 @@ use udpgw::{UDPGW_KEEPALIVE_TIME, UDPGW_MAX_CONNECTIONS, UdpGwClientStream, UdpG
 pub use {
     args::{ArgDns, ArgProxy, ArgVerbosity, Args, ProxyType},
     error::{BoxError, Error, Result},
+    process_bypass::{ProcessBypass, normalize_process_name},
     traffic_status::{TrafficStatus, tun2proxy_set_traffic_status_callback},
 };
 
-pub use general_api::general_run_async;
+pub use general_api::{general_run_async, general_run_async_with_process_bypass};
 
 pub const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -58,6 +59,7 @@ mod http;
 mod no_proxy;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod process;
+mod process_bypass;
 mod proxy_handler;
 mod session_info;
 pub mod socket_transfer;
@@ -211,6 +213,21 @@ pub async fn run<D>(device: D, mtu: u16, args: Args, shutdown_token: Cancellatio
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let process_bypass = ProcessBypass::new(args.bypass_process.clone());
+    run_with_process_bypass(device, mtu, args, shutdown_token, process_bypass).await
+}
+
+/// Run the proxy server with a process list that may be replaced at runtime.
+pub async fn run_with_process_bypass<D>(
+    device: D,
+    mtu: u16,
+    args: Args,
+    shutdown_token: CancellationToken,
+    process_bypass: ProcessBypass,
+) -> crate::Result<usize>
+where
+    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     log::info!("{} {} starting...", env!("CARGO_PKG_NAME"), version_info!());
     log::info!("Proxy {} server: {}", args.proxy.proxy_type, args.proxy.addr);
 
@@ -286,12 +303,12 @@ where
     // `--bypass-process` are relayed directly to their destination through the
     // physical interface instead of being forwarded to the proxy.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    let (process_matcher, direct_bind, no_proxy_mgr) = match process::ProcessMatcher::new(&args.bypass_process) {
+    let (process_matcher, direct_bind, no_proxy_mgr) = match process::ProcessMatcher::new(process_bypass.clone()) {
         Some(matcher) => {
             let iface = direct::detect(args.bind_interface.as_deref())?;
             log::info!(
                 "Process bypass enabled for {:?}; direct relays egress via {}",
-                args.bypass_process,
+                process_bypass.names(),
                 iface
             );
             let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
@@ -300,7 +317,7 @@ where
         None => (None, None, None),
     };
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    if !args.bypass_process.is_empty() {
+    if process_bypass.is_configured() {
         log::warn!("--bypass-process is not supported on this platform; ignoring it");
     }
 
