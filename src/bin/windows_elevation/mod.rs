@@ -13,7 +13,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, INFINITE, OpenProcessToken, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{SEE_MASK_NO_CONSOLE, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 
 const ELEVATED_CONSOLE_PID_ARG: &str = "--elevated-console-pid";
 
@@ -125,6 +125,45 @@ pub fn relaunch_if_needed() -> io::Result<Option<u32>> {
     Ok(Some(exit_code))
 }
 
+/// Start a new elevated instance of the current GUI executable and return
+/// immediately after Windows has accepted the launch.
+///
+/// Unlike [`relaunch_if_needed`], this helper neither attaches a console nor
+/// waits for the child. It is intended for desktop applications that keep
+/// normal proxy operation unelevated and request UAC only when the user enables
+/// route-changing TUN mode.
+pub fn relaunch_gui_elevated(arguments: impl IntoIterator<Item = OsString>) -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    let parameters = build_command_line(arguments);
+    let executable = null_terminated(executable.as_os_str());
+    let working_directory = std::env::current_dir().ok().map(|path| null_terminated(path.as_os_str()));
+    let verb = null_terminated(OsStr::new("runas"));
+
+    let mut execute_info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_NO_CONSOLE,
+        hwnd: null_mut(),
+        lpVerb: verb.as_ptr(),
+        lpFile: executable.as_ptr(),
+        lpParameters: parameters.as_ptr(),
+        lpDirectory: working_directory.as_ref().map_or(null(), |path| path.as_ptr()),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
+    };
+
+    if unsafe { ShellExecuteExW(&raw mut execute_info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if execute_info.hProcess.is_null() {
+        return Err(io::Error::other("the elevated GUI process did not return a process handle"));
+    }
+    // The GUI handoff is asynchronous. Windows keeps the child alive after the
+    // launcher handle is closed, while the original process can shut down its
+    // local listener and release the port for the elevated instance.
+    drop(OwnedHandle(execute_info.hProcess));
+    Ok(())
+}
+
 fn reconnect_standard_handles() -> io::Result<()> {
     let input_name = null_terminated(OsStr::new("CONIN$"));
     let output_name = null_terminated(OsStr::new("CONOUT$"));
@@ -181,7 +220,7 @@ fn reconnect_standard_handles() -> io::Result<()> {
     Ok(())
 }
 
-fn is_elevated() -> io::Result<bool> {
+pub fn is_elevated() -> io::Result<bool> {
     let mut token = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());

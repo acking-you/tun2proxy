@@ -109,6 +109,54 @@ pub async fn general_run_async_with_process_bypass(
     shutdown_token: tokio_util::sync::CancellationToken,
     process_bypass: ProcessBypass,
 ) -> std::io::Result<usize> {
+    general_run_async_with_process_bypass_inner(args, tun_mtu, _packet_information, shutdown_token, process_bypass, None).await
+}
+
+/// Run tun2proxy and report when the adapter and operating-system routes are
+/// ready.
+///
+/// Long-running embedders should not treat task creation as proof that TUN
+/// capture is active. The readiness channel resolves only after device creation
+/// and route setup have both succeeded. Setup failures are returned through the
+/// channel as well as from the task, so a UI can keep its state synchronized
+/// without waiting for the complete TUN session to exit.
+pub async fn general_run_async_with_process_bypass_and_ready(
+    args: Args,
+    tun_mtu: u16,
+    packet_information: bool,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    process_bypass: ProcessBypass,
+    ready: tokio::sync::oneshot::Sender<Result<(), String>>,
+) -> std::io::Result<usize> {
+    general_run_async_with_process_bypass_inner(args, tun_mtu, packet_information, shutdown_token, process_bypass, Some(ready)).await
+}
+
+async fn general_run_async_with_process_bypass_inner(
+    args: Args,
+    tun_mtu: u16,
+    _packet_information: bool,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    process_bypass: ProcessBypass,
+    mut ready: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) -> std::io::Result<usize> {
+    let result =
+        general_run_async_with_process_bypass_setup(args, tun_mtu, _packet_information, shutdown_token, process_bypass, &mut ready).await;
+    if let Err(error) = &result {
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Err(error.to_string()));
+        }
+    }
+    result
+}
+
+async fn general_run_async_with_process_bypass_setup(
+    args: Args,
+    tun_mtu: u16,
+    _packet_information: bool,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    process_bypass: ProcessBypass,
+    ready: &mut Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+) -> std::io::Result<usize> {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     let mut args = args;
 
@@ -186,6 +234,11 @@ pub async fn general_run_async_with_process_bypass(
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     if args.setup {
         restore = Some(tproxy_config::tproxy_setup(&tproxy_args).await?);
+    }
+
+    log::info!("TUN adapter and system routes are ready");
+    if let Some(ready) = ready.take() {
+        let _ = ready.send(Ok(()));
     }
 
     #[cfg(target_os = "linux")]

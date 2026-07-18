@@ -42,7 +42,7 @@ pub use {
     traffic_status::{TrafficStatus, tun2proxy_set_traffic_status_callback},
 };
 
-pub use general_api::{general_run_async, general_run_async_with_process_bypass};
+pub use general_api::{general_run_async, general_run_async_with_process_bypass, general_run_async_with_process_bypass_and_ready};
 
 pub const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
