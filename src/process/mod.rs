@@ -31,14 +31,10 @@ struct SocketEntry {
 struct Cache {
     fetched_at: Option<Instant>,
     entries: Vec<SocketEntry>,
-    /// Resolved `pid -> executable basename`, memoized within one snapshot and
-    /// cleared on every refresh. Note the name is resolved live (against the
-    /// running process) the first time a PID is consulted, so there is a small,
-    /// self-healing window in which a PID recycled since the snapshot was taken
-    /// could resolve to a different executable. The bypass decision still cannot
-    /// create a loop in that case, because a bypassed relay is always pinned to
-    /// the physical interface regardless.
-    pid_names: HashMap<u32, Option<String>>,
+    /// Resolved `pid -> executable identity chain`, memoized within one socket
+    /// snapshot and cleared on every refresh. Windows includes live ancestors so
+    /// a launcher/application selection covers protected game child processes.
+    pid_names: HashMap<u32, Vec<String>>,
 }
 
 /// Matches sessions against a set of process names to be relayed directly.
@@ -134,16 +130,25 @@ impl ProcessMatcher {
         }
         let candidate_count = pids.len();
         for pid in pids {
-            let name = cache
-                .pid_names
-                .entry(pid)
-                .or_insert_with(|| imp::process_name(pid).map(|n| normalize_process_name(&n)));
-            if let Some(name) = name {
+            let names = cache.pid_names.entry(pid).or_insert_with(|| {
+                imp::process_names(pid)
+                    .into_iter()
+                    .map(|name| normalize_process_name(&name))
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            });
+            if names.is_empty() {
+                log::debug!("process bypass could not resolve executable identity for {protocol} session {src} -> {dst} owner pid {pid}");
+                continue;
+            }
+            for (depth, name) in names.iter().enumerate() {
                 if self.names.contains_normalized(name) {
-                    log::debug!("bypassing {protocol} session from {src} owned by process `{name}` (pid {pid})");
+                    let relation = if depth == 0 { "owner" } else { "ancestor" };
+                    log::info!("bypassing {protocol} session {src} -> {dst}: socket pid {pid} matched {relation} process `{name}`");
                     return true;
                 }
             }
+            log::debug!("process bypass resolved socket pid {pid} to identity chain {names:?}");
         }
         log::debug!(
             "process bypass checked {candidate_count} socket owner candidate(s) for {protocol} session {src} -> {dst}; none matched {:?}",
@@ -294,6 +299,32 @@ mod tests {
         assert!(ProcessMatcher::new(ProcessBypass::new(["   ".to_string()])).is_none());
         let matcher = ProcessMatcher::new(ProcessBypass::new(["Curl.exe".to_string(), "wget".to_string()])).unwrap();
         assert_eq!(matcher.names.names(), vec!["curl".to_string(), "wget".to_string()]);
+    }
+
+    #[test]
+    fn process_identity_includes_current_executable() {
+        let current = std::env::current_exe().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        let current = normalize_process_name(&current);
+        let names = imp::process_names(std::process::id())
+            .into_iter()
+            .map(|name| normalize_process_name(&name))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&current), "current process `{current}` missing from {names:?}");
+    }
+
+    #[test]
+    fn matcher_accepts_a_selected_process_ancestor() {
+        let names = ProcessBypass::new(["game-launcher.exe".to_string()]);
+        let matcher = ProcessMatcher::new(names).unwrap();
+        let src = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), 5000);
+        let dst = SocketAddr::new(Ipv4Addr::new(203, 0, 113, 10).into(), 443);
+        let mut cache = Cache {
+            fetched_at: Some(Instant::now()),
+            entries: vec![entry(IpProtocol::Tcp, src.ip(), src.port(), Some(dst), 42)],
+            pid_names: HashMap::from([(42, vec!["protected-game".to_string(), "game-launcher".to_string()])]),
+        };
+
+        assert!(matcher.match_in_cache(&mut cache, IpProtocol::Tcp, src, dst));
     }
 
     #[tokio::test(flavor = "multi_thread")]

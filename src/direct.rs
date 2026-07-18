@@ -11,8 +11,15 @@
 //! Only compiled on Windows and Linux.
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::net::SocketAddr;
+use std::{
+    net::{IpAddr, SocketAddr},
+    str::FromStr,
+    sync::atomic::{AtomicU16, Ordering},
+    time::Duration,
+};
 use tokio::net::TcpStream;
+
+static NEXT_DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
 
 /// The physical interface direct relays egress through.
 #[derive(Debug, Clone)]
@@ -219,4 +226,81 @@ pub(crate) fn bind_udp_bound(peer: SocketAddr, iface: &BindInterface) -> std::io
 
     let std_socket = std::net::UdpSocket::from(socket);
     tokio::net::UdpSocket::from_std(std_socket)
+}
+
+/// Resolve a virtual-DNS name through a DNS socket pinned to the physical
+/// interface.
+///
+/// Calling the operating-system resolver here is not sufficient: its query may
+/// itself enter the TUN and receive another virtual address. Sending the DNS
+/// packet through `IP_UNICAST_IF`/`SO_BINDTODEVICE` guarantees that a process
+/// selected for bypass can recover from a fake address cached before the policy
+/// was changed.
+pub(crate) async fn resolve_domain_bound(
+    domain: &str,
+    port: u16,
+    dns_server: IpAddr,
+    want_ipv6: bool,
+    iface: &BindInterface,
+) -> std::io::Result<SocketAddr> {
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query, ResponseCode},
+        rr::{Name, RData, RecordType},
+    };
+
+    let mut current = domain.to_string();
+    for _ in 0..4 {
+        let name = Name::from_str(&current).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let query_type = if want_ipv6 { RecordType::AAAA } else { RecordType::A };
+        let request_id = NEXT_DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+        let mut request = Message::new(request_id, MessageType::Query, OpCode::Query);
+        request.set_recursion_desired(true);
+        request.add_query(Query::query(name, query_type));
+        let request = request.to_vec().map_err(std::io::Error::other)?;
+
+        let server = SocketAddr::new(dns_server, 53);
+        let socket = bind_udp_bound(server, iface)?;
+        socket.send(&request).await?;
+        let mut response = [0u8; 4096];
+        let size = tokio::time::timeout(Duration::from_secs(3), socket.recv(&mut response))
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("direct DNS query for `{current}` timed out")))??;
+        let response = Message::from_vec(&response[..size]).map_err(std::io::Error::other)?;
+        if response.id() != request_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("direct DNS response ID mismatch for `{current}`"),
+            ));
+        }
+        if response.response_code() != ResponseCode::NoError {
+            return Err(std::io::Error::other(format!(
+                "direct DNS query for `{current}` failed with {:?}",
+                response.response_code()
+            )));
+        }
+
+        let mut cname = None;
+        for answer in response.answers() {
+            match answer.data() {
+                RData::A(address) if !want_ipv6 => return Ok(SocketAddr::new(IpAddr::V4((*address).into()), port)),
+                RData::AAAA(address) if want_ipv6 => return Ok(SocketAddr::new(IpAddr::V6((*address).into()), port)),
+                RData::CNAME(name) => cname = Some(name.to_utf8()),
+                _ => {}
+            }
+        }
+        match cname {
+            Some(name) => current = name,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("direct DNS response for `{current}` contained no {query_type} address"),
+                ));
+            }
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("direct DNS resolution for `{domain}` exceeded the CNAME limit"),
+    ))
 }

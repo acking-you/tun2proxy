@@ -195,14 +195,18 @@ tun2proxy-bin.exe --setup --proxy "http://127.0.0.1:8080" --bypass-process my-pr
 Notes:
 
 - The match is on the executable **file name** and is case-insensitive; a trailing `.exe` is ignored, so
-  `--bypass-process curl` matches both `curl` and `curl.exe`. The flag is repeatable.
+  `--bypass-process curl` matches both `curl` and `curl.exe`. The flag is repeatable. On Windows, a selected
+  launcher/application root also covers its live descendant processes. Process names and parent relationships come
+  from the system ToolHelp snapshot, so protected game and anti-cheat processes do not depend on `OpenProcess` access.
 - A bypassed session is relayed directly **and** its outbound socket is pinned to the physical network interface
   (`SO_BINDTODEVICE` on Linux, `IP_UNICAST_IF`/`IPV6_UNICAST_IF` on Windows). This is required: otherwise the relay
   would be re-captured by the TUN and the loop would merely move one hop. The interface is auto-detected from the
   default route before `--setup` installs the TUN routes; override it with `--bind-interface <name>` if detection
   picks the wrong one.
 - Process bypass takes precedence over virtual/over-TCP DNS and UdpGW handling. In particular, DNS requests from a
-  bypassed process are sent directly so the process receives real addresses rather than virtual-DNS fake IPs.
+  bypassed process are sent directly so the process receives real addresses rather than virtual-DNS fake IPs. If an
+  application cached a virtual address before it was selected, tun2proxy resolves the remembered domain again through
+  a physical-interface-bound DNS socket before opening its direct relay.
 - Only implemented on **Windows and Linux**. On other platforms the flag is accepted but ignored (with a warning).
 - Not compatible with the Linux `--unshare` socket-transfer path; use it with a normal `--setup` run.
 

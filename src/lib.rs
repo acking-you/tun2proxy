@@ -234,6 +234,34 @@ async fn create_udp_stream(
     }
 }
 
+/// Replace a stale virtual-DNS destination with a real address before opening a
+/// physical-interface-bound process bypass relay.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+async fn restore_bypass_destination(
+    info: &mut SessionInfo,
+    virtual_dns: Option<&Arc<Mutex<VirtualDns>>>,
+    dns_addr: IpAddr,
+    bind: Option<&DirectBind>,
+) -> std::io::Result<()> {
+    let Some(virtual_dns) = virtual_dns else {
+        return Ok(());
+    };
+    let domain = {
+        let mut virtual_dns = virtual_dns.lock().await;
+        virtual_dns.touch_ip(&info.dst.ip());
+        virtual_dns.resolve_ip(&info.dst.ip()).cloned()
+    };
+    let Some(domain) = domain else {
+        return Ok(());
+    };
+    let bind = bind.ok_or_else(|| std::io::Error::other("process-bypass physical interface is unavailable"))?;
+    let fake_destination = info.dst;
+    let destination = direct::resolve_domain_bound(&domain, info.dst.port(), dns_addr, info.dst.is_ipv6(), bind).await?;
+    info.dst = destination;
+    log::info!("restored process-bypass destination `{domain}` from virtual address {fake_destination} to {destination}");
+    Ok(())
+}
+
 /// Run the proxy server
 /// # Arguments
 /// * `device` - The network device to use
@@ -440,23 +468,27 @@ where
                         if bypass && info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
                             info.dst.set_ip(dns_addr);
                         }
-                        let domain_name = if bypass {
-                            None
-                        } else if let Some(virtual_dns) = &virtual_dns {
+                        let bypass_destination = if bypass {
+                            restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await
+                        } else {
+                            Ok(())
+                        };
+                        let domain_name = if let Some(virtual_dns) = &virtual_dns {
                             let mut virtual_dns = virtual_dns.lock().await;
                             virtual_dns.touch_ip(&info.dst.ip());
                             virtual_dns.resolve_ip(&info.dst.ip()).cloned()
                         } else {
                             None
                         };
-                        match (bypass, &no_proxy_mgr) {
-                            (true, Some(no_proxy_mgr)) => (
+                        match (bypass_destination, bypass, &no_proxy_mgr) {
+                            (Err(error), _, _) => (Err(error), direct_bind.clone(), bypass, policy_changes),
+                            (Ok(()), true, Some(no_proxy_mgr)) => (
                                 no_proxy_mgr.new_proxy_handler(info, domain_name, false).await,
                                 direct_bind.clone(),
                                 bypass,
                                 policy_changes,
                             ),
-                            _ => (mgr.new_proxy_handler(info, domain_name, false).await, None, bypass, policy_changes),
+                            (Ok(()), _, _) => (mgr.new_proxy_handler(info, domain_name, false).await, None, bypass, policy_changes),
                         }
                     };
                     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -540,6 +572,7 @@ where
                             if info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
                                 info.dst.set_ip(dns_addr);
                             }
+                            restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await?;
                             let no_proxy_mgr = no_proxy_mgr.as_ref().ok_or("process bypass manager is unavailable")?;
                             let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
                             return handle_udp_associate_session(

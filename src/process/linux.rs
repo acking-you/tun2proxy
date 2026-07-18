@@ -8,7 +8,7 @@ use std::path::Path;
 /// running with the privileges `--setup` already requires) and falls back to
 /// `/proc/<pid>/comm` (which the kernel truncates to 15 bytes) when the symlink
 /// cannot be read.
-pub(super) fn process_name(pid: u32) -> Option<String> {
+fn process_name(pid: u32) -> Option<String> {
     if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
         if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
             if !name.is_empty() {
@@ -25,4 +25,11 @@ pub(super) fn process_name(pid: u32) -> Option<String> {
     // `comm` may itself contain a path component in unusual cases; keep only the
     // basename to stay consistent with the `exe` branch.
     Some(Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name).to_string())
+}
+
+/// Linux currently applies executable-name rules to the socket owner itself.
+/// Keep the vector-shaped interface aligned with Windows, where launcher child
+/// processes also participate in Task Manager-style application matching.
+pub(super) fn process_names(pid: u32) -> Vec<String> {
+    process_name(pid).into_iter().collect()
 }
