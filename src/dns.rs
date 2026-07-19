@@ -44,7 +44,7 @@ pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, Stri
                 return Ok(IpAddr::V6((*addr).into()));
             }
             RData::CNAME(name) => {
-                cname = Some(name.to_utf8());
+                cname = Some(name.to_ascii());
             }
             _ => {}
         }
@@ -57,7 +57,9 @@ pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, Stri
 
 pub fn extract_domain_from_dns_message(message: &Message) -> Result<String, String> {
     let query = message.queries().first().ok_or("DnsRequest no query body")?;
-    let name = query.name().to_string();
+    // Display intentionally renders IDNA labels as Unicode. Proxy protocols
+    // and OS resolvers need the wire-safe ASCII/Punycode representation.
+    let name = query.name().to_ascii();
     Ok(name)
 }
 
@@ -100,5 +102,15 @@ mod tests {
         assert_eq!(a_response.answers().len(), 1);
         assert!(aaaa_response.answers().is_empty());
         assert!(https_response.answers().is_empty());
+    }
+
+    #[test]
+    fn extracted_idna_name_remains_ascii_for_proxy_transport() {
+        let ascii = "rr1---sn-npoe7ndl.xn--ngstr-lra8j.com";
+        let mut message = Message::new(2, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(Name::from_ascii(ascii).unwrap(), RecordType::A));
+
+        assert_eq!(message.queries()[0].name().to_string(), "rr1---sn-npoe7ndl.ångströ.com");
+        assert_eq!(extract_domain_from_dns_message(&message).unwrap(), ascii);
     }
 }

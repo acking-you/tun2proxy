@@ -92,6 +92,7 @@ pub mod windows_elevation;
 mod windows_network_config;
 
 const DNS_PORT: u16 = 53;
+const DNS_OVER_TLS_PORT: u16 = 853;
 
 /// Physical interface a process-bypass direct relay egresses through. On
 /// platforms without the feature this is an uninhabited type, so the threaded
@@ -379,7 +380,7 @@ async fn resolve_domain_over_proxy(
                 RData::AAAA(address) if want_ipv6 => {
                     return Ok(SocketAddr::new(IpAddr::V6((*address).into()), port));
                 }
-                RData::CNAME(name) => cname = Some(name.to_utf8()),
+                RData::CNAME(name) => cname = Some(name.to_ascii()),
                 _ => {}
             }
         }
@@ -451,6 +452,7 @@ where
     let dns_addr = args.dns_addr;
     let ipv6_enabled = args.ipv6_enabled;
     let udp_strategy = args.udp_strategy;
+    let virtual_dns_portals = Arc::new(args.virtual_dns_portals.clone());
     // Keep every task created by this forwarding instance under one owner.
     // Dropping a bare tokio JoinHandle detaches its task, which previously let
     // old TCP/UDP sessions survive a TUN stop or hot switch. JoinSet aborts all
@@ -631,6 +633,8 @@ where
                 let info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
                 let mgr = mgr.clone();
                 let socket_queue = socket_queue.clone();
+                let dns = args.dns;
+                let virtual_dns_portals = virtual_dns_portals.clone();
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 let process_matcher = process_matcher.clone();
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -642,6 +646,38 @@ where
                 // task rather than on the accept loop.
                 managed_tasks.spawn(async move {
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let policy_changes = process_matcher.as_ref().map(|matcher| matcher.subscribe());
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let bypass = match &process_matcher {
+                        Some(matcher) => matcher.matches(IpProtocol::Tcp, info.src, info.dst).await,
+                        None => false,
+                    };
+                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                    let bypass = false;
+
+                    if !bypass && dns == ArgDns::Virtual && info.dst.port() == DNS_PORT {
+                        let result = match virtual_dns.clone() {
+                            Some(virtual_dns) => handle_virtual_dns_tcp_session(tcp, virtual_dns).await,
+                            None => Err("virtual DNS manager is unavailable".into()),
+                        };
+                        if let Err(error) = result {
+                            log::debug!("{info} virtual DNS TCP session ended: {error}");
+                        }
+                        log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                        return;
+                    }
+
+                    if !bypass && is_virtual_dns_tls_probe(dns, &virtual_dns_portals, info.dst) {
+                        log::debug!("Rejecting opportunistic DNS-over-TLS probe to virtual DNS portal {}", info.dst);
+                        let mut tcp = tcp;
+                        if let Err(error) = tcp.shutdown().await {
+                            log::debug!("{info} failed to close virtual DNS TLS probe: {error}");
+                        }
+                        log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
+                        return;
+                    }
+
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let (handler_result, bind, bypass, policy_changes): (
                         HandlerResult,
                         Option<DirectBind>,
@@ -649,11 +685,6 @@ where
                         Option<tokio::sync::watch::Receiver<u64>>,
                     ) = {
                         let mut info = info;
-                        let policy_changes = process_matcher.as_ref().map(|matcher| matcher.subscribe());
-                        let bypass = match &process_matcher {
-                            Some(matcher) => matcher.matches(IpProtocol::Tcp, info.src, info.dst).await,
-                            None => false,
-                        };
                         if bypass && info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
                             info.dst.set_ip(dns_addr);
                         }
@@ -907,6 +938,35 @@ async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<Vi
         let (msg, qname, ip) = dns.lock().await.generate_query(&buf[..len])?;
         udp.write_all(&msg).await?;
         log::debug!("Virtual DNS query: {qname} -> {ip}");
+    }
+    Ok(())
+}
+
+fn is_virtual_dns_tls_probe(dns: ArgDns, portals: &[IpAddr], destination: SocketAddr) -> bool {
+    dns == ArgDns::Virtual && destination.port() == DNS_OVER_TLS_PORT && portals.contains(&destination.ip())
+}
+
+async fn handle_virtual_dns_tcp_session<S>(mut tcp: S, dns: Arc<Mutex<VirtualDns>>) -> crate::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    loop {
+        let query_len = match tcp.read_u16().await {
+            Ok(query_len) => usize::from(query_len),
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error.into()),
+        };
+        if query_len == 0 {
+            return Err("empty DNS-over-TCP query".into());
+        }
+
+        let mut query = vec![0_u8; query_len];
+        tcp.read_exact(&mut query).await?;
+        let (response, qname, ip) = dns.lock().await.generate_query(&query)?;
+        let response_len = u16::try_from(response.len()).map_err(|_| "virtual DNS response exceeds TCP framing limit")?;
+        tcp.write_u16(response_len).await?;
+        tcp.write_all(&response).await?;
+        log::debug!("Virtual DNS TCP query: {qname} -> {ip}");
     }
     Ok(())
 }
@@ -1350,4 +1410,63 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
     }
     crate::traffic_status::traffic_status_update(tx, rx)?;
     Ok(proxy_handler.get_udp_associate())
+}
+
+#[cfg(test)]
+mod virtual_dns_transport_tests {
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RecordType},
+    };
+
+    use super::*;
+
+    #[test]
+    fn dns_tls_probe_only_matches_configured_virtual_portal() {
+        let portals = ["172.19.0.2".parse().unwrap()];
+
+        assert!(is_virtual_dns_tls_probe(
+            ArgDns::Virtual,
+            &portals,
+            "172.19.0.2:853".parse().unwrap()
+        ));
+        assert!(!is_virtual_dns_tls_probe(
+            ArgDns::Virtual,
+            &portals,
+            "172.19.0.3:853".parse().unwrap()
+        ));
+        assert!(!is_virtual_dns_tls_probe(
+            ArgDns::Virtual,
+            &portals,
+            "172.19.0.2:443".parse().unwrap()
+        ));
+        assert!(!is_virtual_dns_tls_probe(
+            ArgDns::Direct,
+            &portals,
+            "172.19.0.2:853".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn virtual_dns_answers_length_prefixed_tcp_queries() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let resolver = VirtualDnsState::default().resolver();
+        let server_task = tokio::spawn(handle_virtual_dns_tcp_session(server, resolver));
+
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_ascii("example.com").unwrap(), RecordType::A));
+        let query = query.to_vec().unwrap();
+        client.write_u16(query.len() as u16).await.unwrap();
+        client.write_all(&query).await.unwrap();
+
+        let response_len = client.read_u16().await.unwrap();
+        let mut response = vec![0_u8; usize::from(response_len)];
+        client.read_exact(&mut response).await.unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.message_type(), MessageType::Response);
+        assert_eq!(response.answers().len(), 1);
+
+        drop(client);
+        server_task.await.unwrap().unwrap();
+    }
 }

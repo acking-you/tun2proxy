@@ -284,7 +284,7 @@ pub(crate) async fn resolve_domain_bound(
             match answer.data() {
                 RData::A(address) if !want_ipv6 => return Ok(SocketAddr::new(IpAddr::V4((*address).into()), port)),
                 RData::AAAA(address) if want_ipv6 => return Ok(SocketAddr::new(IpAddr::V6((*address).into()), port)),
-                RData::CNAME(name) => cname = Some(name.to_utf8()),
+                RData::CNAME(name) => cname = Some(name.to_ascii()),
                 _ => {}
             }
         }

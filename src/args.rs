@@ -106,6 +106,15 @@ pub struct Args {
     #[arg(long, value_name = "CIDR", default_value = "198.18.0.0/15")]
     pub virtual_dns_pool: IpCidr,
 
+    /// Addresses advertised by an embedding platform as local virtual DNS
+    /// portals. TCP and UDP port 53 are answered by virtual DNS. Opportunistic
+    /// DNS-over-TLS probes to these addresses are rejected locally so the OS
+    /// can immediately fall back to plain DNS instead of proxying an
+    /// unreachable private address.
+    #[arg(long = "virtual-dns-portal", value_name = "IP")]
+    #[serde(default)]
+    pub virtual_dns_portals: Vec<IpAddr>,
+
     /// IPs used in routing setup which should bypass the tunnel,
     /// in the form of IP or IP/CIDR. Multiple IPs can be specified,
     /// e.g. --bypass 3.4.5.0/24 --bypass 5.6.7.8
@@ -234,6 +243,7 @@ impl Default for Args {
             udp_strategy: ArgUdpStrategy::default(),
             verbosity: ArgVerbosity::Info,
             virtual_dns_pool: IpCidr::from_str("198.18.0.0/15").unwrap(),
+            virtual_dns_portals: vec![],
             daemonize: false,
             exit_on_fatal_error: false,
             max_sessions: 200,
@@ -558,5 +568,29 @@ mod tests {
         assert_eq!(Args::default().udp_strategy, ArgUdpStrategy::Proxy);
         assert_eq!(direct_args.udp_strategy, ArgUdpStrategy::Direct);
         assert_eq!(block_args.udp_strategy, ArgUdpStrategy::Block);
+    }
+
+    #[test]
+    fn virtual_dns_portals_default_empty_and_accept_multiple_addresses() {
+        let default_args = Args::parse_from(["tun2proxy", "--proxy", "socks5://127.0.0.1:1080"]);
+        let configured = Args::parse_from([
+            "tun2proxy",
+            "--proxy",
+            "socks5://127.0.0.1:1080",
+            "--virtual-dns-portal",
+            "172.19.0.2",
+            "--virtual-dns-portal",
+            "fdfe:dcba:9876::2",
+        ]);
+
+        assert!(default_args.virtual_dns_portals.is_empty());
+        assert!(Args::default().virtual_dns_portals.is_empty());
+        assert_eq!(
+            configured.virtual_dns_portals,
+            vec![
+                "172.19.0.2".parse::<IpAddr>().unwrap(),
+                "fdfe:dcba:9876::2".parse::<IpAddr>().unwrap(),
+            ]
+        );
     }
 }
