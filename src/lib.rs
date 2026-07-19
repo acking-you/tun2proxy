@@ -21,7 +21,11 @@ use std::{
     collections::VecDeque,
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -93,6 +97,78 @@ mod windows_network_config;
 
 const DNS_PORT: u16 = 53;
 const DNS_OVER_TLS_PORT: u16 = 853;
+
+#[derive(Debug, Default)]
+struct SessionCounts {
+    total: AtomicUsize,
+    tcp: AtomicUsize,
+    udp: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionCountSnapshot {
+    total: usize,
+    tcp: usize,
+    udp: usize,
+}
+
+impl SessionCounts {
+    fn try_acquire(self: &Arc<Self>, protocol: IpProtocol, max_sessions: usize) -> Option<SessionPermit> {
+        self.total
+            .fetch_update(Relaxed, Relaxed, |count| (count < max_sessions).then_some(count + 1))
+            .ok()?;
+        self.protocol_count(protocol).fetch_add(1, Relaxed);
+        let snapshot = self.snapshot();
+        log::trace!("Session count total={}, TCP={}, UDP={}", snapshot.total, snapshot.tcp, snapshot.udp);
+        Some(SessionPermit {
+            counts: Arc::clone(self),
+            protocol,
+        })
+    }
+
+    fn snapshot(&self) -> SessionCountSnapshot {
+        SessionCountSnapshot {
+            total: self.total.load(Relaxed),
+            tcp: self.tcp.load(Relaxed),
+            udp: self.udp.load(Relaxed),
+        }
+    }
+
+    fn protocol_count(&self, protocol: IpProtocol) -> &AtomicUsize {
+        match protocol {
+            IpProtocol::Tcp => &self.tcp,
+            IpProtocol::Udp => &self.udp,
+            _ => unreachable!("only TCP and UDP sessions are admitted"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SessionPermit {
+    counts: Arc<SessionCounts>,
+    protocol: IpProtocol,
+}
+
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        self.counts.protocol_count(self.protocol).fetch_sub(1, Relaxed);
+        self.counts.total.fetch_sub(1, Relaxed);
+        let snapshot = self.counts.snapshot();
+        log::trace!("Session count total={}, TCP={}, UDP={}", snapshot.total, snapshot.tcp, snapshot.udp);
+    }
+}
+
+fn log_session_limit(protocol: IpProtocol, max_sessions: usize, counts: &SessionCounts) {
+    let snapshot = counts.snapshot();
+    log::warn!(
+        "TUN session limit reached: total={}/{}, TCP={}, UDP={}; dropping new {} session",
+        snapshot.total,
+        max_sessions,
+        snapshot.tcp,
+        snapshot.udp,
+        protocol
+    );
+}
 
 /// Physical interface a process-bypass direct relay egresses through. On
 /// platforms without the feature this is an uninhabited type, so the threaded
@@ -589,8 +665,7 @@ where
         client
     });
 
-    let task_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    use std::sync::atomic::Ordering::Relaxed;
+    let session_counts = Arc::new(SessionCounts::default());
 
     let forwarding_result: crate::Result<()> = loop {
         // JoinSet keeps completed task outputs until they are observed. Reap
@@ -604,7 +679,7 @@ where
             }
         }
 
-        let task_count = task_count.clone();
+        let session_counts = session_counts.clone();
         let virtual_dns = virtual_dns.clone();
         let ip_stack_stream = tokio::select! {
             _ = shutdown_token.cancelled() => {
@@ -621,15 +696,14 @@ where
         let max_sessions = args.max_sessions;
         match ip_stack_stream {
             IpStackStream::Tcp(tcp) => {
-                if task_count.load(Relaxed) >= max_sessions {
+                let Some(session_permit) = session_counts.try_acquire(IpProtocol::Tcp, max_sessions) else {
                     if args.exit_on_fatal_error {
                         log::info!("Too many sessions that over {max_sessions}, exiting...");
                         break Ok(());
                     }
-                    log::warn!("Too many sessions that over {max_sessions}, dropping new session");
+                    log_session_limit(IpProtocol::Tcp, max_sessions, &session_counts);
                     continue;
-                }
-                log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
+                };
                 let info = SessionInfo::new(tcp.local_addr(), tcp.peer_addr(), IpProtocol::Tcp);
                 let mgr = mgr.clone();
                 let socket_queue = socket_queue.clone();
@@ -645,6 +719,7 @@ where
                 // bypass decision and handler creation run inside the per-session
                 // task rather than on the accept loop.
                 managed_tasks.spawn(async move {
+                    let _session_permit = session_permit;
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let policy_changes = process_matcher.as_ref().map(|matcher| matcher.subscribe());
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -663,7 +738,6 @@ where
                         if let Err(error) = result {
                             log::debug!("{info} virtual DNS TCP session ended: {error}");
                         }
-                        log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
                         return;
                     }
 
@@ -673,7 +747,6 @@ where
                         if let Err(error) = tcp.shutdown().await {
                             log::debug!("{info} failed to close virtual DNS TLS probe: {error}");
                         }
-                        log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
                         return;
                     }
 
@@ -745,19 +818,17 @@ where
                         }
                         Err(err) => log::error!("{info} failed to create proxy handler: {err}"),
                     }
-                    log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
                 });
             }
             IpStackStream::Udp(udp) => {
-                if task_count.load(Relaxed) >= max_sessions {
+                let Some(session_permit) = session_counts.try_acquire(IpProtocol::Udp, max_sessions) else {
                     if args.exit_on_fatal_error {
                         log::info!("Too many sessions that over {max_sessions}, exiting...");
                         break Ok(());
                     }
-                    log::warn!("Too many sessions that over {max_sessions}, dropping new session");
+                    log_session_limit(IpProtocol::Udp, max_sessions, &session_counts);
                     continue;
-                }
-                log::trace!("Session count {}", task_count.fetch_add(1, Relaxed).saturating_add(1));
+                };
                 let mgr = mgr.clone();
                 let socket_queue = socket_queue.clone();
                 let proxy_type = args.proxy.proxy_type;
@@ -770,7 +841,9 @@ where
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 #[cfg(feature = "udpgw")]
                 let udpgw_client = udpgw_client.clone();
+                let udp_setup_timeout = Duration::from_secs(args.udp_timeout.max(1));
                 managed_tasks.spawn(async move {
+                    let _session_permit = session_permit;
                     let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let original_src = info.src;
@@ -803,6 +876,7 @@ where
                                 socket_queue,
                                 ipv6_enabled,
                                 direct_bind,
+                                udp_setup_timeout,
                             )
                             .await;
                         }
@@ -851,6 +925,7 @@ where
                                 socket_queue,
                                 ipv6_enabled,
                                 direct_bind,
+                                udp_setup_timeout,
                             )
                             .await;
                         }
@@ -871,7 +946,8 @@ where
                         }
 
                         let proxy_handler = mgr.new_proxy_handler(info, domain_name, true).await?;
-                        handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled, None).await
+                        handle_udp_associate_session(udp, proxy_type, proxy_handler, socket_queue, ipv6_enabled, None, udp_setup_timeout)
+                            .await
                     };
 
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -891,7 +967,6 @@ where
                     if let Some(Err(err)) = result {
                         log::info!("Ending {info} with \"{err}\"");
                     }
-                    log::trace!("Session count {}", task_count.fetch_sub(1, Relaxed).saturating_sub(1));
                 });
             }
             IpStackStream::UnknownTransport(u) => {
@@ -905,7 +980,7 @@ where
             }
         }
     };
-    let active_sessions = task_count.load(Relaxed);
+    let active_sessions = session_counts.snapshot().total;
     if !managed_tasks.is_empty() {
         log::debug!("Stopping {} managed TUN child task(s) before network teardown", managed_tasks.len());
         managed_tasks.abort_all();
@@ -1171,6 +1246,7 @@ async fn handle_udp_associate_session(
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
     bind: Option<DirectBind>,
+    setup_timeout: Duration,
 ) -> crate::Result<()> {
     use socks5_impl::protocol::{Address, StreamOperation, UdpHeader};
 
@@ -1186,21 +1262,26 @@ async fn handle_udp_associate_session(
 
     log::info!("Beginning {session_info}");
 
-    // `_server` is meaningful here, it must be alive all the time
-    // to ensure that UDP transmission will not be interrupted accidentally.
-    // The bypass path always reports a udp-associate address (its destination),
-    // so the proxy-handshake branch below is only taken for real proxies, where
-    // `bind` is `None`.
-    let (_server, udp_addr) = match udp_addr {
-        Some(udp_addr) => (None, udp_addr),
-        None => {
-            let mut server = create_tcp_stream(&socket_queue, server_addr, None).await?;
-            let udp_addr = handle_proxy_session(&mut server, proxy_handler).await?;
-            (Some(server), udp_addr.ok_or("udp associate failed")?)
-        }
+    let setup = async {
+        // `_server` is meaningful here, it must be alive all the time
+        // to ensure that UDP transmission will not be interrupted accidentally.
+        // The bypass path always reports a udp-associate address (its destination),
+        // so the proxy-handshake branch below is only taken for real proxies, where
+        // `bind` is `None`.
+        let (server, udp_addr) = match udp_addr {
+            Some(udp_addr) => (None, udp_addr),
+            None => {
+                let mut server = create_tcp_stream(&socket_queue, server_addr, None).await?;
+                let udp_addr = handle_proxy_session(&mut server, proxy_handler).await?;
+                (Some(server), udp_addr.ok_or("udp associate failed")?)
+            }
+        };
+        let udp_server = create_udp_stream(&socket_queue, udp_addr, bind.as_ref()).await?;
+        Ok::<_, Error>((server, udp_server))
     };
-
-    let mut udp_server = create_udp_stream(&socket_queue, udp_addr, bind.as_ref()).await?;
+    let (_server, mut udp_server) = tokio::time::timeout(setup_timeout, setup)
+        .await
+        .map_err(|_| Error::from(format!("{session_info} UDP association setup timed out after {setup_timeout:?}")))??;
 
     let mut buf1 = [0_u8; 4096];
     let mut buf2 = [0_u8; 4096];
@@ -1420,6 +1501,23 @@ mod virtual_dns_transport_tests {
     };
 
     use super::*;
+
+    #[test]
+    fn session_permits_enforce_limit_and_release_on_drop() {
+        let counts = Arc::new(SessionCounts::default());
+        let tcp = counts.try_acquire(IpProtocol::Tcp, 2).unwrap();
+        let udp = counts.try_acquire(IpProtocol::Udp, 2).unwrap();
+
+        assert!(counts.try_acquire(IpProtocol::Tcp, 2).is_none());
+        assert_eq!(counts.snapshot(), SessionCountSnapshot { total: 2, tcp: 1, udp: 1 });
+
+        drop(udp);
+        let replacement = counts.try_acquire(IpProtocol::Tcp, 2).unwrap();
+        assert_eq!(counts.snapshot(), SessionCountSnapshot { total: 2, tcp: 2, udp: 0 });
+
+        drop((tcp, replacement));
+        assert_eq!(counts.snapshot(), SessionCountSnapshot { total: 0, tcp: 0, udp: 0 });
+    }
 
     #[test]
     fn dns_tls_probe_only_matches_configured_virtual_portal() {
