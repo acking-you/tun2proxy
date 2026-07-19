@@ -233,12 +233,22 @@ async fn general_run_async_with_process_bypass_setup(
         tun_config.destination(TUN_GATEWAY);
     }
 
+    // Keep ownership outside `tun::Device` until construction succeeds. This
+    // closes an embedding application's duplicated descriptor on every setup
+    // error without risking a double-close inside the tun crate.
     #[cfg(unix)]
-    if let Some(fd) = args.tun_fd {
-        tun_config.raw_fd(fd);
-        if let Some(v) = args.close_fd_on_drop {
-            tun_config.close_fd_on_drop(v);
-        };
+    let owned_tun_fd = if args.tun_fd.is_some() && args.close_fd_on_drop.unwrap_or(true) {
+        use std::os::fd::FromRawFd;
+        args.tun_fd.map(|fd| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    if let Some(fd) = owned_tun_fd.as_ref() {
+        use std::os::fd::AsRawFd;
+        tun_config.raw_fd(fd.as_raw_fd()).close_fd_on_drop(false);
+    } else if let Some(fd) = args.tun_fd {
+        tun_config.raw_fd(fd).close_fd_on_drop(false);
     } else if let Some(ref tun) = args.tun {
         tun_config.tun_name(tun);
     }

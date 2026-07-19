@@ -613,7 +613,9 @@ where
                 let udpgw_client = udpgw_client.clone();
                 managed_tasks.spawn(async move {
                     let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let original_src = info.src;
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let original_dst = info.dst;
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let policy_changes = process_matcher.as_ref().map(|matcher| matcher.subscribe());
