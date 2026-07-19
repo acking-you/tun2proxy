@@ -148,6 +148,13 @@ pub struct Args {
     #[arg(long, value_name = "seconds", default_value = "10")]
     pub udp_timeout: u64,
 
+    /// Handling strategy for non-DNS UDP sessions. `proxy` forwards them via
+    /// the configured proxy, `direct` sends them without using the proxy, and
+    /// `block` discards them. DNS continues to follow `--dns`.
+    #[arg(long, value_name = "strategy", value_enum, default_value = "proxy")]
+    #[serde(default)]
+    pub udp_strategy: ArgUdpStrategy,
+
     /// Verbosity level
     #[arg(short, long, value_name = "level", value_enum, default_value = "info")]
     pub verbosity: ArgVerbosity,
@@ -224,6 +231,7 @@ impl Default for Args {
             mtu: crate::DEFAULT_MTU,
             tcp_timeout: 600,
             udp_timeout: 10,
+            udp_strategy: ArgUdpStrategy::default(),
             verbosity: ArgVerbosity::Info,
             virtual_dns_pool: IpCidr::from_str("198.18.0.0/15").unwrap(),
             daemonize: false,
@@ -515,6 +523,16 @@ impl std::fmt::Display for ProxyType {
     }
 }
 
+/// Non-DNS UDP handling strategy.
+#[repr(C)]
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+pub enum ArgUdpStrategy {
+    #[default]
+    Proxy = 0,
+    Direct,
+    Block,
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -528,5 +546,17 @@ mod tests {
         assert_eq!(crate::DEFAULT_MTU, 1500);
         assert_eq!(cli.mtu, crate::DEFAULT_MTU);
         assert_eq!(Args::default().mtu, crate::DEFAULT_MTU);
+    }
+
+    #[test]
+    fn udp_strategy_defaults_to_proxy_and_accepts_fallback_policies() {
+        let default_args = Args::parse_from(["tun2proxy", "--proxy", "socks5://127.0.0.1:1080"]);
+        let direct_args = Args::parse_from(["tun2proxy", "--proxy", "socks5://127.0.0.1:1080", "--udp-strategy", "direct"]);
+        let block_args = Args::parse_from(["tun2proxy", "--proxy", "socks5://127.0.0.1:1080", "--udp-strategy", "block"]);
+
+        assert_eq!(default_args.udp_strategy, ArgUdpStrategy::Proxy);
+        assert_eq!(Args::default().udp_strategy, ArgUdpStrategy::Proxy);
+        assert_eq!(direct_args.udp_strategy, ArgUdpStrategy::Direct);
+        assert_eq!(block_args.udp_strategy, ArgUdpStrategy::Block);
     }
 }

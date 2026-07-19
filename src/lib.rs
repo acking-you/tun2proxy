@@ -35,7 +35,7 @@ use udp_stream::UdpStream;
 use udpgw::{UDPGW_KEEPALIVE_TIME, UDPGW_MAX_CONNECTIONS, UdpGwClientStream, UdpGwResponse};
 
 pub use {
-    args::{ArgDns, ArgProxy, ArgVerbosity, Args, ProxyType},
+    args::{ArgDns, ArgProxy, ArgUdpStrategy, ArgVerbosity, Args, ProxyType},
     error::{BoxError, Error, Result},
     process_bypass::{ProcessBypass, normalize_process_name},
     traffic_status::{TrafficStatus, tun2proxy_set_traffic_status_callback},
@@ -278,6 +278,125 @@ async fn restore_bypass_destination(
     Ok(())
 }
 
+/// Resolve a virtual-DNS name before a direct UDP relay. Resolution itself uses
+/// DNS-over-TCP through the configured proxy, so an Android resolver call
+/// cannot re-enter the VPN DNS portal and return another fake IP.
+async fn restore_direct_udp_destination(
+    info: &mut SessionInfo,
+    domain: Option<&str>,
+    dns_addr: IpAddr,
+    mgr: &Arc<dyn ProxyHandlerManager>,
+    socket_queue: &Option<Arc<SocketQueue>>,
+    bind: Option<&DirectBind>,
+) -> std::io::Result<()> {
+    let Some(domain) = domain else {
+        return Ok(());
+    };
+
+    let virtual_destination = info.dst;
+    let destination = resolve_domain_over_proxy(domain, info.dst.port(), dns_addr, info.dst.is_ipv6(), mgr, socket_queue, bind).await?;
+    info.dst = destination;
+    log::debug!("restored direct UDP destination `{domain}` from virtual address {virtual_destination} to {destination} via proxied DNS");
+    Ok(())
+}
+
+async fn resolve_domain_over_proxy(
+    domain: &str,
+    port: u16,
+    dns_server: IpAddr,
+    want_ipv6: bool,
+    mgr: &Arc<dyn ProxyHandlerManager>,
+    socket_queue: &Option<Arc<SocketQueue>>,
+    bind: Option<&DirectBind>,
+) -> std::io::Result<SocketAddr> {
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query, ResponseCode},
+        rr::{Name, RData, RecordType},
+    };
+    use std::{str::FromStr, sync::atomic::Ordering};
+
+    static NEXT_QUERY_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
+    const DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let resolver = SocketAddr::new(dns_server, DNS_PORT);
+    let resolver_source = match resolver {
+        SocketAddr::V4(_) => SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    let query_type = if want_ipv6 { RecordType::AAAA } else { RecordType::A };
+    let mut current = domain.to_string();
+
+    for _ in 0..4 {
+        let name = Name::from_str(&current).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let request_id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+        let mut request = Message::new(request_id, MessageType::Query, OpCode::Query);
+        request.set_recursion_desired(true);
+        request.add_query(Query::query(name, query_type));
+        let request = request.to_vec().map_err(std::io::Error::other)?;
+
+        let response = tokio::time::timeout(DNS_TIMEOUT, async {
+            let info = SessionInfo::new(resolver_source, resolver, IpProtocol::Tcp);
+            let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
+            let proxy_addr = proxy_handler.lock().await.get_server_addr();
+            let mut stream = create_tcp_stream(socket_queue, proxy_addr, bind).await?;
+            handle_proxy_session(&mut stream, proxy_handler)
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+            let length = u16::try_from(request.len()).map_err(std::io::Error::other)?;
+            stream.write_all(&length.to_be_bytes()).await?;
+            stream.write_all(&request).await?;
+
+            let mut length = [0_u8; 2];
+            stream.read_exact(&mut length).await?;
+            let mut response = vec![0_u8; u16::from_be_bytes(length) as usize];
+            stream.read_exact(&mut response).await?;
+            std::io::Result::Ok(response)
+        })
+        .await
+        .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, format!("proxied DNS query for `{current}` timed out")))??;
+
+        let response = Message::from_vec(&response).map_err(std::io::Error::other)?;
+        if response.id() != request_id {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("proxied DNS response ID mismatch for `{current}`"),
+            ));
+        }
+        if response.response_code() != ResponseCode::NoError {
+            return Err(std::io::Error::other(format!(
+                "proxied DNS query for `{current}` failed with {:?}",
+                response.response_code()
+            )));
+        }
+
+        let mut cname = None;
+        for answer in response.answers() {
+            match answer.data() {
+                RData::A(address) if !want_ipv6 => {
+                    return Ok(SocketAddr::new(IpAddr::V4((*address).into()), port));
+                }
+                RData::AAAA(address) if want_ipv6 => {
+                    return Ok(SocketAddr::new(IpAddr::V6((*address).into()), port));
+                }
+                RData::CNAME(name) => cname = Some(name.to_utf8()),
+                _ => {}
+            }
+        }
+        current = cname.ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::NotFound,
+                format!("proxied DNS response for `{current}` contained no {query_type} address"),
+            )
+        })?;
+    }
+
+    Err(std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!("proxied DNS resolution for `{domain}` exceeded the CNAME limit"),
+    ))
+}
+
 /// Run the proxy server
 /// # Arguments
 /// * `device` - The network device to use
@@ -331,6 +450,7 @@ where
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
     let ipv6_enabled = args.ipv6_enabled;
+    let udp_strategy = args.udp_strategy;
     // Keep every task created by this forwarding instance under one owner.
     // Dropping a bare tokio JoinHandle detaches its task, which previously let
     // old TCP/UDP sessions survive a TUN stop or hot switch. JoinSet aborts all
@@ -358,19 +478,27 @@ where
     // `--bypass-process` are relayed directly to their destination through the
     // physical interface instead of being forwarded to the proxy.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    let (process_matcher, direct_bind, no_proxy_mgr) = match process::ProcessMatcher::new(process_bypass.clone()) {
-        Some(matcher) => {
-            let iface = direct::detect(args.bind_interface.as_deref())?;
-            log::info!(
-                "Process bypass enabled for {:?}; direct relays egress via {}",
-                process_bypass.names(),
-                iface
-            );
-            let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
-            (Some(Arc::new(matcher)), Some(Arc::new(iface) as DirectBind), Some(no_proxy_mgr))
-        }
-        None => (None, None, None),
+    let process_matcher = process::ProcessMatcher::new(process_bypass.clone()).map(Arc::new);
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let direct_bind = if process_matcher.is_some() || udp_strategy == ArgUdpStrategy::Direct {
+        let iface = direct::detect(args.bind_interface.as_deref())?;
+        log::info!("Direct relays egress via {iface}");
+        Some(Arc::new(iface) as DirectBind)
+    } else {
+        None
     };
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let direct_bind: Option<DirectBind> = None;
+    let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if process_bypass.is_configured() {
+        log::info!("Process bypass enabled for {:?}", process_bypass.names());
+    }
+    if udp_strategy == ArgUdpStrategy::Direct {
+        log::warn!("Non-DNS UDP direct fallback enabled; UDP traffic will bypass the proxy");
+    } else if udp_strategy == ArgUdpStrategy::Block {
+        log::warn!("Non-DNS UDP is blocked by policy");
+    }
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     if process_bypass.is_configured() {
         log::warn!("--bypass-process is not supported on this platform; ignoring it");
@@ -541,15 +669,15 @@ where
                         } else {
                             None
                         };
-                        match (bypass_destination, bypass, &no_proxy_mgr) {
-                            (Err(error), _, _) => (Err(error), direct_bind.clone(), bypass, policy_changes),
-                            (Ok(()), true, Some(no_proxy_mgr)) => (
+                        match (bypass_destination, bypass) {
+                            (Err(error), _) => (Err(error), direct_bind.clone(), bypass, policy_changes),
+                            (Ok(()), true) => (
                                 no_proxy_mgr.new_proxy_handler(info, domain_name, false).await,
                                 direct_bind.clone(),
                                 bypass,
                                 policy_changes,
                             ),
-                            (Ok(()), _, _) => (mgr.new_proxy_handler(info, domain_name, false).await, None, bypass, policy_changes),
+                            (Ok(()), false) => (mgr.new_proxy_handler(info, domain_name, false).await, None, bypass, policy_changes),
                         }
                     };
                     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -603,11 +731,11 @@ where
                 let socket_queue = socket_queue.clone();
                 let proxy_type = args.proxy.proxy_type;
                 let dns = args.dns;
+                let udp_strategy = args.udp_strategy;
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 let process_matcher = process_matcher.clone();
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 let direct_bind = direct_bind.clone();
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 #[cfg(feature = "udpgw")]
                 let udpgw_client = udpgw_client.clone();
@@ -636,7 +764,6 @@ where
                                 info.dst.set_ip(dns_addr);
                             }
                             restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await?;
-                            let no_proxy_mgr = no_proxy_mgr.as_ref().ok_or("process bypass manager is unavailable")?;
                             let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
                             return handle_udp_associate_session(
                                 udp,
@@ -665,6 +792,10 @@ where
                             assert_eq!(dns, ArgDns::Direct);
                         }
 
+                        if udp_strategy == ArgUdpStrategy::Block {
+                            return Err(format!("non-DNS UDP blocked by policy for {}", info.dst).into());
+                        }
+
                         let domain_name = if let Some(virtual_dns) = &virtual_dns {
                             let mut virtual_dns = virtual_dns.lock().await;
                             virtual_dns.touch_ip(&info.dst.ip());
@@ -672,6 +803,26 @@ where
                         } else {
                             None
                         };
+
+                        if udp_strategy == ArgUdpStrategy::Direct {
+                            let dns_bind = if proxy_type == ProxyType::None {
+                                direct_bind.as_ref()
+                            } else {
+                                None
+                            };
+                            restore_direct_udp_destination(&mut info, domain_name.as_deref(), dns_addr, &mgr, &socket_queue, dns_bind)
+                                .await?;
+                            let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
+                            return handle_udp_associate_session(
+                                udp,
+                                ProxyType::None,
+                                proxy_handler,
+                                socket_queue,
+                                ipv6_enabled,
+                                direct_bind,
+                            )
+                            .await;
+                        }
 
                         #[cfg(feature = "udpgw")]
                         if let Some(udpgw) = udpgw_client {
