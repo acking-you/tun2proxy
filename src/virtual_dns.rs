@@ -6,16 +6,12 @@ use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
-    time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
 use tproxy_config::IpCidr;
 
-const MAPPING_TIMEOUT: u64 = 60; // Mapping timeout in seconds
-
 struct NameCacheEntry {
     name: String,
-    expiry: Instant,
 }
 
 /// A virtual DNS server which allocates IP addresses to clients.
@@ -110,13 +106,11 @@ impl VirtualDns {
         Ok(addr)
     }
 
-    // This is to be called whenever we receive or send a packet on the socket
-    // which connects the tun interface to the client, so existing IP address to name
-    // mappings to not expire as long as the connection is active.
+    // Mark the mapping as recently used. Mappings intentionally have no time-based
+    // expiry: applications can retain DNS answers beyond their advertised TTL, so
+    // recycling a fake IP can break or misroute a later connection from that cache.
     pub fn touch_ip(&mut self, addr: &IpAddr) {
-        _ = self.lru_cache.get_mut(addr).map(|entry| {
-            entry.expiry = Instant::now() + Duration::from_secs(MAPPING_TIMEOUT);
-        });
+        _ = self.lru_cache.get_mut(addr);
     }
 
     pub fn resolve_ip(&mut self, addr: &IpAddr) -> Option<&String> {
@@ -134,26 +128,6 @@ impl VirtualDns {
         }
         .to_ascii_lowercase();
 
-        let now = Instant::now();
-
-        // Iterate through all entries of the LRU cache and remove those that have expired.
-        loop {
-            let (ip, entry) = match self.lru_cache.iter().next() {
-                None => break,
-                Some((ip, entry)) => (ip, entry),
-            };
-
-            // The entry has expired.
-            if now > entry.expiry {
-                let name = entry.name.clone();
-                self.lru_cache.remove(&ip.clone());
-                self.name_to_ip.remove(&name);
-                continue; // There might be another expired entry after this one.
-            }
-
-            break; // The entry has not expired and all following entries are newer.
-        }
-
         // Return the IP if it is stored inside our LRU cache.
         if let Some(ip) = self.name_to_ip.get(&insert_name) {
             let ip = *ip;
@@ -166,9 +140,8 @@ impl VirtualDns {
 
         loop {
             if let RawEntryMut::Vacant(vacant) = self.lru_cache.raw_entry_mut().from_key(&self.next_addr) {
-                let expiry = Instant::now() + Duration::from_secs(MAPPING_TIMEOUT);
                 let name0 = insert_name.clone();
-                vacant.insert(self.next_addr, NameCacheEntry { name: insert_name, expiry });
+                vacant.insert(self.next_addr, NameCacheEntry { name: insert_name });
                 self.name_to_ip.insert(name0, self.next_addr);
                 return Ok(self.next_addr);
             }
@@ -182,7 +155,16 @@ impl VirtualDns {
                 Self::increment_ip(self.next_addr)?
             };
             if self.next_addr == started_at {
-                return Err("Virtual IP space for DNS exhausted".into());
+                // Every address is allocated. Recycle only now, and choose the
+                // least recently used mapping. DNS lookups and intercepted
+                // sessions both touch their mapping before a new allocation can
+                // acquire the resolver lock, so active cached addresses remain
+                // at the MRU end of the cache.
+                let (ip, entry) = self.lru_cache.remove_lru().ok_or("Virtual IP space for DNS exhausted")?;
+                self.name_to_ip.remove(&entry.name);
+                self.lru_cache.insert(ip, NameCacheEntry { name: insert_name.clone() });
+                self.name_to_ip.insert(insert_name, ip);
+                return Ok(ip);
             }
         }
     }
@@ -233,29 +215,31 @@ mod tests {
     }
 
     #[test]
-    fn single_address_pools_exhaust_without_leaving_the_cidr() {
+    fn single_address_pools_recycle_only_address_without_leaving_the_cidr() {
         for cidr in ["198.18.0.1/32", "2001:db8::1/128"] {
             let mut dns = VirtualDns::new(cidr.parse::<IpCidr>().unwrap());
-            let allocated = dns.find_or_allocate_ip("first.example".to_string()).unwrap();
+            let first = dns.find_or_allocate_ip("first.example".to_string()).unwrap();
+            let second = dns.find_or_allocate_ip("second.example".to_string()).unwrap();
 
-            let error = dns.find_or_allocate_ip("second.example".to_string()).unwrap_err();
-
-            assert_eq!(error.to_string(), "Virtual IP space for DNS exhausted");
-            assert_eq!(dns.resolve_ip(&allocated).map(String::as_str), Some("first.example"));
+            assert_eq!(first, second);
+            assert_eq!(dns.resolve_ip(&second).map(String::as_str), Some("second.example"));
         }
     }
 
     #[test]
-    fn allocation_can_use_the_last_address_before_wrapping() {
+    fn full_pool_recycles_the_least_recently_used_mapping() {
         let mut dns = VirtualDns::new("198.18.0.0/31".parse::<IpCidr>().unwrap());
         let first = dns.find_or_allocate_ip("first.example".to_string()).unwrap();
         let second = dns.find_or_allocate_ip("second.example".to_string()).unwrap();
+        assert_eq!(dns.resolve_ip(&first).map(String::as_str), Some("first.example"));
+
+        let third = dns.find_or_allocate_ip("third.example".to_string()).unwrap();
 
         assert_eq!(first, "198.18.0.0".parse::<IpAddr>().unwrap());
         assert_eq!(second, "198.18.0.1".parse::<IpAddr>().unwrap());
-        assert_eq!(
-            dns.find_or_allocate_ip("third.example".to_string()).unwrap_err().to_string(),
-            "Virtual IP space for DNS exhausted"
-        );
+        assert_eq!(third, second);
+        assert_eq!(dns.resolve_ip(&first).map(String::as_str), Some("first.example"));
+        assert_eq!(dns.resolve_ip(&third).map(String::as_str), Some("third.example"));
+        assert!(!dns.name_to_ip.contains_key("second.example"));
     }
 }
