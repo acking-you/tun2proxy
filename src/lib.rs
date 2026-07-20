@@ -11,7 +11,7 @@ use crate::{
     virtual_dns::VirtualDns,
 };
 pub use clap::ValueEnum;
-use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
+use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 use proxy_handler::{ProxyHandler, ProxyHandlerManager};
 use socks::SocksProxyManager;
 pub use socks5_impl::protocol::UserKey;
@@ -97,6 +97,52 @@ mod windows_network_config;
 
 const DNS_PORT: u16 = 53;
 const DNS_OVER_TLS_PORT: u16 = 853;
+const ICMP_V4_PROTOCOL: u8 = 1;
+const ICMP_V6_PROTOCOL: u8 = 58;
+
+fn icmp_type_code(protocol: u8, payload: &[u8]) -> Option<(u8, u8)> {
+    if protocol != ICMP_V4_PROTOCOL && protocol != ICMP_V6_PROTOCOL {
+        return None;
+    }
+    payload.first().zip(payload.get(1)).map(|(&kind, &code)| (kind, code))
+}
+
+fn log_unknown_transport(packet: &IpStackUnknownTransport) {
+    let protocol = packet.ip_protocol().0;
+    let payload = packet.payload();
+    let type_code = icmp_type_code(protocol, payload);
+    match (protocol, type_code) {
+        // Android emits this after a QUIC/UDP socket has already closed and a
+        // late relayed response reaches its old port. It is feedback about the
+        // dead UDP flow, not evidence that the VPN itself has no connectivity.
+        (ICMP_V4_PROTOCOL, Some((3, 3))) | (ICMP_V6_PROTOCOL, Some((1, 4))) => log::debug!(
+            "Discarding late UDP port-unreachable feedback {} -> {}, payload {} bytes",
+            packet.src_addr(),
+            packet.dst_addr(),
+            payload.len()
+        ),
+        (ICMP_V4_PROTOCOL, Some((3, 4))) | (ICMP_V6_PROTOCOL, Some((2, _))) => log::warn!(
+            "Discarding path-MTU feedback {} -> {}, ICMP type/code {:?}, payload {} bytes; consider lowering the VPN MTU",
+            packet.src_addr(),
+            packet.dst_addr(),
+            type_code,
+            payload.len()
+        ),
+        (_, Some((kind, code))) => log::info!(
+            "Unhandled ICMP transport {} -> {}, protocol {protocol}, type {kind}, code {code}, payload {} bytes",
+            packet.src_addr(),
+            packet.dst_addr(),
+            payload.len()
+        ),
+        _ => log::info!(
+            "Unhandled transport {} -> {}, IP protocol {:?}, payload {} bytes",
+            packet.src_addr(),
+            packet.dst_addr(),
+            packet.ip_protocol(),
+            payload.len()
+        ),
+    }
+}
 
 #[derive(Debug, Default)]
 struct SessionCounts {
@@ -336,14 +382,7 @@ async fn restore_bypass_destination(
     dns_addr: IpAddr,
     bind: Option<&DirectBind>,
 ) -> std::io::Result<()> {
-    let Some(virtual_dns) = virtual_dns else {
-        return Ok(());
-    };
-    let domain = {
-        let mut virtual_dns = virtual_dns.lock().await;
-        virtual_dns.touch_ip(&info.dst.ip());
-        virtual_dns.resolve_ip(&info.dst.ip()).cloned()
-    };
+    let domain = resolve_virtual_domain(virtual_dns, info.dst.ip()).await?;
     let Some(domain) = domain else {
         return Ok(());
     };
@@ -353,6 +392,27 @@ async fn restore_bypass_destination(
     info.dst = destination;
     log::info!("restored process-bypass destination `{domain}` from virtual address {fake_destination} to {destination}");
     Ok(())
+}
+
+/// Resolve a fake-IP destination and reject stale fake addresses explicitly.
+/// Forwarding an unmapped 198.18.0.0/15 address to the upstream proxy only
+/// turns a recoverable application DNS-cache miss into a long timeout.
+async fn resolve_virtual_domain(virtual_dns: Option<&Arc<Mutex<VirtualDns>>>, destination: IpAddr) -> std::io::Result<Option<Arc<str>>> {
+    let Some(virtual_dns) = virtual_dns else {
+        return Ok(None);
+    };
+    let mut virtual_dns = virtual_dns.lock().await;
+    virtual_dns.touch_ip(&destination);
+    if let Some(domain) = virtual_dns.resolve_ip(&destination) {
+        return Ok(Some(domain));
+    }
+    if virtual_dns.contains_address(destination) {
+        return Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            format!("stale virtual DNS address {destination}; reconnect after refreshing DNS"),
+        ));
+    }
+    Ok(None)
 }
 
 /// Resolve a virtual-DNS name before a direct UDP relay. Resolution itself uses
@@ -766,34 +826,27 @@ where
                         } else {
                             Ok(())
                         };
-                        let domain_name = if let Some(virtual_dns) = &virtual_dns {
-                            let mut virtual_dns = virtual_dns.lock().await;
-                            virtual_dns.touch_ip(&info.dst.ip());
-                            virtual_dns.resolve_ip(&info.dst.ip()).cloned()
-                        } else {
-                            None
-                        };
-                        match (bypass_destination, bypass) {
-                            (Err(error), _) => (Err(error), direct_bind.clone(), bypass, policy_changes),
-                            (Ok(()), true) => (
+                        let domain_name = resolve_virtual_domain(virtual_dns.as_ref(), info.dst.ip()).await;
+                        match (bypass_destination, domain_name, bypass) {
+                            (Err(error), _, _) | (_, Err(error), _) => (Err(error), direct_bind.clone(), bypass, policy_changes),
+                            (Ok(()), Ok(domain_name), true) => (
                                 no_proxy_mgr.new_proxy_handler(info, domain_name, false).await,
                                 direct_bind.clone(),
                                 bypass,
                                 policy_changes,
                             ),
-                            (Ok(()), false) => (mgr.new_proxy_handler(info, domain_name, false).await, None, bypass, policy_changes),
+                            (Ok(()), Ok(domain_name), false) => {
+                                (mgr.new_proxy_handler(info, domain_name, false).await, None, bypass, policy_changes)
+                            }
                         }
                     };
                     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                     let (handler_result, bind): (HandlerResult, Option<DirectBind>) = {
-                        let domain_name = if let Some(virtual_dns) = &virtual_dns {
-                            let mut virtual_dns = virtual_dns.lock().await;
-                            virtual_dns.touch_ip(&info.dst.ip());
-                            virtual_dns.resolve_ip(&info.dst.ip()).cloned()
-                        } else {
-                            None
+                        let handler_result = match resolve_virtual_domain(virtual_dns.as_ref(), info.dst.ip()).await {
+                            Ok(domain_name) => mgr.new_proxy_handler(info, domain_name, false).await,
+                            Err(error) => Err(error),
                         };
-                        (mgr.new_proxy_handler(info, domain_name, false).await, None)
+                        (handler_result, None)
                     };
 
                     match handler_result {
@@ -901,13 +954,7 @@ where
                             return Err(format!("non-DNS UDP blocked by policy for {}", info.dst).into());
                         }
 
-                        let domain_name = if let Some(virtual_dns) = &virtual_dns {
-                            let mut virtual_dns = virtual_dns.lock().await;
-                            virtual_dns.touch_ip(&info.dst.ip());
-                            virtual_dns.resolve_ip(&info.dst.ip()).cloned()
-                        } else {
-                            None
-                        };
+                        let domain_name = resolve_virtual_domain(virtual_dns.as_ref(), info.dst.ip()).await?;
 
                         if udp_strategy == ArgUdpStrategy::Direct {
                             let dns_bind = if proxy_type == ProxyType::None {
@@ -939,7 +986,7 @@ where
                             let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
                             let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
                             let dst_addr = match domain_name {
-                                Some(ref domain) => socks5_impl::protocol::Address::from((domain.clone(), info.dst.port())),
+                                Some(ref domain) => socks5_impl::protocol::Address::from((domain.to_string(), info.dst.port())),
                                 None => info.dst.into(),
                             };
                             return handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, socket_queue, ipv6_enabled).await;
@@ -970,8 +1017,7 @@ where
                 });
             }
             IpStackStream::UnknownTransport(u) => {
-                let len = u.payload().len();
-                log::info!("#0 unhandled transport - Ip Protocol {:?}, length {}", u.ip_protocol(), len);
+                log_unknown_transport(&u);
                 continue;
             }
             IpStackStream::UnknownNetwork(pkt) => {
@@ -1298,7 +1344,7 @@ async fn handle_udp_associate_session(
 
                 if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
                     let s5addr = if let Some(domain_name) = &domain_name {
-                        Address::DomainAddress(domain_name.clone().into(), session_info.dst.port())
+                        Address::DomainAddress(domain_name.to_string().into(), session_info.dst.port())
                     } else {
                         session_info.dst.into()
                     };
@@ -1543,6 +1589,29 @@ mod virtual_dns_transport_tests {
             &portals,
             "172.19.0.2:853".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn classifies_icmp_type_and_code() {
+        assert_eq!(icmp_type_code(ICMP_V4_PROTOCOL, &[3, 3]), Some((3, 3)));
+        assert_eq!(icmp_type_code(ICMP_V6_PROTOCOL, &[2, 0]), Some((2, 0)));
+        assert_eq!(icmp_type_code(6, &[3, 3]), None);
+        assert_eq!(icmp_type_code(ICMP_V4_PROTOCOL, &[3]), None);
+    }
+
+    #[tokio::test]
+    async fn stale_virtual_dns_addresses_are_rejected_without_proxying() {
+        let state = VirtualDnsState::default();
+        let resolver = state.resolver();
+        let stale = "198.18.0.1".parse().unwrap();
+
+        let error = resolve_virtual_domain(Some(&resolver), stale).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(error.to_string().contains("stale virtual DNS address"));
+        assert_eq!(
+            resolve_virtual_domain(Some(&resolver), "8.8.8.8".parse().unwrap()).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

@@ -1,29 +1,33 @@
 use crate::error::Result;
+use hashbrown::HashMap;
 use hashlink::{LruCache, linked_hash_map::RawEntryMut};
 use std::{
-    collections::HashMap,
     convert::TryInto,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::PathBuf,
     sync::Arc,
 };
 use tokio::sync::Mutex;
 use tproxy_config::IpCidr;
 
-struct NameCacheEntry {
-    name: String,
-}
+mod persistence;
+
+use persistence::{LoadResult, PersistentCache};
+
+const CACHE_FILE_NAME: &str = "tun-virtual-dns-v1.jsonl";
 
 /// A virtual DNS server which allocates IP addresses to clients.
 /// The IP addresses are in the range of private IP addresses.
 /// The DNS server is implemented as a LRU cache.
 pub struct VirtualDns {
     trailing_dot: bool,
-    lru_cache: LruCache<IpAddr, NameCacheEntry>,
-    name_to_ip: HashMap<String, IpAddr>,
+    lru_cache: LruCache<IpAddr, Arc<str>>,
+    name_to_ip: HashMap<Arc<str>, IpAddr>,
     network_addr: IpAddr,
     broadcast_addr: IpAddr,
     next_addr: IpAddr,
+    persistence: Option<PersistentCache>,
 }
 
 /// Share fake-IP allocations across restarts of the same embedded TUN session.
@@ -41,6 +45,12 @@ impl VirtualDnsState {
 
     pub(crate) fn resolver(&self) -> Arc<Mutex<VirtualDns>> {
         Arc::clone(&self.0)
+    }
+
+    /// Persist fake-IP mappings so application DNS caches survive a proxy
+    /// process restart or an in-place application upgrade.
+    pub async fn enable_persistence_in(&self, directory: impl Into<PathBuf>) -> Result<usize> {
+        self.0.lock().await.enable_persistence(directory.into().join(CACHE_FILE_NAME))
     }
 }
 
@@ -65,7 +75,151 @@ impl VirtualDns {
             network_addr: ip_pool.first_address(),
             broadcast_addr: ip_pool.last_address(),
             lru_cache: LruCache::new_unbounded(),
+            persistence: None,
         }
+    }
+
+    fn enable_persistence(&mut self, path: PathBuf) -> Result<usize> {
+        let mut persistence = PersistentCache::new(path);
+        match persistence.load(self.network_addr, self.broadcast_addr)? {
+            LoadResult::Missing => {
+                // Older releases always allocated from the first address. Start
+                // the first persistent generation in the upper half so cached
+                // addresses from a pre-persistence process are not silently
+                // reassigned to an unrelated hostname during migration.
+                if self.lru_cache.is_empty() {
+                    self.next_addr = upper_half_start(self.network_addr, self.broadcast_addr);
+                }
+                self.persistence = Some(persistence);
+                self.rewrite_persistence()?;
+            }
+            LoadResult::Incompatible => {
+                log::warn!("Ignoring incompatible virtual DNS cache at {}", persistence.path().display());
+                self.clear_mappings();
+                self.next_addr = upper_half_start(self.network_addr, self.broadcast_addr);
+                self.persistence = Some(persistence);
+                self.rewrite_persistence()?;
+            }
+            LoadResult::Loaded {
+                allocation_cursor,
+                mappings,
+                mut repair_needed,
+            } => {
+                self.clear_mappings();
+                self.next_addr = allocation_cursor;
+                for (ip, name) in mappings {
+                    if !self.restore_mapping(ip, name) {
+                        repair_needed = true;
+                    }
+                }
+                self.persistence = Some(persistence);
+                if repair_needed {
+                    if let Some(cache) = &self.persistence {
+                        log::warn!("Repaired incomplete virtual DNS cache at {}", cache.path().display());
+                    }
+                    self.rewrite_persistence()?;
+                }
+            }
+        }
+        Ok(self.lru_cache.len())
+    }
+
+    fn clear_mappings(&mut self) {
+        self.lru_cache.clear();
+        self.name_to_ip.clear();
+        self.next_addr = self.network_addr;
+    }
+
+    fn canonical_name(&self, name: String) -> String {
+        if name.ends_with('.') && !self.trailing_dot {
+            String::from(name.trim_end_matches('.'))
+        } else {
+            name
+        }
+        .to_ascii_lowercase()
+    }
+
+    fn address_in_pool(&self, ip: IpAddr) -> bool {
+        ip.is_ipv4() == self.network_addr.is_ipv4() && ip >= self.network_addr && ip <= self.broadcast_addr
+    }
+
+    fn restore_mapping(&mut self, ip: IpAddr, name: String) -> bool {
+        let name: Arc<str> = self.canonical_name(name).into();
+        if name.is_empty() || name.len() > 253 || !self.address_in_pool(ip) {
+            return false;
+        }
+        if let Some(old_ip) = self.name_to_ip.remove(name.as_ref()) {
+            self.lru_cache.remove(&old_ip);
+        }
+        if let Some(old_name) = self.lru_cache.remove(&ip) {
+            self.name_to_ip.remove(old_name.as_ref());
+        }
+        self.lru_cache.insert(ip, Arc::clone(&name));
+        self.name_to_ip.insert(name, ip);
+        true
+    }
+
+    fn persist_mapping(&mut self, ip: IpAddr, name: &str) {
+        let needs_rewrite = match &self.persistence {
+            Some(persistence) => persistence.needs_rewrite(),
+            None => return,
+        };
+        let result = match needs_rewrite {
+            Ok(true) => self.rewrite_persistence(),
+            Ok(false) => {
+                let should_compact = match self.persistence.as_mut() {
+                    Some(persistence) => persistence
+                        .append_mapping(ip, name)
+                        .map(|()| persistence.should_compact(self.lru_cache.len())),
+                    None => return,
+                };
+                match should_compact {
+                    Ok(true) => self.rewrite_persistence(),
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            if let Some(persistence) = &mut self.persistence {
+                persistence.mark_dirty();
+                log::warn!("Failed to persist virtual DNS cache at {}: {error}", persistence.path().display());
+            }
+            // An append can fail after leaving a partial final record. Repair
+            // immediately while the new mapping is still available in memory;
+            // deferring until another DNS query could lose it on process exit.
+            if let Err(repair_error) = self.rewrite_persistence()
+                && let Some(persistence) = &self.persistence
+            {
+                log::warn!(
+                    "Failed to repair virtual DNS cache at {}: {repair_error}",
+                    persistence.path().display()
+                );
+            }
+        }
+    }
+
+    fn retry_dirty_persistence(&mut self) {
+        if self.persistence.as_ref().is_some_and(PersistentCache::is_dirty)
+            && let Err(error) = self.rewrite_persistence()
+        {
+            if let Some(persistence) = &self.persistence {
+                log::warn!("Failed to repair virtual DNS cache at {}: {error}", persistence.path().display());
+            }
+        }
+    }
+
+    fn rewrite_persistence(&mut self) -> Result<()> {
+        let Some(persistence) = &mut self.persistence else {
+            return Ok(());
+        };
+        persistence.rewrite(
+            self.network_addr,
+            self.broadcast_addr,
+            self.next_addr,
+            self.lru_cache.iter().map(|(ip, name)| (*ip, name.as_ref())),
+        )
     }
 
     /// Returns the DNS response to send back to the client.
@@ -113,25 +267,25 @@ impl VirtualDns {
         _ = self.lru_cache.get_mut(addr);
     }
 
-    pub fn resolve_ip(&mut self, addr: &IpAddr) -> Option<&String> {
-        self.lru_cache.get(addr).map(|entry| &entry.name)
+    pub fn resolve_ip(&mut self, addr: &IpAddr) -> Option<Arc<str>> {
+        self.lru_cache.get(addr).cloned()
+    }
+
+    pub fn contains_address(&self, addr: IpAddr) -> bool {
+        self.address_in_pool(addr)
     }
 
     fn find_or_allocate_ip(&mut self, name: String) -> Result<IpAddr> {
         // This function is a search and creation function, so canonicalizing
         // once here keeps the forward and reverse maps consistent. DNS names
         // are ASCII case-insensitive and a terminal root dot is equivalent.
-        let insert_name = if name.ends_with('.') && !self.trailing_dot {
-            String::from(name.trim_end_matches('.'))
-        } else {
-            name
-        }
-        .to_ascii_lowercase();
+        let insert_name: Arc<str> = self.canonical_name(name).into();
 
         // Return the IP if it is stored inside our LRU cache.
-        if let Some(ip) = self.name_to_ip.get(&insert_name) {
+        if let Some(ip) = self.name_to_ip.get(insert_name.as_ref()) {
             let ip = *ip;
             self.touch_ip(&ip);
+            self.retry_dirty_persistence();
             return Ok(ip);
         }
 
@@ -140,9 +294,9 @@ impl VirtualDns {
 
         loop {
             if let RawEntryMut::Vacant(vacant) = self.lru_cache.raw_entry_mut().from_key(&self.next_addr) {
-                let name0 = insert_name.clone();
-                vacant.insert(self.next_addr, NameCacheEntry { name: insert_name });
-                self.name_to_ip.insert(name0, self.next_addr);
+                vacant.insert(self.next_addr, Arc::clone(&insert_name));
+                self.name_to_ip.insert(Arc::clone(&insert_name), self.next_addr);
+                self.persist_mapping(self.next_addr, insert_name.as_ref());
                 return Ok(self.next_addr);
             }
             // Wrap before incrementing the final address. Comparing the
@@ -160,19 +314,67 @@ impl VirtualDns {
                 // sessions both touch their mapping before a new allocation can
                 // acquire the resolver lock, so active cached addresses remain
                 // at the MRU end of the cache.
-                let (ip, entry) = self.lru_cache.remove_lru().ok_or("Virtual IP space for DNS exhausted")?;
-                self.name_to_ip.remove(&entry.name);
-                self.lru_cache.insert(ip, NameCacheEntry { name: insert_name.clone() });
-                self.name_to_ip.insert(insert_name, ip);
+                let (ip, old_name) = self.lru_cache.remove_lru().ok_or("Virtual IP space for DNS exhausted")?;
+                self.name_to_ip.remove(old_name.as_ref());
+                self.lru_cache.insert(ip, Arc::clone(&insert_name));
+                self.name_to_ip.insert(Arc::clone(&insert_name), ip);
+                self.persist_mapping(ip, insert_name.as_ref());
                 return Ok(ip);
             }
         }
     }
 }
 
+fn upper_half_start(network_addr: IpAddr, broadcast_addr: IpAddr) -> IpAddr {
+    match (network_addr, broadcast_addr) {
+        (IpAddr::V4(network), IpAddr::V4(broadcast)) => {
+            let network = u32::from(network);
+            let distance = u32::from(broadcast) - network;
+            IpAddr::V4(Ipv4Addr::from(network + distance / 2 + distance % 2))
+        }
+        (IpAddr::V6(network), IpAddr::V6(broadcast)) => {
+            let network = u128::from(network);
+            let distance = u128::from(broadcast) - network;
+            IpAddr::V6(Ipv6Addr::from(network + distance / 2 + distance % 2))
+        }
+        _ => network_addr,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::{BufRead, BufReader, Write},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestCache {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestCache {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "tun2proxy-virtual-dns-{}-{}",
+                std::process::id(),
+                NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join(CACHE_FILE_NAME);
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for TestCache {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
 
     #[tokio::test]
     async fn cloned_state_preserves_fake_ip_mapping() {
@@ -183,9 +385,85 @@ mod tests {
         let restarted_resolver = state.clone().resolver();
         assert!(Arc::ptr_eq(&resolver, &restarted_resolver));
         assert_eq!(
-            restarted_resolver.lock().await.resolve_ip(&address),
-            Some(&"cached.example".to_string())
+            restarted_resolver.lock().await.resolve_ip(&address).as_deref(),
+            Some("cached.example")
         );
+    }
+
+    #[tokio::test]
+    async fn persistent_state_preserves_mapping_across_process_recreation() {
+        let cache = TestCache::new();
+        let original = VirtualDnsState::default();
+        original.enable_persistence_in(&cache.directory).await.unwrap();
+        let address = original
+            .resolver()
+            .lock()
+            .await
+            .find_or_allocate_ip("play.googleapis.com".to_string())
+            .unwrap();
+        assert_eq!(address, "198.19.0.0".parse::<IpAddr>().unwrap());
+
+        let recreated = VirtualDnsState::default();
+        assert_eq!(recreated.enable_persistence_in(&cache.directory).await.unwrap(), 1);
+        let resolver = recreated.resolver();
+        let mut resolver = resolver.lock().await;
+        assert_eq!(resolver.find_or_allocate_ip("PLAY.GOOGLEAPIS.COM.".to_string()).unwrap(), address);
+        assert_eq!(resolver.resolve_ip(&address).as_deref(), Some("play.googleapis.com"));
+    }
+
+    #[tokio::test]
+    async fn persistent_state_repairs_a_truncated_journal_tail() {
+        let cache = TestCache::new();
+        let original = VirtualDnsState::default();
+        original.enable_persistence_in(&cache.directory).await.unwrap();
+        let address = original
+            .resolver()
+            .lock()
+            .await
+            .find_or_allocate_ip("cached.example".to_string())
+            .unwrap();
+        OpenOptions::new().append(true).open(&cache.path).unwrap().write_all(b"{").unwrap();
+
+        let recreated = VirtualDnsState::default();
+        assert_eq!(recreated.enable_persistence_in(&cache.directory).await.unwrap(), 1);
+        assert_eq!(
+            recreated.resolver().lock().await.resolve_ip(&address).as_deref(),
+            Some("cached.example")
+        );
+        for line in BufReader::new(File::open(&cache.path).unwrap()).lines() {
+            serde_json::from_str::<serde_json::Value>(&line.unwrap()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn persistent_state_rebuilds_a_deleted_journal_from_live_mappings() {
+        let cache = TestCache::new();
+        let original = VirtualDnsState::default();
+        original.enable_persistence_in(&cache.directory).await.unwrap();
+        let resolver = original.resolver();
+        resolver.lock().await.find_or_allocate_ip("first.example".to_string()).unwrap();
+        fs::remove_file(&cache.path).unwrap();
+        resolver.lock().await.find_or_allocate_ip("second.example".to_string()).unwrap();
+
+        let recreated = VirtualDnsState::default();
+        assert_eq!(recreated.enable_persistence_in(&cache.directory).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn persistent_state_rejects_a_different_fake_ip_pool() {
+        let cache = TestCache::new();
+        let original = VirtualDnsState::default();
+        original.enable_persistence_in(&cache.directory).await.unwrap();
+        original
+            .resolver()
+            .lock()
+            .await
+            .find_or_allocate_ip("cached.example".to_string())
+            .unwrap();
+
+        let replacement = VirtualDnsState::new("198.19.0.0/31".parse().unwrap());
+        assert_eq!(replacement.enable_persistence_in(&cache.directory).await.unwrap(), 0);
+        assert_eq!(replacement.resolver().lock().await.lru_cache.len(), 0);
     }
 
     #[test]
@@ -210,8 +488,8 @@ mod tests {
 
         assert_eq!(first, same);
         assert_ne!(first, other);
-        assert_eq!(dns.resolve_ip(&first).map(String::as_str), Some("example.com"));
-        assert_eq!(dns.resolve_ip(&other).map(String::as_str), Some("www.example.com"));
+        assert_eq!(dns.resolve_ip(&first).as_deref(), Some("example.com"));
+        assert_eq!(dns.resolve_ip(&other).as_deref(), Some("www.example.com"));
     }
 
     #[test]
@@ -222,7 +500,7 @@ mod tests {
             let second = dns.find_or_allocate_ip("second.example".to_string()).unwrap();
 
             assert_eq!(first, second);
-            assert_eq!(dns.resolve_ip(&second).map(String::as_str), Some("second.example"));
+            assert_eq!(dns.resolve_ip(&second).as_deref(), Some("second.example"));
         }
     }
 
@@ -231,15 +509,15 @@ mod tests {
         let mut dns = VirtualDns::new("198.18.0.0/31".parse::<IpCidr>().unwrap());
         let first = dns.find_or_allocate_ip("first.example".to_string()).unwrap();
         let second = dns.find_or_allocate_ip("second.example".to_string()).unwrap();
-        assert_eq!(dns.resolve_ip(&first).map(String::as_str), Some("first.example"));
+        assert_eq!(dns.resolve_ip(&first).as_deref(), Some("first.example"));
 
         let third = dns.find_or_allocate_ip("third.example".to_string()).unwrap();
 
         assert_eq!(first, "198.18.0.0".parse::<IpAddr>().unwrap());
         assert_eq!(second, "198.18.0.1".parse::<IpAddr>().unwrap());
         assert_eq!(third, second);
-        assert_eq!(dns.resolve_ip(&first).map(String::as_str), Some("first.example"));
-        assert_eq!(dns.resolve_ip(&third).map(String::as_str), Some("third.example"));
+        assert_eq!(dns.resolve_ip(&first).as_deref(), Some("first.example"));
+        assert_eq!(dns.resolve_ip(&third).as_deref(), Some("third.example"));
         assert!(!dns.name_to_ip.contains_key("second.example"));
     }
 }

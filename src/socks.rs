@@ -22,7 +22,7 @@ enum SocksState {
 struct SocksProxyImpl {
     server_addr: SocketAddr,
     info: SessionInfo,
-    domain_name: Option<String>,
+    domain_name: Option<Arc<str>>,
     state: SocksState,
     client_inbuf: VecDeque<u8>,
     server_inbuf: VecDeque<u8>,
@@ -38,7 +38,7 @@ impl SocksProxyImpl {
     fn new(
         server_addr: SocketAddr,
         info: SessionInfo,
-        domain_name: Option<String>,
+        domain_name: Option<Arc<str>>,
         credentials: Option<UserKey>,
         version: Version,
         command: protocol::Command,
@@ -214,7 +214,7 @@ impl SocksProxyImpl {
         let addr = if self.command == protocol::Command::UdpAssociate {
             Address::unspecified()
         } else if let Some(domain_name) = &self.domain_name {
-            Address::DomainAddress(domain_name.clone().into(), self.info.dst.port())
+            Address::DomainAddress(domain_name.as_ref().into(), self.info.dst.port())
         } else {
             self.info.dst.into()
         };
@@ -285,7 +285,7 @@ impl ProxyHandler for SocksProxyImpl {
         self.info
     }
 
-    fn get_domain_name(&self) -> Option<String> {
+    fn get_domain_name(&self) -> Option<Arc<str>> {
         self.domain_name.clone()
     }
 
@@ -353,7 +353,7 @@ impl ProxyHandlerManager for SocksProxyManager {
     async fn new_proxy_handler(
         &self,
         info: SessionInfo,
-        domain_name: Option<String>,
+        domain_name: Option<Arc<str>>,
         udp_associate: bool,
     ) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>> {
         use socks5_impl::protocol::Command::{Connect, UdpAssociate};

@@ -50,7 +50,7 @@ pub struct HttpConnection {
     before: bool,
     credentials: Option<UserKey>,
     info: SessionInfo,
-    domain_name: Option<String>,
+    domain_name: Option<Arc<str>>,
 }
 
 static PROXY_AUTHENTICATE: &str = "Proxy-Authenticate";
@@ -84,7 +84,7 @@ impl HttpConnection {
     async fn new(
         server_addr: SocketAddr,
         info: SessionInfo,
-        domain_name: Option<String>,
+        domain_name: Option<Arc<str>>,
         credentials: Option<UserKey>,
         digest_state: Arc<Mutex<Option<DigestState>>>,
     ) -> Result<Self> {
@@ -368,7 +368,7 @@ impl ProxyHandler for HttpConnection {
         self.info
     }
 
-    fn get_domain_name(&self) -> Option<String> {
+    fn get_domain_name(&self) -> Option<Arc<str>> {
         self.domain_name.clone()
     }
 
@@ -440,7 +440,7 @@ impl ProxyHandlerManager for HttpManager {
     async fn new_proxy_handler(
         &self,
         info: SessionInfo,
-        domain_name: Option<String>,
+        domain_name: Option<Arc<str>>,
         _udp_associate: bool,
     ) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>> {
         if info.protocol != IpProtocol::Tcp {

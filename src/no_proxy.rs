@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 struct NoProxyHandler {
     info: SessionInfo,
-    domain_name: Option<String>,
+    domain_name: Option<Arc<str>>,
     client_outbuf: VecDeque<u8>,
     server_outbuf: VecDeque<u8>,
     udp_associate: bool,
@@ -24,7 +24,7 @@ impl ProxyHandler for NoProxyHandler {
         self.info
     }
 
-    fn get_domain_name(&self) -> Option<String> {
+    fn get_domain_name(&self) -> Option<Arc<str>> {
         self.domain_name.clone()
     }
 
@@ -87,7 +87,7 @@ impl ProxyHandlerManager for NoProxyManager {
     async fn new_proxy_handler(
         &self,
         info: SessionInfo,
-        domain_name: Option<String>,
+        domain_name: Option<Arc<str>>,
         udp_associate: bool,
     ) -> std::io::Result<Arc<Mutex<dyn ProxyHandler>>> {
         Ok(Arc::new(Mutex::new(NoProxyHandler {
