@@ -12,7 +12,7 @@
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::atomic::{AtomicU16, Ordering},
     time::Duration,
@@ -28,6 +28,9 @@ pub(crate) struct BindInterface {
     pub ipv4_index: u32,
     /// IPv6 interface index, used by Windows `IPV6_UNICAST_IF`.
     pub ipv6_index: u32,
+    /// IPv4 address used by `IP_MULTICAST_IF`. `IP_UNICAST_IF` alone does not
+    /// select the egress interface for multicast datagrams on Windows.
+    pub ipv4_addr: Option<Ipv4Addr>,
     /// Interface name, used by Linux `SO_BINDTODEVICE`.
     pub name: String,
 }
@@ -40,6 +43,11 @@ impl std::fmt::Display for BindInterface {
 
 impl BindInterface {
     fn from_netdev(iface: netdev::Interface) -> crate::Result<Self> {
+        let ipv4_addr = iface
+            .ipv4
+            .iter()
+            .map(|network| network.addr())
+            .find(|address| !address.is_unspecified() && !address.is_loopback());
         #[cfg(target_os = "windows")]
         let (ipv4_index, ipv6_index) = windows_interface_indices(&iface)?;
         #[cfg(target_os = "linux")]
@@ -51,6 +59,7 @@ impl BindInterface {
         Ok(Self {
             ipv4_index,
             ipv6_index,
+            ipv4_addr,
             name: iface.name,
         })
     }
@@ -214,6 +223,27 @@ pub(crate) fn bind_udp_bound(peer: SocketAddr, iface: &BindInterface) -> std::io
     let domain = if peer.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     apply_device_bind(&socket, peer, iface)?;
+    match peer.ip() {
+        IpAddr::V4(address) if address.is_multicast() => {
+            let interface = iface.ipv4_addr.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("interface `{}` has no IPv4 address for multicast egress", iface.name),
+                )
+            })?;
+            socket.set_multicast_if_v4(&interface)?;
+        }
+        IpAddr::V6(address) if address.is_multicast() => {
+            if iface.ipv6_index == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("interface `{}` has no IPv6 index for multicast egress", iface.name),
+                ));
+            }
+            socket.set_multicast_if_v6(iface.ipv6_index)?;
+        }
+        _ => {}
+    }
 
     let unspecified = match peer {
         SocketAddr::V4(_) => SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),

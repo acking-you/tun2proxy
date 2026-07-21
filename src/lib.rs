@@ -100,6 +100,11 @@ const DNS_OVER_TLS_PORT: u16 = 853;
 const ICMP_V4_PROTOCOL: u8 = 1;
 const ICMP_V6_PROTOCOL: u8 = 58;
 
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn is_local_multicast_destination(address: IpAddr) -> bool {
+    address.is_multicast()
+}
+
 fn icmp_type_code(protocol: u8, payload: &[u8]) -> Option<(u8, u8)> {
     if protocol != ICMP_V4_PROTOCOL && protocol != ICMP_V6_PROTOCOL {
         return None;
@@ -618,12 +623,14 @@ where
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     let process_matcher = process::ProcessMatcher::new(process_bypass.clone()).map(Arc::new);
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    let direct_bind = if process_matcher.is_some() || udp_strategy == ArgUdpStrategy::Direct {
+    // Local multicast cannot be meaningfully forwarded through an Internet
+    // proxy. Keep a physical egress available even when no process bypass or
+    // global UDP-direct policy was configured, so discovery traffic never
+    // recurses through the TUN.
+    let direct_bind = {
         let iface = direct::detect(args.bind_interface.as_deref())?;
-        log::info!("Direct relays egress via {iface}");
+        log::info!("Direct relays and local multicast egress via {iface}");
         Some(Arc::new(iface) as DirectBind)
-    } else {
-        None
     };
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let direct_bind: Option<DirectBind> = None;
@@ -903,16 +910,36 @@ where
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let original_dst = info.dst;
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
-                    let policy_changes = process_matcher.as_ref().map(|matcher| matcher.subscribe());
+                    let local_multicast = is_local_multicast_destination(info.dst.ip());
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let policy_changes = (!local_multicast)
+                        .then(|| process_matcher.as_ref().map(|matcher| matcher.subscribe()))
+                        .flatten();
                     // Decide process bypass before DNS or UdpGW handling. A
                     // bypassed process must see real DNS answers and raw UDP;
                     // otherwise its own traffic can recurse through the local
                     // proxy or attempt to connect to a virtual-DNS fake IP.
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
-                    let bypass = match &process_matcher {
-                        Some(matcher) => matcher.matches(IpProtocol::Udp, info.src, info.dst).await,
-                        None => false,
+                    let process_bypass = if local_multicast {
+                        false
+                    } else {
+                        match &process_matcher {
+                            Some(matcher) => matcher.matches(IpProtocol::Udp, info.src, info.dst).await,
+                            None => false,
+                        }
                     };
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    let bypass = local_multicast || process_bypass;
+                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                    let bypass = false;
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    if local_multicast {
+                        log::debug!(
+                            "Relaying local multicast UDP {} -> {} through the physical interface",
+                            info.src,
+                            info.dst
+                        );
+                    }
 
                     let relay = async {
                         #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -1597,6 +1624,14 @@ mod virtual_dns_transport_tests {
         assert_eq!(icmp_type_code(ICMP_V6_PROTOCOL, &[2, 0]), Some((2, 0)));
         assert_eq!(icmp_type_code(6, &[3, 3]), None);
         assert_eq!(icmp_type_code(ICMP_V4_PROTOCOL, &[3]), None);
+    }
+
+    #[test]
+    fn local_multicast_destinations_bypass_internet_proxies() {
+        assert!(is_local_multicast_destination("239.255.255.250".parse().unwrap()));
+        assert!(is_local_multicast_destination("ff02::c".parse().unwrap()));
+        assert!(!is_local_multicast_destination("198.18.0.1".parse().unwrap()));
+        assert!(!is_local_multicast_destination("1.1.1.1".parse().unwrap()));
     }
 
     #[tokio::test]
