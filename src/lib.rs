@@ -930,8 +930,6 @@ where
                     };
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
                     let bypass = local_multicast || process_bypass;
-                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-                    let bypass = false;
                     #[cfg(any(target_os = "windows", target_os = "linux"))]
                     if local_multicast {
                         log::debug!(
