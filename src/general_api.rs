@@ -112,6 +112,28 @@ pub async fn general_run_async_with_process_bypass(
     general_run_async_with_process_bypass_inner(args, tun_mtu, _packet_information, shutdown_token, process_bypass, None, None).await
 }
 
+/// Run an embedded TUN session with reusable fake-DNS mappings but without a
+/// readiness callback.
+pub async fn general_run_async_with_process_bypass_and_virtual_dns(
+    args: Args,
+    tun_mtu: u16,
+    packet_information: bool,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    process_bypass: ProcessBypass,
+    virtual_dns_state: VirtualDnsState,
+) -> std::io::Result<usize> {
+    general_run_async_with_process_bypass_inner(
+        args,
+        tun_mtu,
+        packet_information,
+        shutdown_token,
+        process_bypass,
+        None,
+        Some(virtual_dns_state),
+    )
+    .await
+}
+
 /// Run tun2proxy and report when the adapter and operating-system routes are
 /// ready.
 ///

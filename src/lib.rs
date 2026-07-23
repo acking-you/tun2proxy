@@ -18,7 +18,7 @@ pub use socks5_impl::protocol::UserKey;
 #[cfg(feature = "udpgw")]
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::{
-    collections::VecDeque,
+    collections::HashMap,
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -48,7 +48,7 @@ pub use {
 
 pub use general_api::{
     general_run_async, general_run_async_with_process_bypass, general_run_async_with_process_bypass_and_ready,
-    general_run_async_with_process_bypass_and_ready_and_virtual_dns,
+    general_run_async_with_process_bypass_and_ready_and_virtual_dns, general_run_async_with_process_bypass_and_virtual_dns,
 };
 
 pub const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -97,6 +97,7 @@ mod windows_network_config;
 
 const DNS_PORT: u16 = 53;
 const DNS_OVER_TLS_PORT: u16 = 853;
+const MAX_OUTSTANDING_DNS_QUERIES: usize = 256;
 const ICMP_V4_PROTOCOL: u8 = 1;
 const ICMP_V6_PROTOCOL: u8 = 58;
 
@@ -453,7 +454,7 @@ async fn resolve_domain_over_proxy(
 ) -> std::io::Result<SocketAddr> {
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query, ResponseCode},
-        rr::{Name, RData, RecordType},
+        rr::{Name, RecordType},
     };
     use std::{str::FromStr, sync::atomic::Ordering};
 
@@ -468,12 +469,13 @@ async fn resolve_domain_over_proxy(
     let query_type = if want_ipv6 { RecordType::AAAA } else { RecordType::A };
     let mut current = domain.to_string();
 
-    for _ in 0..4 {
+    for _ in 0..dns::MAX_CNAME_DEPTH {
         let name = Name::from_str(&current).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let query = Query::query(name, query_type);
         let request_id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
         let mut request = Message::new(request_id, MessageType::Query, OpCode::Query);
         request.set_recursion_desired(true);
-        request.add_query(Query::query(name, query_type));
+        request.add_query(query.clone());
         let request = request.to_vec().map_err(std::io::Error::other)?;
 
         let response = tokio::time::timeout(DNS_TIMEOUT, async {
@@ -499,38 +501,17 @@ async fn resolve_domain_over_proxy(
         .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, format!("proxied DNS query for `{current}` timed out")))??;
 
         let response = Message::from_vec(&response).map_err(std::io::Error::other)?;
-        if response.id() != request_id {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!("proxied DNS response ID mismatch for `{current}`"),
-            ));
-        }
+        dns::validate_dns_response(&response, request_id, &query).map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
         if response.response_code() != ResponseCode::NoError {
             return Err(std::io::Error::other(format!(
                 "proxied DNS query for `{current}` failed with {:?}",
                 response.response_code()
             )));
         }
-
-        let mut cname = None;
-        for answer in response.answers() {
-            match answer.data() {
-                RData::A(address) if !want_ipv6 => {
-                    return Ok(SocketAddr::new(IpAddr::V4((*address).into()), port));
-                }
-                RData::AAAA(address) if want_ipv6 => {
-                    return Ok(SocketAddr::new(IpAddr::V6((*address).into()), port));
-                }
-                RData::CNAME(name) => cname = Some(name.to_ascii()),
-                _ => {}
-            }
+        match dns::extract_address_or_cname(&response, &query).map_err(|error| std::io::Error::new(ErrorKind::NotFound, error))? {
+            dns::AddressLookup::Address(ip) => return Ok(SocketAddr::new(ip, port)),
+            dns::AddressLookup::Cname(name) => current = name,
         }
-        current = cname.ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::NotFound,
-                format!("proxied DNS response for `{current}` contained no {query_type} address"),
-            )
-        })?;
     }
 
     Err(std::io::Error::new(
@@ -825,13 +806,25 @@ where
                         Option<tokio::sync::watch::Receiver<u64>>,
                     ) = {
                         let mut info = info;
-                        if bypass && info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
-                            info.dst.set_ip(dns_addr);
-                        }
-                        let bypass_destination = if bypass {
-                            restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await
+                        let dns_destination = if bypass && info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
+                            direct_bind
+                                .as_deref()
+                                .and_then(|bind| direct::preferred_dns_server(dns_addr, bind))
+                                .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "no usable physical DNS resolver"))
+                                .map(Some)
                         } else {
-                            Ok(())
+                            Ok(None)
+                        };
+                        let bypass_destination = match dns_destination {
+                            Ok(Some(resolver)) => {
+                                info.dst.set_ip(resolver);
+                                restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await
+                            }
+                            Ok(None) if bypass => {
+                                restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await
+                            }
+                            Ok(None) => Ok(()),
+                            Err(error) => Err(error),
                         };
                         let domain_name = resolve_virtual_domain(virtual_dns.as_ref(), info.dst.ip()).await;
                         match (bypass_destination, domain_name, bypass) {
@@ -943,7 +936,11 @@ where
                         #[cfg(any(target_os = "windows", target_os = "linux"))]
                         if bypass {
                             if info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
-                                info.dst.set_ip(dns_addr);
+                                let resolver = direct_bind
+                                    .as_deref()
+                                    .and_then(|bind| direct::preferred_dns_server(dns_addr, bind))
+                                    .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "no usable physical DNS resolver"))?;
+                                info.dst.set_ip(resolver);
                             }
                             restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await?;
                             let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
@@ -1083,7 +1080,7 @@ async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<Vi
         }
         let (msg, qname, ip) = dns.lock().await.generate_query(&buf[..len])?;
         udp.write_all(&msg).await?;
-        log::debug!("Virtual DNS query: {qname} -> {ip}");
+        log::debug!("Virtual DNS query: {qname} -> {ip:?}");
     }
     Ok(())
 }
@@ -1112,7 +1109,7 @@ where
         let response_len = u16::try_from(response.len()).map_err(|_| "virtual DNS response exceeds TCP framing limit")?;
         tcp.write_u16(response_len).await?;
         tcp.write_all(&response).await?;
-        log::debug!("Virtual DNS TCP query: {qname} -> {ip}");
+        log::debug!("Virtual DNS TCP query: {qname} -> {ip:?}");
     }
     Ok(())
 }
@@ -1441,6 +1438,8 @@ async fn handle_dns_over_tcp_session(
 
     let mut buf1 = [0_u8; 4096];
     let mut buf2 = [0_u8; 4096];
+    let mut server_buffer = Vec::with_capacity(4096);
+    let mut outstanding_queries = HashMap::new();
     loop {
         tokio::select! {
             len = udp_stack.read(&mut buf1) => {
@@ -1450,7 +1449,18 @@ async fn handle_dns_over_tcp_session(
                 }
                 let buf1 = &buf1[..len];
 
-                _ = dns::parse_data_to_dns_message(buf1, false)?;
+                let query = dns::parse_data_to_dns_message(buf1, false)?;
+                let question = dns::validate_dns_query(&query)?.clone();
+                if outstanding_queries.contains_key(&query.id()) {
+                    return Err(format!("duplicate in-flight DNS query ID {}", query.id()).into());
+                }
+                if outstanding_queries.len() >= MAX_OUTSTANDING_DNS_QUERIES {
+                    return Err(format!(
+                        "DNS-over-TCP outstanding query limit reached ({MAX_OUTSTANDING_DNS_QUERIES})"
+                    )
+                    .into());
+                }
+                outstanding_queries.insert(query.id(), question);
 
                 // Insert the DNS message length in front of the payload
                 let len = u16::try_from(buf1.len())?;
@@ -1467,24 +1477,15 @@ async fn handle_dns_over_tcp_session(
                 if len == 0 {
                     break;
                 }
-                let mut buf = buf2[..len].to_vec();
+                server_buffer.extend_from_slice(&buf2[..len]);
 
                 crate::traffic_status::traffic_status_update(0, len)?;
 
-                let mut to_send: VecDeque<Vec<u8>> = VecDeque::new();
-                loop {
-                    if buf.len() < 2 {
-                        break;
-                    }
-                    let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                    if buf.len() < len + 2 {
-                        break;
-                    }
-
-                    // remove the length field
-                    let data = buf[2..len + 2].to_vec();
-
-                    let mut message = dns::parse_data_to_dns_message(&data, false)?;
+                for mut message in dns::drain_tcp_messages(&mut server_buffer)? {
+                    let expected_query = outstanding_queries
+                        .remove(&message.id())
+                        .ok_or_else(|| format!("unsolicited DNS-over-TCP response ID {}", message.id()))?;
+                    dns::validate_dns_response(&message, message.id(), &expected_query)?;
 
                     let name = dns::extract_domain_from_dns_message(&message)?;
                     let ip = dns::extract_ipaddr_from_dns_message(&message);
@@ -1494,14 +1495,7 @@ async fn handle_dns_over_tcp_session(
                         dns::remove_ipv6_entries(&mut message);
                     }
 
-                    to_send.push_back(message.to_vec()?);
-                    if len + 2 == buf.len() {
-                        break;
-                    }
-                    buf = buf[len + 2..].to_vec();
-                }
-
-                while let Some(packet) = to_send.pop_front() {
+                    let packet = message.to_vec()?;
                     udp_stack.write_all(&packet).await?;
                 }
             }

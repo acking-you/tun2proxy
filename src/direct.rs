@@ -17,9 +17,15 @@ use std::{
     sync::atomic::{AtomicU16, Ordering},
     time::Duration,
 };
-use tokio::net::TcpStream;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 static NEXT_DNS_QUERY_ID: AtomicU16 = AtomicU16::new(1);
+const DNS_UDP_ATTEMPTS: usize = 2;
+const DNS_UDP_TIMEOUT: Duration = Duration::from_millis(750);
+const DNS_TCP_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The physical interface direct relays egress through.
 #[derive(Debug, Clone)]
@@ -31,6 +37,8 @@ pub(crate) struct BindInterface {
     /// IPv4 address used by `IP_MULTICAST_IF`. `IP_UNICAST_IF` alone does not
     /// select the egress interface for multicast datagrams on Windows.
     pub ipv4_addr: Option<Ipv4Addr>,
+    /// Resolvers configured on the selected physical interface.
+    pub dns_servers: Vec<IpAddr>,
     /// Interface name, used by Linux `SO_BINDTODEVICE`.
     pub name: String,
 }
@@ -60,6 +68,7 @@ impl BindInterface {
             ipv4_index,
             ipv6_index,
             ipv4_addr,
+            dns_servers: iface.dns_servers,
             name: iface.name,
         })
     }
@@ -275,57 +284,32 @@ pub(crate) async fn resolve_domain_bound(
 ) -> std::io::Result<SocketAddr> {
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query, ResponseCode},
-        rr::{Name, RData, RecordType},
+        rr::{Name, RecordType},
     };
 
     let mut current = domain.to_string();
-    for _ in 0..4 {
+    for _ in 0..crate::dns::MAX_CNAME_DEPTH {
         let name = Name::from_str(&current).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let query_type = if want_ipv6 { RecordType::AAAA } else { RecordType::A };
+        let query = Query::query(name, query_type);
         let request_id = NEXT_DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed);
         let mut request = Message::new(request_id, MessageType::Query, OpCode::Query);
         request.set_recursion_desired(true);
-        request.add_query(Query::query(name, query_type));
+        request.add_query(query.clone());
         let request = request.to_vec().map_err(std::io::Error::other)?;
 
-        let server = SocketAddr::new(dns_server, 53);
-        let socket = bind_udp_bound(server, iface)?;
-        socket.send(&request).await?;
-        let mut response = [0u8; 4096];
-        let size = tokio::time::timeout(Duration::from_secs(3), socket.recv(&mut response))
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, format!("direct DNS query for `{current}` timed out")))??;
-        let response = Message::from_vec(&response[..size]).map_err(std::io::Error::other)?;
-        if response.id() != request_id {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("direct DNS response ID mismatch for `{current}`"),
-            ));
-        }
+        let response = query_dns_bound(&request, request_id, &query, &current, dns_server, iface).await?;
         if response.response_code() != ResponseCode::NoError {
             return Err(std::io::Error::other(format!(
                 "direct DNS query for `{current}` failed with {:?}",
                 response.response_code()
             )));
         }
-
-        let mut cname = None;
-        for answer in response.answers() {
-            match answer.data() {
-                RData::A(address) if !want_ipv6 => return Ok(SocketAddr::new(IpAddr::V4((*address).into()), port)),
-                RData::AAAA(address) if want_ipv6 => return Ok(SocketAddr::new(IpAddr::V6((*address).into()), port)),
-                RData::CNAME(name) => cname = Some(name.to_ascii()),
-                _ => {}
-            }
-        }
-        match cname {
-            Some(name) => current = name,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("direct DNS response for `{current}` contained no {query_type} address"),
-                ));
-            }
+        match crate::dns::extract_address_or_cname(&response, &query)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))?
+        {
+            crate::dns::AddressLookup::Address(ip) => return Ok(SocketAddr::new(ip, port)),
+            crate::dns::AddressLookup::Cname(name) => current = name,
         }
     }
 
@@ -333,4 +317,211 @@ pub(crate) async fn resolve_domain_bound(
         std::io::ErrorKind::InvalidData,
         format!("direct DNS resolution for `{domain}` exceeded the CNAME limit"),
     ))
+}
+
+async fn query_dns_bound(
+    request: &[u8],
+    request_id: u16,
+    expected_query: &hickory_proto::op::Query,
+    domain: &str,
+    configured_dns: IpAddr,
+    iface: &BindInterface,
+) -> std::io::Result<hickory_proto::op::Message> {
+    let servers = direct_dns_servers(configured_dns, iface);
+    let mut last_error = None;
+
+    'servers: for dns_server in &servers {
+        let server = SocketAddr::new(*dns_server, 53);
+        for _ in 0..DNS_UDP_ATTEMPTS {
+            match tokio::time::timeout(DNS_UDP_TIMEOUT, query_dns_udp(request, request_id, expected_query, server, iface)).await {
+                Ok(Ok(response)) if response.truncated() => break,
+                Ok(Ok(response))
+                    if matches!(
+                        response.response_code(),
+                        hickory_proto::op::ResponseCode::NoError | hickory_proto::op::ResponseCode::NXDomain
+                    ) =>
+                {
+                    return Ok(response);
+                }
+                Ok(Ok(response)) => {
+                    last_error = Some(std::io::Error::other(format!(
+                        "UDP DNS query to {dns_server} failed with {:?}",
+                        response.response_code()
+                    )));
+                    continue 'servers;
+                }
+                Ok(Err(error)) => {
+                    log::debug!("Direct UDP DNS query to {dns_server} failed: {error}");
+                }
+                Err(_) => {
+                    log::debug!("Direct UDP DNS query to {dns_server} timed out");
+                }
+            }
+        }
+
+        match tokio::time::timeout(DNS_TCP_TIMEOUT, query_dns_tcp(request, request_id, expected_query, server, iface)).await {
+            Ok(Ok(response))
+                if matches!(
+                    response.response_code(),
+                    hickory_proto::op::ResponseCode::NoError | hickory_proto::op::ResponseCode::NXDomain
+                ) =>
+            {
+                return Ok(response);
+            }
+            Ok(Ok(response)) => {
+                last_error = Some(std::io::Error::other(format!(
+                    "TCP DNS query to {dns_server} failed with {:?}",
+                    response.response_code()
+                )));
+            }
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("TCP DNS query to {dns_server} timed out"),
+                ));
+            }
+        }
+    }
+
+    let detail = last_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "no DNS resolver is available".to_string());
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "direct DNS query for `{domain}` through physical resolver(s) {} failed: {detail}",
+            servers.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+        ),
+    ))
+}
+
+fn direct_dns_servers(configured_dns: IpAddr, iface: &BindInterface) -> Vec<IpAddr> {
+    let mut servers = Vec::new();
+    for address in iface.dns_servers.iter().copied().filter(is_usable_dns_server) {
+        if !servers.contains(&address) {
+            servers.push(address);
+        }
+    }
+    if is_usable_dns_server(&configured_dns) && !servers.contains(&configured_dns) {
+        servers.push(configured_dns);
+    }
+    servers
+}
+
+pub(crate) fn preferred_dns_server(configured_dns: IpAddr, iface: &BindInterface) -> Option<IpAddr> {
+    direct_dns_servers(configured_dns, iface).into_iter().next()
+}
+
+fn is_usable_dns_server(address: &IpAddr) -> bool {
+    if address.is_unspecified() || address.is_loopback() || address.is_multicast() {
+        return false;
+    }
+    match address {
+        IpAddr::V4(address) => *address != Ipv4Addr::BROADCAST,
+        IpAddr::V6(address) => !address.is_unicast_link_local(),
+    }
+}
+
+async fn query_dns_udp(
+    request: &[u8],
+    request_id: u16,
+    expected_query: &hickory_proto::op::Query,
+    server: SocketAddr,
+    iface: &BindInterface,
+) -> std::io::Result<hickory_proto::op::Message> {
+    let socket = bind_udp_bound(server, iface)?;
+    socket.send(request).await?;
+    let mut response = [0u8; 4096];
+    let size = socket.recv(&mut response).await?;
+    parse_dns_response(&response[..size], request_id, expected_query)
+}
+
+async fn query_dns_tcp(
+    request: &[u8],
+    request_id: u16,
+    expected_query: &hickory_proto::op::Query,
+    server: SocketAddr,
+    iface: &BindInterface,
+) -> std::io::Result<hickory_proto::op::Message> {
+    let request_len =
+        u16::try_from(request.len()).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "DNS request is too large"))?;
+    let mut stream = connect_tcp_bound(server, iface).await?;
+    stream.write_all(&request_len.to_be_bytes()).await?;
+    stream.write_all(request).await?;
+
+    let response_len = stream.read_u16().await? as usize;
+    if response_len == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid TCP DNS response length {response_len}"),
+        ));
+    }
+    let mut response = vec![0; response_len];
+    stream.read_exact(&mut response).await?;
+    parse_dns_response(&response, request_id, expected_query)
+}
+
+fn parse_dns_response(
+    response: &[u8],
+    request_id: u16,
+    expected_query: &hickory_proto::op::Query,
+) -> std::io::Result<hickory_proto::op::Message> {
+    let response = hickory_proto::op::Message::from_vec(response).map_err(std::io::Error::other)?;
+    crate::dns::validate_dns_response(&response, request_id, expected_query)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_interface(dns_servers: Vec<IpAddr>) -> BindInterface {
+        BindInterface {
+            ipv4_index: 1,
+            ipv6_index: 1,
+            ipv4_addr: Some(Ipv4Addr::LOCALHOST),
+            dns_servers,
+            name: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn direct_dns_prefers_physical_interface_resolvers() {
+        let physical = "192.168.21.1".parse().unwrap();
+        let configured = "8.8.8.8".parse().unwrap();
+        let iface = test_interface(vec![physical]);
+
+        assert_eq!(direct_dns_servers(configured, &iface), vec![physical, configured]);
+    }
+
+    #[test]
+    fn direct_dns_deduplicates_configured_resolver() {
+        let configured = "1.1.1.1".parse().unwrap();
+        let iface = test_interface(vec![configured]);
+
+        assert_eq!(direct_dns_servers(configured, &iface), vec![configured]);
+    }
+
+    #[test]
+    fn direct_dns_ignores_resolvers_that_cannot_be_reached_on_a_physical_bind() {
+        let configured = "8.8.8.8".parse().unwrap();
+        let iface = test_interface(vec![
+            "127.0.0.53".parse().unwrap(),
+            "::1".parse().unwrap(),
+            "224.0.0.251".parse().unwrap(),
+        ]);
+
+        assert_eq!(direct_dns_servers(configured, &iface), vec![configured]);
+    }
+
+    #[test]
+    fn direct_dns_selects_the_physical_resolver_for_private_virtual_portals() {
+        let physical = "192.168.21.1".parse().unwrap();
+        let configured = "8.8.8.8".parse().unwrap();
+        let iface = test_interface(vec![physical]);
+
+        assert_eq!(preferred_dns_server(configured, &iface), Some(physical));
+    }
 }

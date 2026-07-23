@@ -223,12 +223,18 @@ impl VirtualDns {
     }
 
     /// Returns the DNS response to send back to the client.
-    pub fn generate_query(&mut self, data: &[u8]) -> Result<(Vec<u8>, String, IpAddr)> {
+    pub fn generate_query(&mut self, data: &[u8]) -> Result<(Vec<u8>, String, Option<IpAddr>)> {
         use crate::dns;
         let message = dns::parse_data_to_dns_message(data, false)?;
+        let query_type = dns::validate_dns_query(&message)?.query_type();
         let qname = dns::extract_domain_from_dns_message(&message)?;
-        let ip = self.find_or_allocate_ip(qname.clone())?;
-        let message = dns::build_dns_response(message, &qname, ip, 5)?;
+        let ip = match (query_type, self.network_addr) {
+            (hickory_proto::rr::RecordType::A, IpAddr::V4(_)) | (hickory_proto::rr::RecordType::AAAA, IpAddr::V6(_)) => {
+                Some(self.find_or_allocate_ip(qname.clone())?)
+            }
+            _ => None,
+        };
+        let message = dns::build_dns_response(message, ip, 5)?;
         Ok((message.to_vec()?, qname, ip))
     }
 
@@ -344,6 +350,10 @@ fn upper_half_start(network_addr: IpAddr, broadcast_addr: IpAddr) -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::{
+        op::{Message, MessageType, OpCode, Query},
+        rr::{Name, RecordType},
+    };
     use std::{
         fs::{self, File, OpenOptions},
         io::{BufRead, BufReader, Write},
@@ -351,6 +361,23 @@ mod tests {
     };
 
     static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn non_address_queries_do_not_consume_fake_ips() {
+        let mut dns = VirtualDns::new(crate::Args::default().virtual_dns_pool);
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_ascii("example.com").unwrap(), RecordType::HTTPS));
+
+        let (response, name, ip) = dns.generate_query(&query.to_vec().unwrap()).unwrap();
+        let response = Message::from_vec(&response).unwrap();
+
+        assert_eq!(name, "example.com.");
+        assert_eq!(ip, None);
+        assert!(response.answers().is_empty());
+        assert!(response.recursion_available());
+        assert!(dns.lru_cache.is_empty());
+        assert!(dns.name_to_ip.is_empty());
+    }
 
     struct TestCache {
         directory: PathBuf,
