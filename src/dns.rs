@@ -199,7 +199,11 @@ pub fn drain_tcp_messages(buffer: &mut Vec<u8>) -> Result<Vec<Message>, String> 
 }
 
 fn names_equal(left: &Name, right: &Name) -> bool {
-    left.to_ascii().eq_ignore_ascii_case(&right.to_ascii())
+    // DNS wire decoding marks names as fully qualified, even when the
+    // application built the original query from a relative textual name.
+    // Compare labels case-insensitively without treating the terminal root
+    // marker as part of the identity.
+    left.eq_ignore_root(right)
 }
 
 #[cfg(test)]
@@ -251,6 +255,24 @@ mod tests {
 
         let wrong = query(RecordType::AAAA).to_response();
         assert!(validate_dns_response(&wrong, 1, &expected).is_err());
+
+        let mut wrong_name = Message::new(1, MessageType::Response, OpCode::Query);
+        wrong_name.add_query(Query::query(Name::from_ascii("other.example").unwrap(), RecordType::A));
+        assert!(validate_dns_response(&wrong_name, 1, &expected).is_err());
+    }
+
+    #[test]
+    fn dns_response_validation_accepts_wire_qualified_question() {
+        let expected = Query::query(Name::from_ascii("Example.COM").unwrap(), RecordType::A);
+        assert!(!expected.name().is_fqdn());
+
+        let mut response = Message::new(7, MessageType::Response, OpCode::Query);
+        response.add_query(expected.clone());
+        let wire = response.to_vec().unwrap();
+        let decoded = Message::from_vec(&wire).unwrap();
+
+        assert!(decoded.queries()[0].name().is_fqdn());
+        assert!(validate_dns_response(&decoded, 7, &expected).is_ok());
     }
 
     #[test]
@@ -268,6 +290,8 @@ mod tests {
             60,
             RData::A(A("203.0.113.7".parse().unwrap())),
         ));
+        let wire = response.to_vec().unwrap();
+        let response = Message::from_vec(&wire).unwrap();
 
         assert_eq!(
             extract_address_or_cname(&response, &query).unwrap(),
