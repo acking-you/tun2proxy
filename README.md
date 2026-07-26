@@ -115,10 +115,13 @@ changes behind.
 
 Windows `--setup` preserves every existing physical/VPN default route. It captures IPv4 with two more-specific `/1`
 routes and an additional session-owned `0.0.0.0/0` compatibility row for forwarding consumers such as WSL HNS NAT.
-All rows are created through the IP Helper API, and only rows created by the current session are rolled back together
-with the TUN DNS setting. It never performs an unqualified deletion of `0.0.0.0/0`. Bypass routes are resolved before
-capture is enabled and retain both the physical interface and next hop, which avoids selecting the TUN itself. Windows
-10 version 2004 (build 19041) or newer is required for transactional DNS setup. See the
+It also snapshots and enables IPv4 forwarding on Wintun and WSL HNS `vEthernet` interfaces. Wintun uses weak-host
+send/receive while capture is active so NAT-translated traffic is accepted even when its address belongs to another
+interface. A lightweight monitor applies the same forwarding policy if WSL creates or replaces its interface after TUN
+startup. All changes use the IP Helper API; teardown restores only fields and route rows changed by the current session,
+together with the prior TUN DNS setting. It never performs an unqualified deletion of `0.0.0.0/0`. Bypass routes are
+resolved before capture is enabled and retain both the physical interface and next hop, which avoids selecting the TUN
+itself. Windows 10 version 2004 (build 19041) or newer is required for transactional DNS setup. See the
 [local proxy to TUN setup guide](docs/local-proxy-tun-setup.zh-CN.md#24-windows-安全路由) for limitations and diagnostics.
 
 You would then run the tool as follows:

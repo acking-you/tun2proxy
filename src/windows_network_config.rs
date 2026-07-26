@@ -1,27 +1,33 @@
-//! Transactional Windows route and DNS setup.
+//! Transactional Windows route, interface, and DNS setup.
 //!
 //! All routing changes use the IP Helper API.  In particular, this module
 //! never deletes or rewrites the machine's existing default route.  Traffic is
 //! captured with two more-specific `/1` routes, while proxy and user bypasses
 //! are installed through the physical route selected before capture begins.
+//! IPv4 forwarding is enabled only on the TUN and WSL HNS interfaces that need
+//! it, and every changed interface property is restored exactly.
 
 use std::{
     collections::HashSet,
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Duration,
 };
 
 use tproxy_config::{IpCidr, TproxyArgs};
 use windows_sys::{
     Win32::{
-        Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, FreeLibrary, HMODULE, NO_ERROR},
+        Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, FreeLibrary, HMODULE, NO_ERROR},
         NetworkManagement::{
             IpHelper::{
-                ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToGuid, CreateIpForwardEntry2, DNS_INTERFACE_SETTINGS,
-                DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, GetBestRoute2, IP_ADDRESS_PREFIX,
-                InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+                ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToAlias, ConvertInterfaceLuidToGuid, CreateIpForwardEntry2,
+                DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, FreeMibTable,
+                GetBestRoute2, GetIpInterfaceEntry, GetIpInterfaceTable, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
+                InitializeIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, SetIpInterfaceEntry,
             },
-            Ndis::NET_LUID_LH,
+            Ndis::{IF_MAX_STRING_SIZE, NET_LUID_LH},
         },
         Networking::WinSock::{
             AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, MIB_IPPROTO_NETMGMT, NlroManual, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
@@ -34,6 +40,7 @@ use windows_sys::{
 
 const CAPTURE_ROUTE_METRIC: u32 = 6;
 const BYPASS_ROUTE_METRIC: u32 = 1;
+const FORWARDING_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
 type GetInterfaceDnsSettingsFn = unsafe extern "system" fn(GUID, *mut DNS_INTERFACE_SETTINGS) -> u32;
 type SetInterfaceDnsSettingsFn = unsafe extern "system" fn(GUID, *const DNS_INTERFACE_SETTINGS) -> u32;
@@ -129,11 +136,72 @@ enum AddOutcome {
     Preexisting,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterfaceRole {
+    Tun,
+    WslHns,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InterfaceTarget {
+    luid: u64,
+    alias: String,
+    role: InterfaceRole,
+}
+
+impl fmt::Display for InterfaceTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?} interface {:?} (LUID {:#x})", self.role, self.alias, self.luid)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct InterfaceSettings {
+    forwarding: bool,
+    weak_host_send: bool,
+    weak_host_receive: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct InterfacePatch {
+    forwarding: Option<bool>,
+    weak_host_send: Option<bool>,
+    weak_host_receive: Option<bool>,
+}
+
+impl InterfacePatch {
+    const fn is_empty(self) -> bool {
+        self.forwarding.is_none() && self.weak_host_send.is_none() && self.weak_host_receive.is_none()
+    }
+
+    fn merge_owned(&mut self, patch: Self, before: InterfaceSettings) {
+        if patch.forwarding.is_some() && self.forwarding.is_none() {
+            self.forwarding = Some(before.forwarding);
+        }
+        if patch.weak_host_send.is_some() && self.weak_host_send.is_none() {
+            self.weak_host_send = Some(before.weak_host_send);
+        }
+        if patch.weak_host_receive.is_some() && self.weak_host_receive.is_none() {
+            self.weak_host_receive = Some(before.weak_host_receive);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InterfaceSnapshot {
+    target: InterfaceTarget,
+    before: InterfaceSettings,
+    restore: InterfacePatch,
+}
+
 trait NetworkOperations {
     fn interface_luid(&mut self, alias: &str) -> io::Result<u64>;
     fn best_route(&mut self, destination: IpAddr) -> io::Result<(u64, RouteAddress)>;
     fn create_route(&mut self, route: &RouteSpec) -> io::Result<AddOutcome>;
     fn delete_route(&mut self, route: &RouteSpec) -> io::Result<()>;
+    fn wsl_hns_interfaces(&mut self) -> io::Result<Vec<InterfaceTarget>>;
+    fn interface_settings(&mut self, interface_luid: u64) -> io::Result<InterfaceSettings>;
+    fn apply_interface_patch(&mut self, interface_luid: u64, patch: InterfacePatch) -> io::Result<()>;
     fn snapshot_dns(&mut self, interface_luid: u64) -> io::Result<DnsSnapshot>;
     fn set_dns(&mut self, interface_luid: u64, name_servers: Option<&str>) -> io::Result<()>;
 }
@@ -144,7 +212,49 @@ struct InstallRecord {
     dns_before: DnsSnapshot,
     dns_changed: bool,
     owned_routes: Vec<RouteSpec>,
+    interface_snapshots: Arc<Mutex<Vec<InterfaceSnapshot>>>,
     removed: bool,
+}
+
+#[derive(Debug)]
+struct InterfaceMonitor {
+    stop: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl InterfaceMonitor {
+    fn start(tun_target: InterfaceTarget, snapshots: Arc<Mutex<Vec<InterfaceSnapshot>>>) -> io::Result<Self> {
+        let (stop, receiver) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("tun2proxy-windows-interface-monitor".into())
+            .spawn(move || {
+                loop {
+                    match receiver.recv_timeout(FORWARDING_RECONCILE_INTERVAL) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            let mut operations = IpHelperOperations;
+                            if let Err(error) = reconcile_interface_settings(&mut operations, &tun_target, &snapshots) {
+                                log::warn!("Could not reconcile Windows TUN/WSL forwarding settings; retrying: {error}");
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|error| contextual_error("start the Windows TUN/WSL forwarding monitor", error))?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    fn stop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            log::error!("Windows TUN/WSL forwarding monitor panicked during shutdown");
+        }
+    }
 }
 
 /// Owns exactly the Windows network rows installed for one TUN session.
@@ -154,23 +264,47 @@ struct InstallRecord {
 #[derive(Debug)]
 pub(crate) struct WindowsNetworkConfig {
     record: InstallRecord,
+    interface_monitor: Option<InterfaceMonitor>,
 }
 
 impl WindowsNetworkConfig {
     pub(crate) fn install(args: &TproxyArgs) -> io::Result<Self> {
         let mut operations = IpHelperOperations;
-        let record = install_transaction(&mut operations, args)?;
-        Ok(Self { record })
+        let mut record = install_transaction(&mut operations, args)?;
+        let interface_monitor = if args.ipv4_default_route {
+            let target = InterfaceTarget {
+                luid: record.tun_luid,
+                alias: args.tun_name.clone(),
+                role: InterfaceRole::Tun,
+            };
+            match InterfaceMonitor::start(target, Arc::clone(&record.interface_snapshots)) {
+                Ok(monitor) => Some(monitor),
+                Err(error) => {
+                    return Err(rollback_after_setup_failure(&mut operations, &mut record, error));
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self { record, interface_monitor })
     }
 
     pub(crate) fn remove(mut self) -> io::Result<()> {
+        self.stop_interface_monitor();
         let mut operations = IpHelperOperations;
         cleanup_transaction(&mut operations, &mut self.record)
+    }
+
+    fn stop_interface_monitor(&mut self) {
+        if let Some(mut monitor) = self.interface_monitor.take() {
+            monitor.stop();
+        }
     }
 }
 
 impl Drop for WindowsNetworkConfig {
     fn drop(&mut self) {
+        self.stop_interface_monitor();
         if self.record.removed {
             return;
         }
@@ -302,8 +436,21 @@ fn install_transaction<O: NetworkOperations>(operations: &mut O, args: &TproxyAr
         dns_before,
         dns_changed: false,
         owned_routes: Vec::with_capacity(planned.len()),
+        interface_snapshots: Arc::new(Mutex::new(Vec::new())),
         removed: false,
     };
+
+    if args.ipv4_default_route {
+        let tun_target = InterfaceTarget {
+            luid: tun_luid,
+            alias: args.tun_name.clone(),
+            role: InterfaceRole::Tun,
+        };
+        if let Err(error) = reconcile_interface_settings(operations, &tun_target, &record.interface_snapshots) {
+            let setup_error = contextual_error("enable transactional IPv4 forwarding for Windows TUN and WSL HNS interfaces", error);
+            return Err(rollback_after_setup_failure(operations, &mut record, setup_error));
+        }
+    }
 
     for route in planned {
         log::debug!("Creating Windows route with CreateIpForwardEntry2: {route}");
@@ -337,11 +484,82 @@ fn install_transaction<O: NetworkOperations>(operations: &mut O, args: &TproxyAr
         return Err(rollback_after_setup_failure(operations, &mut record, setup_error));
     }
     log::info!(
-        "Windows TUN setup committed: {} owned route(s), DNS {}; original default routes remain untouched",
+        "Windows TUN setup committed: {} owned route(s), {} tracked interface(s), DNS {}; original default routes remain untouched",
         record.owned_routes.len(),
+        lock_interface_snapshots(&record.interface_snapshots).len(),
         args.tun_gateway
     );
     Ok(record)
+}
+
+fn reconcile_interface_settings<O: NetworkOperations>(
+    operations: &mut O,
+    tun_target: &InterfaceTarget,
+    snapshots: &Arc<Mutex<Vec<InterfaceSnapshot>>>,
+) -> io::Result<()> {
+    let mut targets = vec![tun_target.clone()];
+    targets.extend(operations.wsl_hns_interfaces()?);
+
+    let mut unique = HashSet::new();
+    for target in targets {
+        if !unique.insert(target.luid) {
+            continue;
+        }
+
+        let current = match operations.interface_settings(target.luid) {
+            Ok(settings) => settings,
+            Err(error) if is_missing_interface_error(&error) && target.role == InterfaceRole::WslHns => {
+                log::debug!("WSL HNS interface disappeared before forwarding could be reconciled: {target}");
+                continue;
+            }
+            Err(error) => return Err(contextual_error(&format!("read IPv4 settings for {target}"), error)),
+        };
+        let required = required_interface_patch(target.role, current);
+
+        let mut snapshots = lock_interface_snapshots(snapshots);
+        let index = snapshots.iter().position(|snapshot| snapshot.target.luid == target.luid);
+        let snapshot_index = match index {
+            Some(index) => index,
+            None => {
+                snapshots.push(InterfaceSnapshot {
+                    target: target.clone(),
+                    before: current,
+                    restore: InterfacePatch::default(),
+                });
+                snapshots.len() - 1
+            }
+        };
+        if required.is_empty() {
+            continue;
+        }
+
+        let snapshot = &mut snapshots[snapshot_index];
+        snapshot.restore.merge_owned(required, snapshot.before);
+        log::info!("Enabling required IPv4 forwarding settings on {target}: {required:?}");
+        operations
+            .apply_interface_patch(target.luid, required)
+            .map_err(|error| contextual_error(&format!("enable IPv4 forwarding settings on {target}"), error))?;
+    }
+    Ok(())
+}
+
+fn required_interface_patch(role: InterfaceRole, current: InterfaceSettings) -> InterfacePatch {
+    let forwarding = (!current.forwarding).then_some(true);
+    match role {
+        InterfaceRole::Tun => InterfacePatch {
+            forwarding,
+            weak_host_send: (!current.weak_host_send).then_some(true),
+            weak_host_receive: (!current.weak_host_receive).then_some(true),
+        },
+        InterfaceRole::WslHns => InterfacePatch {
+            forwarding,
+            ..Default::default()
+        },
+    }
+}
+
+fn lock_interface_snapshots(snapshots: &Arc<Mutex<Vec<InterfaceSnapshot>>>) -> std::sync::MutexGuard<'_, Vec<InterfaceSnapshot>> {
+    snapshots.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn rollback_after_setup_failure<O: NetworkOperations>(operations: &mut O, record: &mut InstallRecord, setup_error: io::Error) -> io::Error {
@@ -403,9 +621,38 @@ fn cleanup_transaction<O: NetworkOperations>(operations: &mut O, record: &mut In
         }
     }
 
+    let mut interface_snapshots = lock_interface_snapshots(&record.interface_snapshots);
+    let mut failed_snapshots = Vec::new();
+    for snapshot in std::mem::take(&mut *interface_snapshots).into_iter().rev() {
+        if snapshot.restore.is_empty() {
+            continue;
+        }
+        log::debug!(
+            "Restoring exact IPv4 interface settings changed by this TUN session on {}: {:?}",
+            snapshot.target,
+            snapshot.restore
+        );
+        match operations.apply_interface_patch(snapshot.target.luid, snapshot.restore) {
+            Ok(()) => {
+                log::info!("Restored previous IPv4 interface settings on {}", snapshot.target);
+            }
+            Err(error) if is_missing_interface_error(&error) && snapshot.target.role == InterfaceRole::WslHns => {
+                log::debug!("WSL HNS interface was already removed during teardown: {}", snapshot.target);
+            }
+            Err(error) => {
+                log::error!("Could not restore IPv4 interface settings on {}: {error}", snapshot.target);
+                failures.push(format!("restore IPv4 settings on {}: {error}", snapshot.target));
+                failed_snapshots.push(snapshot);
+            }
+        }
+    }
+    failed_snapshots.reverse();
+    *interface_snapshots = failed_snapshots;
+    drop(interface_snapshots);
+
     if failures.is_empty() {
         record.removed = true;
-        log::info!("Windows TUN network teardown completed without modifying any foreign default route");
+        log::info!("Windows TUN network teardown restored owned routes, interface settings, and DNS");
         Ok(())
     } else {
         record.removed = false;
@@ -461,6 +708,65 @@ impl NetworkOperations for IpHelperOperations {
             log::debug!("Owned route was already absent during idempotent teardown: {route}");
             return Ok(());
         }
+        win32_result(status)
+    }
+
+    fn wsl_hns_interfaces(&mut self) -> io::Result<Vec<InterfaceTarget>> {
+        let mut table = std::ptr::null_mut();
+        let status = unsafe { GetIpInterfaceTable(AF_INET, &mut table) };
+        win32_result(status)?;
+        if table.is_null() {
+            return Err(io::Error::other("GetIpInterfaceTable returned a null IPv4 interface table"));
+        }
+
+        let mut targets = Vec::new();
+        let table_ref = unsafe { &*table };
+        let rows = unsafe { std::slice::from_raw_parts(table_ref.Table.as_ptr(), table_ref.NumEntries as usize) };
+        for row in rows {
+            let luid = unsafe { row.InterfaceLuid.Value };
+            let alias = match interface_alias(luid) {
+                Ok(alias) => alias,
+                Err(error) => {
+                    log::debug!("Could not resolve IPv4 interface LUID {luid:#x} while discovering WSL HNS adapters: {error}");
+                    continue;
+                }
+            };
+            if is_wsl_hns_alias(&alias) {
+                targets.push(InterfaceTarget {
+                    luid,
+                    alias,
+                    role: InterfaceRole::WslHns,
+                });
+            }
+        }
+        unsafe { FreeMibTable(table.cast()) };
+        Ok(targets)
+    }
+
+    fn interface_settings(&mut self, interface_luid: u64) -> io::Result<InterfaceSettings> {
+        let row = ip_interface_row(interface_luid)?;
+        Ok(InterfaceSettings {
+            forwarding: row.ForwardingEnabled,
+            weak_host_send: row.WeakHostSend,
+            weak_host_receive: row.WeakHostReceive,
+        })
+    }
+
+    fn apply_interface_patch(&mut self, interface_luid: u64, patch: InterfacePatch) -> io::Result<()> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let mut row = ip_interface_row(interface_luid)?;
+        if let Some(value) = patch.forwarding {
+            row.ForwardingEnabled = value;
+        }
+        if let Some(value) = patch.weak_host_send {
+            row.WeakHostSend = value;
+        }
+        if let Some(value) = patch.weak_host_receive {
+            row.WeakHostReceive = value;
+        }
+        let status = unsafe { SetIpInterfaceEntry(&mut row) };
         win32_result(status)
     }
 
@@ -572,12 +878,43 @@ fn luid_to_guid(luid: u64) -> io::Result<GUID> {
     Ok(guid)
 }
 
+fn interface_alias(luid: u64) -> io::Result<String> {
+    let luid = NET_LUID_LH { Value: luid };
+    let mut alias = vec![0; IF_MAX_STRING_SIZE as usize + 1];
+    let status = unsafe { ConvertInterfaceLuidToAlias(&luid, alias.as_mut_ptr(), alias.len()) };
+    win32_result(status)?;
+    let len = alias.iter().position(|value| *value == 0).unwrap_or(alias.len());
+    Ok(String::from_utf16_lossy(&alias[..len]))
+}
+
+fn is_wsl_hns_alias(alias: &str) -> bool {
+    let normalized = alias.to_ascii_lowercase();
+    normalized.starts_with("vethernet (") && normalized.contains("wsl")
+}
+
+fn ip_interface_row(luid: u64) -> io::Result<MIB_IPINTERFACE_ROW> {
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = AF_INET;
+    row.InterfaceLuid = NET_LUID_LH { Value: luid };
+    let status = unsafe { GetIpInterfaceEntry(&mut row) };
+    win32_result(status)?;
+    Ok(row)
+}
+
 fn win32_result(status: u32) -> io::Result<()> {
     if status == NO_ERROR {
         Ok(())
     } else {
         Err(io::Error::from_raw_os_error(status as i32))
     }
+}
+
+fn is_missing_interface_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_NOT_FOUND as i32
+    )
 }
 
 fn wide_string(value: &str) -> Vec<u16> {
@@ -599,7 +936,10 @@ unsafe fn optional_wide_string(value: *const u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, str::FromStr};
+    use std::{
+        collections::{HashMap, VecDeque},
+        str::FromStr,
+    };
 
     #[derive(Default)]
     struct MockOperations {
@@ -608,6 +948,9 @@ mod tests {
         delete_failures_remaining: usize,
         dns_failure: bool,
         best_route_luid: Option<u64>,
+        wsl_targets: Vec<InterfaceTarget>,
+        interface_values: HashMap<u64, InterfaceSettings>,
+        interface_apply_failures: VecDeque<bool>,
     }
 
     impl NetworkOperations for MockOperations {
@@ -639,6 +982,34 @@ mod tests {
             }
         }
 
+        fn wsl_hns_interfaces(&mut self) -> io::Result<Vec<InterfaceTarget>> {
+            self.events.push("interfaces:wsl".into());
+            Ok(self.wsl_targets.clone())
+        }
+
+        fn interface_settings(&mut self, interface_luid: u64) -> io::Result<InterfaceSettings> {
+            self.events.push(format!("interface:get:{interface_luid:#x}"));
+            Ok(*self.interface_values.get(&interface_luid).unwrap_or(&InterfaceSettings::default()))
+        }
+
+        fn apply_interface_patch(&mut self, interface_luid: u64, patch: InterfacePatch) -> io::Result<()> {
+            self.events.push(format!("interface:set:{interface_luid:#x}:{patch:?}"));
+            if self.interface_apply_failures.pop_front().unwrap_or(false) {
+                return Err(io::Error::other("injected interface failure"));
+            }
+            let settings = self.interface_values.entry(interface_luid).or_default();
+            if let Some(value) = patch.forwarding {
+                settings.forwarding = value;
+            }
+            if let Some(value) = patch.weak_host_send {
+                settings.weak_host_send = value;
+            }
+            if let Some(value) = patch.weak_host_receive {
+                settings.weak_host_receive = value;
+            }
+            Ok(())
+        }
+
         fn snapshot_dns(&mut self, _: u64) -> io::Result<DnsSnapshot> {
             self.events.push("dns:snapshot".into());
             Ok(DnsSnapshot {
@@ -663,15 +1034,43 @@ mod tests {
             .bypass_ips(&[IpCidr::from_str("192.0.2.0/24").unwrap()])
     }
 
+    fn wsl_target(luid: u64) -> InterfaceTarget {
+        InterfaceTarget {
+            luid,
+            alias: "vEthernet (WSL (Hyper-V firewall))".into(),
+            role: InterfaceRole::WslHns,
+        }
+    }
+
     #[test]
     fn adds_owned_default_for_forwarding_consumers_and_preserves_physical_route() {
-        let mut operations = MockOperations::default();
+        let mut operations = MockOperations {
+            wsl_targets: vec![wsl_target(0x66), wsl_target(0x67)],
+            interface_values: HashMap::from([(
+                0x67,
+                InterfaceSettings {
+                    forwarding: true,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
         let mut record = install_transaction(&mut operations, &test_args()).unwrap();
 
         assert!(operations.events.contains(&"add:0.0.0.0/0".into()));
         assert!(operations.events.contains(&"add:0.0.0.0/1".into()));
         assert!(operations.events.contains(&"add:128.0.0.0/1".into()));
         assert_eq!(record.owned_routes.len(), 5); // explicit bypass, proxy host, compatibility 0/0, and two /1 capture rows
+        assert_eq!(
+            operations.interface_values[&0x55],
+            InterfaceSettings {
+                forwarding: true,
+                weak_host_send: true,
+                weak_host_receive: true,
+            }
+        );
+        assert!(operations.interface_values[&0x66].forwarding);
+        assert!(operations.interface_values[&0x67].forwarding);
 
         cleanup_transaction(&mut operations, &mut record).unwrap();
         let deletes: Vec<_> = operations
@@ -690,7 +1089,44 @@ mod tests {
                 "delete:192.0.2.0/24"
             ]
         );
-        assert_eq!(operations.events.last().unwrap(), "dns:set:Some(\"9.9.9.9\")");
+        assert!(operations.events.contains(&"dns:set:Some(\"9.9.9.9\")".into()));
+        assert_eq!(operations.interface_values[&0x55], InterfaceSettings::default());
+        assert_eq!(operations.interface_values[&0x66], InterfaceSettings::default());
+        assert!(operations.interface_values[&0x67].forwarding);
+    }
+
+    #[test]
+    fn discovers_and_restores_wsl_interface_created_after_initial_setup() {
+        let mut operations = MockOperations::default();
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        operations.wsl_targets.push(wsl_target(0x68));
+        let tun_target = InterfaceTarget {
+            luid: record.tun_luid,
+            alias: "test-tun".into(),
+            role: InterfaceRole::Tun,
+        };
+
+        reconcile_interface_settings(&mut operations, &tun_target, &record.interface_snapshots).unwrap();
+
+        assert!(operations.interface_values[&0x68].forwarding);
+        assert_eq!(lock_interface_snapshots(&record.interface_snapshots).len(), 2);
+        cleanup_transaction(&mut operations, &mut record).unwrap();
+        assert_eq!(operations.interface_values[&0x68], InterfaceSettings::default());
+    }
+
+    #[test]
+    fn interface_setup_failure_restores_already_changed_interfaces_before_routes() {
+        let mut operations = MockOperations {
+            wsl_targets: vec![wsl_target(0x66)],
+            interface_apply_failures: VecDeque::from([false, true]),
+            ..Default::default()
+        };
+
+        let error = install_transaction(&mut operations, &test_args()).unwrap_err();
+
+        assert!(error.to_string().contains("injected interface failure"));
+        assert!(!operations.events.iter().any(|event| event.starts_with("add:")));
+        assert_eq!(operations.interface_values[&0x55], InterfaceSettings::default());
     }
 
     #[test]
@@ -741,7 +1177,8 @@ mod tests {
                 "delete:192.0.2.0/24"
             ]
         );
-        assert_eq!(operations.events.last().unwrap(), "dns:set:Some(\"9.9.9.9\")");
+        assert!(operations.events.contains(&"dns:set:Some(\"9.9.9.9\")".into()));
+        assert_eq!(operations.interface_values[&0x55], InterfaceSettings::default());
     }
 
     #[test]
@@ -775,9 +1212,28 @@ mod tests {
 
         let error = cleanup_transaction(&mut operations, &mut record).unwrap_err();
         assert!(error.to_string().contains("injected delete failure"));
-        assert_eq!(operations.events.last().unwrap(), "dns:set:Some(\"9.9.9.9\")");
+        assert!(operations.events.contains(&"dns:set:Some(\"9.9.9.9\")".into()));
+        assert_eq!(operations.interface_values[&0x55], InterfaceSettings::default());
         assert!(!record.removed);
         assert_eq!(record.owned_routes.len(), 5);
+    }
+
+    #[test]
+    fn teardown_retries_only_interface_settings_that_failed_to_restore() {
+        let mut operations = MockOperations::default();
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        operations.interface_apply_failures.push_back(true);
+
+        let error = cleanup_transaction(&mut operations, &mut record).unwrap_err();
+
+        assert!(error.to_string().contains("injected interface failure"));
+        assert_eq!(lock_interface_snapshots(&record.interface_snapshots).len(), 1);
+        assert!(!record.removed);
+
+        cleanup_transaction(&mut operations, &mut record).unwrap();
+        assert!(lock_interface_snapshots(&record.interface_snapshots).is_empty());
+        assert!(record.removed);
+        assert_eq!(operations.interface_values[&0x55], InterfaceSettings::default());
     }
 
     #[test]
@@ -807,5 +1263,13 @@ mod tests {
             assert!(error.to_string().contains("too broad"));
             assert!(!operations.events.iter().any(|event| event.starts_with("add:")));
         }
+    }
+
+    #[test]
+    fn recognizes_only_wsl_hns_virtual_ethernet_aliases() {
+        assert!(is_wsl_hns_alias("vEthernet (WSL)"));
+        assert!(is_wsl_hns_alias("vEthernet (WSL (Hyper-V firewall))"));
+        assert!(!is_wsl_hns_alias("vEthernet (Default Switch)"));
+        assert!(!is_wsl_hns_alias("Corporate WSL VPN"));
     }
 }
