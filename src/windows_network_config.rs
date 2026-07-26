@@ -208,7 +208,7 @@ fn install_transaction<O: NetworkOperations>(operations: &mut O, args: &TproxyAr
         bypass_cidrs.push(proxy_host);
     }
 
-    let mut planned = Vec::with_capacity(bypass_cidrs.len() + 2);
+    let mut planned = Vec::with_capacity(bypass_cidrs.len() + 3);
     let mut unique = HashSet::new();
     for cidr in bypass_cidrs {
         if !unique.insert(cidr) {
@@ -261,9 +261,20 @@ fn install_transaction<O: NetworkOperations>(operations: &mut O, args: &TproxyAr
                 format!("Windows IPv4 capture requires an IPv4 TUN gateway, got {}", gateway.ip),
             ));
         }
-        // Two /1 rows outrank the physical 0/0 without deleting, replacing, or
-        // changing the metric of any route owned by another component.
+        // Keep an owned 0/0 row as well as the two /1 capture rows. Ordinary
+        // host traffic follows the more-specific /1 rows, while forwarding
+        // consumers such as WSL HNS NAT select their egress from actual
+        // default-route rows when they initialize. The physical 0/0 remains
+        // untouched and becomes effective again when this exact TUN row is
+        // removed.
         planned.extend([
+            RouteSpec {
+                destination: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                prefix_len: 0,
+                next_hop: gateway,
+                interface_luid: tun_luid,
+                metric: CAPTURE_ROUTE_METRIC,
+            },
             RouteSpec {
                 destination: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 prefix_len: 1,
@@ -653,14 +664,14 @@ mod tests {
     }
 
     #[test]
-    fn uses_split_capture_routes_and_preserves_default_route() {
+    fn adds_owned_default_for_forwarding_consumers_and_preserves_physical_route() {
         let mut operations = MockOperations::default();
         let mut record = install_transaction(&mut operations, &test_args()).unwrap();
 
+        assert!(operations.events.contains(&"add:0.0.0.0/0".into()));
         assert!(operations.events.contains(&"add:0.0.0.0/1".into()));
         assert!(operations.events.contains(&"add:128.0.0.0/1".into()));
-        assert!(!operations.events.iter().any(|event| event == "add:0.0.0.0/0"));
-        assert_eq!(record.owned_routes.len(), 4); // explicit bypass, proxy host, two /1 capture rows
+        assert_eq!(record.owned_routes.len(), 5); // explicit bypass, proxy host, compatibility 0/0, and two /1 capture rows
 
         cleanup_transaction(&mut operations, &mut record).unwrap();
         let deletes: Vec<_> = operations
@@ -674,6 +685,7 @@ mod tests {
             [
                 "delete:128.0.0.0/1",
                 "delete:0.0.0.0/1",
+                "delete:0.0.0.0/0",
                 "delete:203.0.113.8/32",
                 "delete:192.0.2.0/24"
             ]
@@ -724,6 +736,7 @@ mod tests {
             [
                 "delete:128.0.0.0/1",
                 "delete:0.0.0.0/1",
+                "delete:0.0.0.0/0",
                 "delete:203.0.113.8/32",
                 "delete:192.0.2.0/24"
             ]
@@ -764,7 +777,7 @@ mod tests {
         assert!(error.to_string().contains("injected delete failure"));
         assert_eq!(operations.events.last().unwrap(), "dns:set:Some(\"9.9.9.9\")");
         assert!(!record.removed);
-        assert_eq!(record.owned_routes.len(), 4);
+        assert_eq!(record.owned_routes.len(), 5);
     }
 
     #[test]
