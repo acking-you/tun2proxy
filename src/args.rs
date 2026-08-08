@@ -180,6 +180,14 @@ pub struct Args {
     #[arg(long, value_name = "number", default_value = "200")]
     pub max_sessions: usize,
 
+    /// Per-session TCP read buffer, in bytes. Zero keeps the ipstack default.
+    ///
+    /// Every admitted session holds one of these for as long as it lives, and
+    /// `tcp_timeout` keeps idle sessions around for minutes, so this multiplies
+    /// straight into the resident set of a busy device.
+    #[arg(long, value_name = "bytes", default_value = "0")]
+    pub tcp_read_buffer_size: usize,
+
     /// UDP gateway server address, forwards UDP packets via specified TCP server
     #[cfg(feature = "udpgw")]
     #[arg(long, value_name = "IP:PORT")]
@@ -247,6 +255,7 @@ impl Default for Args {
             daemonize: false,
             exit_on_fatal_error: false,
             max_sessions: 200,
+            tcp_read_buffer_size: 0,
             #[cfg(feature = "udpgw")]
             udpgw_server: None,
             #[cfg(feature = "udpgw")]

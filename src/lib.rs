@@ -634,6 +634,9 @@ where
     ipstack_config.mtu(mtu)?;
     let mut tcp_cfg = ipstack::TcpConfig::default();
     tcp_cfg.timeout = std::time::Duration::from_secs(args.tcp_timeout);
+    if args.tcp_read_buffer_size > 0 {
+        tcp_cfg.read_buffer_size = args.tcp_read_buffer_size;
+    }
     ipstack_config.with_tcp_config(tcp_cfg);
     ipstack_config.udp_timeout(std::time::Duration::from_secs(args.udp_timeout));
 
@@ -714,6 +717,35 @@ where
     });
 
     let session_counts = Arc::new(SessionCounts::default());
+
+    // Concurrent sessions are the term that multiplies every per-session buffer,
+    // and `tcp_timeout` keeps idle ones alive for minutes. Without a periodic
+    // reading there is no way to tell a busy device from a memory problem, since
+    // the existing counters only surface at trace level or when the cap is hit.
+    managed_tasks.spawn({
+        let session_counts = Arc::clone(&session_counts);
+        let shutdown_token = shutdown_token.clone();
+        let max_sessions = args.max_sessions;
+        async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let snapshot = session_counts.snapshot();
+                        log::info!(
+                            "TUN sessions: total={}/{}, TCP={}, UDP={}",
+                            snapshot.total,
+                            max_sessions,
+                            snapshot.tcp,
+                            snapshot.udp
+                        );
+                    }
+                }
+            }
+        }
+    });
 
     let forwarding_result: crate::Result<()> = loop {
         // JoinSet keeps completed task outputs until they are observed. Reap
@@ -1034,7 +1066,7 @@ where
                     let result = Some(relay.await);
 
                     if let Some(Err(err)) = result {
-                        log::info!("Ending {info} with \"{err}\"");
+                        log::debug!("Ending {info} with \"{err}\"");
                     }
                 });
             }
@@ -1154,7 +1186,7 @@ async fn handle_tcp_session(
     // and `bind` is `None` (normal routing).
     let mut server = create_tcp_stream(&socket_queue, server_addr, bind.as_ref()).await?;
 
-    log::info!("Beginning {session_info}");
+    log::debug!("Beginning {session_info}");
 
     if let Err(e) = handle_proxy_session(&mut server, proxy_handler).await {
         tcp_stack.shutdown().await?;
@@ -1180,7 +1212,7 @@ async fn handle_tcp_session(
             r
         },
     );
-    log::info!("Ending {session_info} with {res:?}");
+    log::debug!("Ending {session_info} with {res:?}");
 
     Ok(())
 }
@@ -1220,7 +1252,7 @@ async fn handle_udp_gateway_session(
     let tcp_local_addr = stream.local_addr();
     let sn = stream.serial_number();
 
-    log::info!("[UdpGw] Beginning stream {} {} -> {}", sn, &tcp_local_addr, udp_dst);
+    log::debug!("[UdpGw] Beginning stream {} {} -> {}", sn, &tcp_local_addr, udp_dst);
 
     let Some(mut reader) = stream.get_reader() else {
         return Err("get reader failed".into());
@@ -1237,19 +1269,19 @@ async fn handle_udp_gateway_session(
             len = udp_stack.read(&mut tmp_buf) => {
                 let read_len = match len {
                     Ok(0) => {
-                        log::info!("[UdpGw] Ending stream {} {} <> {}", sn, &tcp_local_addr, udp_dst);
+                        log::debug!("[UdpGw] Ending stream {} {} <> {}", sn, &tcp_local_addr, udp_dst);
                         break;
                     }
                     Ok(n) => n,
                     Err(e) => {
-                        log::info!("[UdpGw] Ending stream {} {} <> {} with udp stack \"{}\"", sn, &tcp_local_addr, udp_dst, e);
+                        log::debug!("[UdpGw] Ending stream {} {} <> {} with udp stack \"{}\"", sn, &tcp_local_addr, udp_dst, e);
                         break;
                     }
                 };
                 crate::traffic_status::traffic_status_update(read_len, 0)?;
                 let sn = stream.serial_number();
                 if let Err(e) = UdpGwClient::send_udpgw_packet(ipv6_enabled, &tmp_buf[0..read_len], udp_dst, sn, &mut writer).await {
-                    log::info!("[UdpGw] Ending stream {} {} <> {} with send_udpgw_packet {}", sn, &tcp_local_addr, udp_dst, e);
+                    log::debug!("[UdpGw] Ending stream {} {} <> {} with send_udpgw_packet {}", sn, &tcp_local_addr, udp_dst, e);
                     break;
                 }
                 log::debug!("[UdpGw] stream {} {} -> {} send len {}", sn, &tcp_local_addr, udp_dst, read_len);
@@ -1274,7 +1306,7 @@ async fn handle_udp_gateway_session(
                         }
                         //server udp may be timeout,can continue to receive udp data?
                         UdpGwResponse::Error => {
-                            log::info!("[UdpGw] Ending stream {} {} <> {} with recv udp error", sn, &tcp_local_addr, udp_dst);
+                            log::debug!("[UdpGw] Ending stream {} {} <> {} with recv udp error", sn, &tcp_local_addr, udp_dst);
                             stream.update_activity();
                             continue;
                         }
@@ -1328,7 +1360,7 @@ async fn handle_udp_associate_session(
         )
     };
 
-    log::info!("Beginning {session_info}");
+    log::debug!("Beginning {session_info}");
 
     let setup = async {
         // `_server` is meaningful here, it must be alive all the time
@@ -1413,7 +1445,7 @@ async fn handle_udp_associate_session(
         }
     }
 
-    log::info!("Ending {session_info}");
+    log::debug!("Ending {session_info}");
 
     Ok(())
 }
@@ -1432,7 +1464,7 @@ async fn handle_dns_over_tcp_session(
 
     let mut server = create_tcp_stream(&socket_queue, server_addr, None).await?;
 
-    log::info!("Beginning {session_info}");
+    log::debug!("Beginning {session_info}");
 
     let _ = handle_proxy_session(&mut server, proxy_handler).await?;
 
@@ -1502,7 +1534,7 @@ async fn handle_dns_over_tcp_session(
         }
     }
 
-    log::info!("Ending {session_info}");
+    log::debug!("Ending {session_info}");
 
     Ok(())
 }
