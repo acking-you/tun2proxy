@@ -42,7 +42,10 @@ hashlink = "0.12.0"
 # breaks those embedders at compile time.
 hickory-proto = "=0.26.0-alpha.1"
 httparse = "1.10.1"
-ipstack = { version = "1.0.0" }
+# The sibling fork, which carries a fix for an active half-close that never
+# completes while data is still in flight. No version requirement, so the fork
+# stays on the upstream pre-release version and its only diff is the fix.
+ipstack = { path = "../ipstack" }
 log = { version = "0.4.30", features = ["std"] }
 percent-encoding = "2.3.2"
 serde = { version = "1.0.228", features = ["derive"] }
