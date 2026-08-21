@@ -83,7 +83,7 @@ impl ProcessBypass {
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux", test))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
     pub(crate) fn contains_normalized(&self, name: &str) -> bool {
         match self.names.read() {
             Ok(names) => names.iter().any(|candidate| candidate == name),
@@ -93,7 +93,7 @@ impl ProcessBypass {
 
     /// Subscribe to effective policy changes. The revision itself is opaque;
     /// receivers only use it as an inexpensive wake-up signal.
-    #[cfg(any(target_os = "windows", target_os = "linux", test))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
     }

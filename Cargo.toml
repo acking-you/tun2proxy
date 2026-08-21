@@ -73,8 +73,9 @@ bincode-next = "2.1.0"
 
 # Process-based bypass feature (`--bypass-process`): only built on the platforms
 # that implement source-process lookup and physical-interface binding. Keeping
-# these here avoids pulling them (and breaking the build) on iOS/macOS/Android.
-[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+# these here avoids pulling them (and breaking the build) on iOS/Android, where
+# the platform VPN API owns per-application routing instead.
+[target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
 netdev = "0.44.0"
 netstat2 = "0.11.2"
 socket2 = "0.6.4"

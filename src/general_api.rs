@@ -213,7 +213,7 @@ async fn general_run_async_with_process_bypass_setup(
     virtual_dns_state: Option<VirtualDnsState>,
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> std::io::Result<usize> {
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     let mut args = args;
 
     // Capture this before creating our adapter. If setup later fails, the
@@ -229,7 +229,7 @@ async fn general_run_async_with_process_bypass_setup(
     // Resolve the physical egress before `tproxy_setup` installs the TUN
     // catch-all routes. Re-resolving the default interface afterwards would
     // select the TUN itself and send direct relays back into the tunnel.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     if process_bypass.is_configured() {
         let iface = crate::direct::detect(args.bind_interface.as_deref()).map_err(std::io::Error::from)?;
         log::info!("Process-bypass physical interface selected before route setup: {iface}");

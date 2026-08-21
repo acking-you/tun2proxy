@@ -64,7 +64,7 @@ pub const DEFAULT_MTU: u16 = 1500;
 
 mod android;
 mod args;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 mod direct;
 mod directions;
 mod dns;
@@ -75,7 +75,7 @@ mod http;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod network_config;
 mod no_proxy;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 mod process;
 mod process_bypass;
 mod proxy_handler;
@@ -101,7 +101,7 @@ const MAX_OUTSTANDING_DNS_QUERIES: usize = 256;
 const ICMP_V4_PROTOCOL: u8 = 1;
 const ICMP_V6_PROTOCOL: u8 = 58;
 
-#[cfg(any(target_os = "windows", target_os = "linux", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
 fn is_local_multicast_destination(address: IpAddr) -> bool {
     address.is_multicast()
 }
@@ -225,9 +225,9 @@ fn log_session_limit(protocol: IpProtocol, max_sessions: usize, counts: &Session
 /// Physical interface a process-bypass direct relay egresses through. On
 /// platforms without the feature this is an uninhabited type, so the threaded
 /// `Option<DirectBind>` is always `None` and carries zero cost.
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 type DirectBind = Arc<direct::BindInterface>;
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 type DirectBind = std::convert::Infallible;
 
 /// Outcome of constructing a per-session proxy handler.
@@ -237,7 +237,7 @@ type HandlerResult = std::io::Result<Arc<Mutex<dyn ProxyHandler>>>;
 /// policy update changes whether its source process should bypass the proxy.
 /// Dropping the relay future closes both halves; the application can then
 /// reconnect and receive a fresh handler on the new route.
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 async fn run_until_process_policy_change<F, T>(
     relay: F,
     matcher: Option<Arc<process::ProcessMatcher>>,
@@ -333,7 +333,7 @@ async fn create_tcp_stream(
     // Process-bypass direct relays must egress through the physical interface so
     // they are not re-captured by the TUN. This only applies on the normal
     // (non-socket-transfer) path.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     if let Some(iface) = bind {
         if socket_queue.is_none() {
             return direct::connect_tcp_bound(peer, iface).await;
@@ -352,7 +352,7 @@ async fn create_udp_stream(
     peer: SocketAddr,
     bind: Option<&DirectBind>,
 ) -> std::io::Result<UdpStream> {
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     if let Some(iface) = bind {
         if socket_queue.is_none() {
             let socket = direct::bind_udp_bound(peer, iface)?;
@@ -381,7 +381,7 @@ async fn create_udp_stream(
 
 /// Replace a stale virtual-DNS destination with a real address before opening a
 /// physical-interface-bound process bypass relay.
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 async fn restore_bypass_destination(
     info: &mut SessionInfo,
     virtual_dns: Option<&Arc<Mutex<VirtualDns>>>,
@@ -601,9 +601,9 @@ where
     // Process-based bypass: sessions whose originating local process matches
     // `--bypass-process` are relayed directly to their destination through the
     // physical interface instead of being forwarded to the proxy.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     let process_matcher = process::ProcessMatcher::new(process_bypass.clone()).map(Arc::new);
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     // Local multicast cannot be meaningfully forwarded through an Internet
     // proxy. Keep a physical egress available even when no process bypass or
     // global UDP-direct policy was configured, so discovery traffic never
@@ -613,10 +613,10 @@ where
         log::info!("Direct relays and local multicast egress via {iface}");
         Some(Arc::new(iface) as DirectBind)
     };
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     let direct_bind: Option<DirectBind> = None;
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     if process_bypass.is_configured() {
         log::info!("Process bypass enabled for {:?}", process_bypass.names());
     }
@@ -625,7 +625,7 @@ where
     } else if udp_strategy == ArgUdpStrategy::Block {
         log::warn!("Non-DNS UDP is blocked by policy");
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     if process_bypass.is_configured() {
         log::warn!("--bypass-process is not supported on this platform; ignoring it");
     }
@@ -789,25 +789,25 @@ where
                 let socket_queue = socket_queue.clone();
                 let dns = args.dns;
                 let virtual_dns_portals = virtual_dns_portals.clone();
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let process_matcher = process_matcher.clone();
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let direct_bind = direct_bind.clone();
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 // The source-process lookup may briefly touch the OS, so the
                 // bypass decision and handler creation run inside the per-session
                 // task rather than on the accept loop.
                 managed_tasks.spawn(async move {
                     let _session_permit = session_permit;
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let policy_changes = process_matcher.as_ref().map(|matcher| matcher.subscribe());
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let bypass = match &process_matcher {
                         Some(matcher) => matcher.matches(IpProtocol::Tcp, info.src, info.dst).await,
                         None => false,
                     };
-                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let bypass = false;
 
                     if !bypass && dns == ArgDns::Virtual && info.dst.port() == DNS_PORT {
@@ -830,7 +830,7 @@ where
                         return;
                     }
 
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let (handler_result, bind, bypass, policy_changes): (
                         HandlerResult,
                         Option<DirectBind>,
@@ -872,7 +872,7 @@ where
                             }
                         }
                     };
-                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let (handler_result, bind): (HandlerResult, Option<DirectBind>) = {
                         let handler_result = match resolve_virtual_domain(virtual_dns.as_ref(), info.dst.ip()).await {
                             Ok(domain_name) => mgr.new_proxy_handler(info, domain_name, false).await,
@@ -883,7 +883,7 @@ where
 
                     match handler_result {
                         Ok(proxy_handler) => {
-                            #[cfg(any(target_os = "windows", target_os = "linux"))]
+                            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                             let result = run_until_process_policy_change(
                                 handle_tcp_session(tcp, proxy_handler, socket_queue, bind),
                                 process_matcher,
@@ -894,7 +894,7 @@ where
                                 bypass,
                             )
                             .await;
-                            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                            #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                             let result = Some(handle_tcp_session(tcp, proxy_handler, socket_queue, bind).await);
 
                             if let Some(Err(err)) = result {
@@ -919,9 +919,9 @@ where
                 let proxy_type = args.proxy.proxy_type;
                 let dns = args.dns;
                 let udp_strategy = args.udp_strategy;
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let process_matcher = process_matcher.clone();
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let direct_bind = direct_bind.clone();
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 #[cfg(feature = "udpgw")]
@@ -930,13 +930,13 @@ where
                 managed_tasks.spawn(async move {
                     let _session_permit = session_permit;
                     let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let original_src = info.src;
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let original_dst = info.dst;
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let local_multicast = is_local_multicast_destination(info.dst.ip());
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let policy_changes = (!local_multicast)
                         .then(|| process_matcher.as_ref().map(|matcher| matcher.subscribe()))
                         .flatten();
@@ -944,7 +944,7 @@ where
                     // bypassed process must see real DNS answers and raw UDP;
                     // otherwise its own traffic can recurse through the local
                     // proxy or attempt to connect to a virtual-DNS fake IP.
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let process_bypass = if local_multicast {
                         false
                     } else {
@@ -953,9 +953,9 @@ where
                             None => false,
                         }
                     };
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let bypass = local_multicast || process_bypass;
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     if local_multicast {
                         log::debug!(
                             "Relaying local multicast UDP {} -> {} through the physical interface",
@@ -965,7 +965,7 @@ where
                     }
 
                     let relay = async {
-                        #[cfg(any(target_os = "windows", target_os = "linux"))]
+                        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                         if bypass {
                             if info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
                                 let resolver = direct_bind
@@ -1051,7 +1051,7 @@ where
                             .await
                     };
 
-                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let result = run_until_process_policy_change(
                         relay,
                         process_matcher,
@@ -1062,7 +1062,7 @@ where
                         bypass,
                     )
                     .await;
-                    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let result = Some(relay.await);
 
                     if let Some(Err(err)) = result {

@@ -7,12 +7,15 @@
 //! relay a local loopback proxy's own outbound traffic directly, breaking the
 //! routing loop it would otherwise create.
 //!
-//! Only implemented on Windows and Linux; the module is not compiled elsewhere.
+//! Only implemented on Windows, Linux, and macOS; the module is not compiled
+//! elsewhere. iOS and Android leave the interface to the platform VPN API, which
+//! owns per-application routing itself.
 
 use crate::{ProcessBypass, process_bypass::normalize_process_name, session_info::IpProtocol};
 use std::{collections::HashMap, net::SocketAddr, sync::Mutex, time::Instant};
 
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
+#[cfg_attr(target_os = "macos", path = "macos.rs")]
 #[cfg_attr(target_os = "windows", path = "windows.rs")]
 mod imp;
 
@@ -310,6 +313,29 @@ mod tests {
             .map(|name| normalize_process_name(&name))
             .collect::<Vec<_>>();
         assert!(names.contains(&current), "current process `{current}` missing from {names:?}");
+    }
+
+    /// The macOS backend walks ancestors through `proc_pidinfo`, so verify the
+    /// chain really reaches this process's parent instead of stopping at itself.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_identity_chain_reaches_a_real_ancestor() {
+        let names = imp::process_names(std::process::id());
+        assert!(
+            names.len() >= 2,
+            "expected an ancestor beyond the current process, got {names:?}"
+        );
+
+        let parent = imp::process_names(std::os::unix::process::parent_id());
+        assert_eq!(
+            names[1],
+            parent[0],
+            "the second identity must be the real parent executable"
+        );
+
+        // A pid that cannot exist must resolve to nothing rather than panicking
+        // or inventing a chain.
+        assert!(imp::process_names(0).is_empty());
     }
 
     #[test]

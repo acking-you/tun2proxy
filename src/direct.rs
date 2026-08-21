@@ -6,9 +6,9 @@
 //! re-captures the relay and the loop we were trying to break simply moves one
 //! hop down. This mirrors mihomo's `auto-detect-interface` behaviour: bind the
 //! direct socket to the default route's interface via `SO_BINDTODEVICE`
-//! (Linux) or `IP_UNICAST_IF` (Windows).
+//! (Linux), `IP_UNICAST_IF` (Windows), or `IP_BOUND_IF` (macOS).
 //!
-//! Only compiled on Windows and Linux.
+//! Only compiled on Windows, Linux, and macOS.
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
@@ -30,9 +30,11 @@ const DNS_TCP_TIMEOUT: Duration = Duration::from_millis(1500);
 /// The physical interface direct relays egress through.
 #[derive(Debug, Clone)]
 pub(crate) struct BindInterface {
-    /// IPv4 interface index, used by Windows `IP_UNICAST_IF`.
+    /// IPv4 interface index, used by Windows `IP_UNICAST_IF` and macOS
+    /// `IP_BOUND_IF`.
     pub ipv4_index: u32,
-    /// IPv6 interface index, used by Windows `IPV6_UNICAST_IF`.
+    /// IPv6 interface index, used by Windows `IPV6_UNICAST_IF` and macOS
+    /// `IPV6_BOUND_IF`.
     pub ipv6_index: u32,
     /// IPv4 address used by `IP_MULTICAST_IF`. `IP_UNICAST_IF` alone does not
     /// select the egress interface for multicast datagrams on Windows.
@@ -58,7 +60,9 @@ impl BindInterface {
             .find(|address| !address.is_unspecified() && !address.is_loopback());
         #[cfg(target_os = "windows")]
         let (ipv4_index, ipv6_index) = windows_interface_indices(&iface)?;
-        #[cfg(target_os = "linux")]
+        // Both BSD-style socket options take the same `if_nametoindex` value for
+        // either family, so one index serves both.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let (ipv4_index, ipv6_index) = (iface.index, iface.index);
 
         if ipv4_index == 0 && ipv6_index == 0 {
@@ -143,11 +147,11 @@ fn connect_in_progress(err: &std::io::Error) -> bool {
     if err.kind() == std::io::ErrorKind::WouldBlock {
         return true;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         err.raw_os_error() == Some(nix::libc::EINPROGRESS)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         false
     }
@@ -158,6 +162,54 @@ fn connect_in_progress(err: &std::io::Error) -> bool {
 fn apply_device_bind(socket: &Socket, _peer: SocketAddr, iface: &BindInterface) -> std::io::Result<()> {
     // SO_BINDTODEVICE forces egress through the named interface.
     socket.bind_device(Some(iface.name.as_bytes()))
+}
+
+/// Bind `socket` to the configured physical interface for the given peer family.
+///
+/// macOS has no `SO_BINDTODEVICE`. `IP_BOUND_IF` is the documented equivalent and
+/// does override the default route, which is exactly what is needed here: while
+/// TUN mode is active the default route points at the utun device, so an unbound
+/// direct relay would be recaptured.
+#[cfg(target_os = "macos")]
+fn apply_device_bind(socket: &Socket, peer: SocketAddr, iface: &BindInterface) -> std::io::Result<()> {
+    use nix::libc;
+    use std::os::fd::AsRawFd;
+
+    let (level, optname, index) = if peer.is_ipv4() {
+        if iface.ipv4_index == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("interface `{}` has no IPv4 index", iface.name),
+            ));
+        }
+        (libc::IPPROTO_IP, libc::IP_BOUND_IF, iface.ipv4_index)
+    } else {
+        if iface.ipv6_index == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("interface `{}` has no IPv6 index", iface.name),
+            ));
+        }
+        (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF, iface.ipv6_index)
+    };
+    // Unlike the Windows `IP_UNICAST_IF` asymmetry, both options take a plain
+    // host-order interface index.
+    let value = index as libc::c_uint;
+    // SAFETY: `value` outlives the call, `optlen` matches its size, and the fd is
+    // owned by `socket` for the duration.
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            optname,
+            &value as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Bind `socket` to the configured physical interface for the given peer family.
@@ -485,6 +537,44 @@ mod tests {
             dns_servers,
             name: "test".to_string(),
         }
+    }
+
+    /// A bound socket must source from the interface it was pinned to. UDP
+    /// `connect` only records a default peer, so this sends no packets.
+    ///
+    /// Note this compares against the default interface, so it proves the bind is
+    /// accepted and honoured rather than that it beats a *competing* route. The
+    /// override itself was confirmed by hand with the default route pointing at a
+    /// utun device: unbound sockets left through the tunnel while bound ones still
+    /// left through the physical interface. Reproducing that here would require
+    /// installing a route, which a unit test must not do.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bound_socket_egresses_through_the_named_interface() {
+        use std::net::UdpSocket;
+
+        let Ok(iface) = detect(None) else {
+            // No default route on this machine; nothing to compare against.
+            return;
+        };
+        let Some(expected) = iface.ipv4_addr else {
+            return;
+        };
+
+        // A public address that is merely routed, never contacted here.
+        let peer: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        apply_device_bind(&socket, peer, &iface).expect("IP_BOUND_IF must be accepted");
+        socket.bind(&SockAddr::from(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))).unwrap();
+        socket.connect(&SockAddr::from(peer)).unwrap();
+
+        let bound = UdpSocket::from(socket).local_addr().unwrap();
+        assert_eq!(
+            bound.ip(),
+            IpAddr::V4(expected),
+            "a bound socket must egress through `{}`",
+            iface.name
+        );
     }
 
     #[test]
