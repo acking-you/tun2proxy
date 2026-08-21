@@ -321,17 +321,10 @@ mod tests {
     #[test]
     fn macos_identity_chain_reaches_a_real_ancestor() {
         let names = imp::process_names(std::process::id());
-        assert!(
-            names.len() >= 2,
-            "expected an ancestor beyond the current process, got {names:?}"
-        );
+        assert!(names.len() >= 2, "expected an ancestor beyond the current process, got {names:?}");
 
         let parent = imp::process_names(std::os::unix::process::parent_id());
-        assert_eq!(
-            names[1],
-            parent[0],
-            "the second identity must be the real parent executable"
-        );
+        assert_eq!(names[1], parent[0], "the second identity must be the real parent executable");
 
         // A pid that cannot exist must resolve to nothing rather than panicking
         // or inventing a chain.

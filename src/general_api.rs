@@ -204,6 +204,45 @@ async fn general_run_async_with_process_bypass_inner(
     result
 }
 
+/// Wait until the operating system stops routing arbitrary traffic through a
+/// tunnel, so the physical egress can be resolved from a settled routing table.
+///
+/// Restarting a session — an upstream node hot switch, for instance — cancels the
+/// previous one and immediately starts the next. Route teardown is asynchronous
+/// on Windows, so the old capture rows can still be present here, and the
+/// default-route probe would then answer with the TUN.
+///
+/// Returns either way. `direct::detect` rejects tunnels by name, type, and
+/// address regardless, so this only improves *which* physical interface is
+/// chosen; it is not what makes the selection correct.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+async fn wait_for_physical_default_route(tun_name: Option<&str>) {
+    const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    let started = std::time::Instant::now();
+    let mut waited = false;
+    loop {
+        // `detect` performs the same filtering used for the real selection, so
+        // agreement here means the probe is no longer answering with a tunnel.
+        if crate::direct::detect(None, tun_name).is_ok() && netdev::get_default_interface().is_ok_and(|iface| !iface.is_tun()) {
+            break;
+        }
+        if started.elapsed() >= SETTLE_TIMEOUT {
+            log::warn!(
+                "Default route still points at a tunnel after {:?}; selecting a physical egress anyway",
+                SETTLE_TIMEOUT
+            );
+            return;
+        }
+        waited = true;
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    if waited {
+        log::info!("Waited {:?} for the previous session's routes to be removed", started.elapsed());
+    }
+}
+
 async fn general_run_async_with_process_bypass_setup(
     args: Args,
     tun_mtu: u16,
@@ -227,12 +266,21 @@ async fn general_run_async_with_process_bypass_setup(
     }
 
     // Resolve the physical egress before `tproxy_setup` installs the TUN
-    // catch-all routes. Re-resolving the default interface afterwards would
-    // select the TUN itself and send direct relays back into the tunnel.
+    // catch-all routes. Re-resolving the default interface afterwards selects
+    // the TUN itself and sends direct relays back into the tunnel.
+    //
+    // Done unconditionally rather than only when a bypass list is present: the
+    // list is updatable at runtime, and local-multicast egress needs a physical
+    // interface regardless of it.
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    if process_bypass.is_configured() {
-        let iface = crate::direct::detect(args.bind_interface.as_deref()).map_err(std::io::Error::from)?;
-        log::info!("Process-bypass physical interface selected before route setup: {iface}");
+    {
+        // A hot switch stops the previous session and starts a new one. If any
+        // capture route from the old session is still installed, the probe below
+        // resolves to the TUN. Give teardown a moment to land first; the name
+        // filter in `detect` covers whatever is left after this.
+        wait_for_physical_default_route(args.tun.as_deref()).await;
+        let iface = crate::direct::detect(args.bind_interface.as_deref(), args.tun.as_deref()).map_err(std::io::Error::from)?;
+        log::info!("Physical egress selected before route setup: {iface}");
         args.bind_interface = Some(iface.name);
     }
 

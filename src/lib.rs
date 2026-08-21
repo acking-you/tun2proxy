@@ -609,7 +609,11 @@ where
     // global UDP-direct policy was configured, so discovery traffic never
     // recurses through the TUN.
     let direct_bind = {
-        let iface = direct::detect(args.bind_interface.as_deref())?;
+        // `bind_interface` was pinned by name before the capture routes were
+        // installed, so this normally resolves that exact device. Passing the TUN
+        // name keeps the tunnel out of the answer on the paths that reach here
+        // without a pre-resolved name.
+        let iface = direct::detect(args.bind_interface.as_deref(), args.tun.as_deref())?;
         log::info!("Direct relays and local multicast egress via {iface}");
         Some(Arc::new(iface) as DirectBind)
     };

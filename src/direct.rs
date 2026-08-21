@@ -122,21 +122,100 @@ fn windows_interface_indices(iface: &netdev::Interface) -> std::io::Result<(u32,
     ))
 }
 
+/// Whether `iface` names the TUN device this session uses.
+fn matches_tun_name(iface: &netdev::Interface, tun_name: Option<&str>) -> bool {
+    let Some(tun_name) = tun_name else {
+        return false;
+    };
+    let matches = |candidate: Option<&str>| candidate.is_some_and(|value| value.eq_ignore_ascii_case(tun_name));
+    matches(Some(iface.name.as_str())) || matches(iface.friendly_name.as_deref()) || matches(iface.description.as_deref())
+}
+
+/// Whether `iface` is a tunnel and therefore unusable as a physical egress.
+///
+/// A direct relay pinned to a tunnel is worse than useless: the TUN catch-all
+/// route re-captures it, so the traffic loops back into the proxy it was
+/// supposed to skip and the application hangs with no diagnostic.
+///
+/// The interface carrying `TUN_IPV4` is rejected as well as the one matching the
+/// configured name. `netdev` reports the address before the alias in some
+/// configurations, and a stale device from a previous session can still hold it.
+fn is_unusable_egress(iface: &netdev::Interface, tun_name: Option<&str>) -> bool {
+    let carries_tun_address = iface
+        .ipv4
+        .iter()
+        .any(|network| IpAddr::V4(network.addr()) == tproxy_config::TUN_IPV4);
+
+    matches_tun_name(iface, tun_name)
+        || carries_tun_address
+        || iface.if_type == netdev::interface::types::InterfaceType::Tunnel
+        || iface.is_tun()
+        || iface.is_loopback()
+}
+
+/// Score a candidate so the best physical interface wins. Higher is better.
+fn egress_preference(iface: &netdev::Interface) -> (u8, u8, u8) {
+    let has_gateway = u8::from(iface.gateway.is_some());
+    let physical = u8::from(iface.is_physical());
+    let usable_address = u8::from(
+        iface
+            .ipv4
+            .iter()
+            .any(|network| !network.addr().is_unspecified() && !network.addr().is_loopback()),
+    );
+    (has_gateway, physical, usable_address)
+}
+
 /// Resolve the interface used for direct relays: an explicit `--bind-interface`
 /// value (matched against system, friendly, or description names) or, when
 /// omitted, the default route interface.
-pub(crate) fn detect(manual: Option<&str>) -> crate::Result<BindInterface> {
+///
+/// `tun_name` names this session's TUN device so it can never be selected. Pass
+/// it even before the device exists: the address and type checks then still
+/// reject a leftover device from a previous session.
+pub(crate) fn detect(manual: Option<&str>, tun_name: Option<&str>) -> crate::Result<BindInterface> {
     match manual {
         Some(wanted) => {
             let iface = netdev::get_interfaces()
                 .into_iter()
                 .find(|i| i.name == wanted || i.friendly_name.as_deref() == Some(wanted) || i.description.as_deref() == Some(wanted))
                 .ok_or_else(|| crate::Error::from(format!("--bind-interface `{wanted}` was not found")))?;
+            // An explicit request is honoured even if it looks like a tunnel:
+            // the operator may be deliberately stacking tunnels. Warn, because
+            // it is far more often a mistake.
+            if is_unusable_egress(&iface, tun_name) {
+                log::warn!("--bind-interface `{wanted}` looks like a tunnel or loopback device; direct relays may be re-captured");
+            }
             BindInterface::from_netdev(iface)
         }
         None => {
-            let iface = netdev::get_default_interface().map_err(crate::Error::from)?;
-            BindInterface::from_netdev(iface)
+            // `netdev` picks the default interface by asking the OS which source
+            // address it would use for an arbitrary address, not by reading the
+            // routing table. While TUN capture routes are installed that probe
+            // resolves to the TUN itself, so the answer has to be filtered.
+            let candidate = netdev::get_default_interface()
+                .ok()
+                .filter(|iface| !is_unusable_egress(iface, tun_name));
+            if let Some(iface) = candidate {
+                return BindInterface::from_netdev(iface);
+            }
+
+            let fallback = netdev::get_interfaces()
+                .into_iter()
+                .filter(|iface| (iface.is_up() || iface.is_oper_up()) && !is_unusable_egress(iface, tun_name))
+                .filter(|iface| !iface.ipv4.is_empty() || !iface.ipv6.is_empty())
+                .max_by_key(egress_preference)
+                .ok_or_else(|| {
+                    crate::Error::from(
+                        "no physical network interface is available for direct relays; every candidate is a tunnel, \
+                         loopback, or has no address",
+                    )
+                })?;
+            log::info!(
+                "Default-route lookup returned an unusable egress; falling back to physical interface `{}`",
+                fallback.name
+            );
+            BindInterface::from_netdev(fallback)
         }
     }
 }
@@ -539,6 +618,87 @@ mod tests {
         }
     }
 
+    /// Build a synthetic interface. The rejection filter reads only these
+    /// fields, so this avoids depending on whatever the host actually has.
+    fn candidate(name: &str, address: Option<&str>) -> netdev::Interface {
+        let mut iface = netdev::Interface::dummy();
+        iface.name = name.to_string();
+        iface.index = 7;
+        if let Some(address) = address {
+            iface.ipv4 = vec![netdev::ipnet::Ipv4Net::new(address.parse().unwrap(), 24).unwrap()];
+        }
+        iface
+    }
+
+    #[test]
+    fn the_configured_tun_is_never_a_physical_egress() {
+        let tun = candidate("wintun", Some("192.168.1.10"));
+        assert!(is_unusable_egress(&tun, Some("wintun")));
+        // Case-insensitively, because Windows reports friendly names verbatim.
+        assert!(is_unusable_egress(&candidate("WinTun", None), Some("wintun")));
+        // A different adapter with an ordinary address stays usable.
+        assert!(!is_unusable_egress(&candidate("en0", Some("192.168.1.10")), Some("wintun")));
+    }
+
+    /// The TUN address is checked separately from the name: a leftover device
+    /// from a previous session can still hold it under a different alias.
+    #[test]
+    fn an_interface_carrying_the_tun_address_is_rejected() {
+        let stale = candidate("utun9", Some("10.0.0.33"));
+        assert_eq!(tproxy_config::TUN_IPV4.to_string(), "10.0.0.33");
+        assert!(is_unusable_egress(&stale, None));
+        assert!(is_unusable_egress(&stale, Some("some-other-name")));
+    }
+
+    #[test]
+    fn loopback_and_tunnel_types_are_rejected() {
+        let mut tunnel = candidate("tunnel0", Some("192.168.9.2"));
+        tunnel.if_type = netdev::interface::types::InterfaceType::Tunnel;
+        assert!(is_unusable_egress(&tunnel, None));
+
+        let mut loopback = candidate("lo0", Some("127.0.0.1"));
+        loopback.flags |= netdev::interface::flags::IFF_LOOPBACK as u32;
+        assert!(is_unusable_egress(&loopback, None));
+    }
+
+    /// An interface with a gateway beats one without, so the fallback picks a
+    /// genuinely routable device rather than the first one enumerated.
+    #[test]
+    fn egress_preference_ranks_a_routable_interface_highest() {
+        let plain = candidate("en5", Some("192.168.4.2"));
+        let addressless = candidate("en6", None);
+        assert!(egress_preference(&plain) > egress_preference(&addressless));
+    }
+
+    /// The real host must still yield a usable egress, and never a tunnel — this
+    /// is the property the whole fix exists to guarantee.
+    ///
+    /// Also covers the actual bug: when the machine's default route already
+    /// points at a tunnel (any VPN, or our own TUN mid-session), `netdev` answers
+    /// with that tunnel and `detect` must disagree. That case was observed
+    /// directly during development, with `netdev` returning `utun4` while this
+    /// returned `en0`.
+    #[test]
+    fn detect_never_returns_the_tunnel_the_os_calls_default() {
+        let Ok(selected) = detect(None, Some(tproxy_config::TUN_NAME)) else {
+            // A machine with no physical interface at all; nothing to assert.
+            return;
+        };
+        assert_ne!(selected.name, tproxy_config::TUN_NAME);
+        assert_ne!(selected.ipv4_addr.map(IpAddr::V4), Some(tproxy_config::TUN_IPV4));
+        assert!(selected.ipv4_index != 0 || selected.ipv6_index != 0);
+
+        if let Ok(os_default) = netdev::get_default_interface()
+            && is_unusable_egress(&os_default, Some(tproxy_config::TUN_NAME))
+        {
+            assert_ne!(
+                selected.name, os_default.name,
+                "the OS default route points at `{}`, which must not be used as a physical egress",
+                os_default.name
+            );
+        }
+    }
+
     /// A bound socket must source from the interface it was pinned to. UDP
     /// `connect` only records a default peer, so this sends no packets.
     ///
@@ -553,7 +713,7 @@ mod tests {
     fn macos_bound_socket_egresses_through_the_named_interface() {
         use std::net::UdpSocket;
 
-        let Ok(iface) = detect(None) else {
+        let Ok(iface) = detect(None, Some(tproxy_config::TUN_NAME)) else {
             // No default route on this machine; nothing to compare against.
             return;
         };

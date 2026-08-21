@@ -16,13 +16,7 @@ fn process_name(pid: u32) -> Option<String> {
     let mut buffer = vec![0u8; 4 * libc::PATH_MAX as usize];
     // SAFETY: the buffer is valid for `buffer.len()` bytes and `proc_pidpath`
     // writes at most that many, returning the byte count it used.
-    let length = unsafe {
-        libc::proc_pidpath(
-            pid as libc::c_int,
-            buffer.as_mut_ptr().cast(),
-            buffer.len() as u32,
-        )
-    };
+    let length = unsafe { libc::proc_pidpath(pid as libc::c_int, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
     if length <= 0 {
         return None;
     }
@@ -41,15 +35,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
     // SAFETY: the destination is a correctly sized, writable `proc_bsdinfo`, and
     // the flavor matches that struct. A partial write is rejected below by
     // requiring the exact byte count back.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
+    let written = unsafe { libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
     if written != size {
         return None;
     }
