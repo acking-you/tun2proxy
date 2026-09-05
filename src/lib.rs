@@ -235,30 +235,19 @@ type HandlerResult = std::io::Result<Arc<Mutex<dyn ProxyHandler>>>;
 
 /// Run one established relay until it finishes normally or a live process
 /// policy update changes whether its source process should bypass the proxy.
-/// Dropping the relay future closes both halves; the application can then
-/// reconnect and receive a fresh handler on the new route.
+/// A `None` result requires the TCP caller to explicitly reset the captured
+/// stream: dropping a userspace relay alone does not notify the application.
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-async fn run_until_process_policy_change<F, T>(
-    relay: F,
-    matcher: Option<Arc<process::ProcessMatcher>>,
-    changes: Option<tokio::sync::watch::Receiver<u64>>,
-    protocol: IpProtocol,
-    src: SocketAddr,
-    dst: SocketAddr,
-    initial_bypass: bool,
-) -> Option<T>
+async fn run_until_process_policy_change<F, T>(relay: F, policy: Option<process::SessionPolicy>) -> Option<T>
 where
     F: std::future::Future<Output = T>,
 {
-    let Some(matcher) = matcher else {
-        return Some(relay.await);
-    };
-    let Some(changes) = changes else {
+    let Some(policy) = policy else {
         return Some(relay.await);
     };
     tokio::select! {
         result = relay => Some(result),
-        _ = matcher.wait_for_routing_change(changes, protocol, src, dst, initial_bypass) => None,
+        _ = policy.wait_for_routing_change() => None,
     }
 }
 
@@ -804,22 +793,32 @@ where
                 // task rather than on the accept loop.
                 managed_tasks.spawn(async move {
                     let _session_permit = session_permit;
+                    let mut tcp = tcp;
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                    let policy_changes = process_matcher.as_ref().map(|matcher| matcher.subscribe());
-                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                    let bypass = match &process_matcher {
-                        Some(matcher) => matcher.matches(IpProtocol::Tcp, info.src, info.dst).await,
-                        None => false,
+                    let policy = match &process_matcher {
+                        Some(matcher) => Some(matcher.match_session(IpProtocol::Tcp, info.src, info.dst).await),
+                        None => None,
                     };
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                    let bypass = policy.as_ref().is_some_and(process::SessionPolicy::bypass);
                     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let bypass = false;
 
                     if !bypass && dns == ArgDns::Virtual && info.dst.port() == DNS_PORT {
-                        let result = match virtual_dns.clone() {
-                            Some(virtual_dns) => handle_virtual_dns_tcp_session(tcp, virtual_dns).await,
-                            None => Err("virtual DNS manager is unavailable".into()),
+                        let relay = async {
+                            match virtual_dns.clone() {
+                                Some(virtual_dns) => handle_virtual_dns_tcp_session(&mut tcp, virtual_dns).await,
+                                None => Err("virtual DNS manager is unavailable".into()),
+                            }
                         };
-                        if let Err(error) = result {
+                        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                        let result = run_until_process_policy_change(relay, policy).await;
+                        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+                        let result = Some(relay.await);
+                        if result.is_none() {
+                            reset_tcp_after_policy_change(&mut tcp, info);
+                        }
+                        if let Some(Err(error)) = result {
                             log::debug!("{info} virtual DNS TCP session ended: {error}");
                         }
                         return;
@@ -835,12 +834,7 @@ where
                     }
 
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                    let (handler_result, bind, bypass, policy_changes): (
-                        HandlerResult,
-                        Option<DirectBind>,
-                        bool,
-                        Option<tokio::sync::watch::Receiver<u64>>,
-                    ) = {
+                    let (handler_result, bind): (HandlerResult, Option<DirectBind>) = {
                         let mut info = info;
                         let dns_destination = if bypass && info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
                             direct_bind
@@ -864,16 +858,11 @@ where
                         };
                         let domain_name = resolve_virtual_domain(virtual_dns.as_ref(), info.dst.ip()).await;
                         match (bypass_destination, domain_name, bypass) {
-                            (Err(error), _, _) | (_, Err(error), _) => (Err(error), direct_bind.clone(), bypass, policy_changes),
-                            (Ok(()), Ok(domain_name), true) => (
-                                no_proxy_mgr.new_proxy_handler(info, domain_name, false).await,
-                                direct_bind.clone(),
-                                bypass,
-                                policy_changes,
-                            ),
-                            (Ok(()), Ok(domain_name), false) => {
-                                (mgr.new_proxy_handler(info, domain_name, false).await, None, bypass, policy_changes)
+                            (Err(error), _, _) | (_, Err(error), _) => (Err(error), direct_bind.clone()),
+                            (Ok(()), Ok(domain_name), true) => {
+                                (no_proxy_mgr.new_proxy_handler(info, domain_name, false).await, direct_bind.clone())
                             }
+                            (Ok(()), Ok(domain_name), false) => (mgr.new_proxy_handler(info, domain_name, false).await, None),
                         }
                     };
                     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -888,18 +877,15 @@ where
                     match handler_result {
                         Ok(proxy_handler) => {
                             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                            let result = run_until_process_policy_change(
-                                handle_tcp_session(tcp, proxy_handler, socket_queue, bind),
-                                process_matcher,
-                                policy_changes,
-                                IpProtocol::Tcp,
-                                info.src,
-                                info.dst,
-                                bypass,
-                            )
-                            .await;
+                            let result =
+                                run_until_process_policy_change(handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind), policy)
+                                    .await;
                             #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-                            let result = Some(handle_tcp_session(tcp, proxy_handler, socket_queue, bind).await);
+                            let result = Some(handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind).await);
+
+                            if result.is_none() {
+                                reset_tcp_after_policy_change(&mut tcp, info);
+                            }
 
                             if let Some(Err(err)) = result {
                                 log::error!("{info} error \"{err}\"");
@@ -935,30 +921,22 @@ where
                     let _session_permit = session_permit;
                     let mut info = SessionInfo::new(udp.local_addr(), udp.peer_addr(), IpProtocol::Udp);
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                    let original_src = info.src;
-                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                    let original_dst = info.dst;
-                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let local_multicast = is_local_multicast_destination(info.dst.ip());
-                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                    let policy_changes = (!local_multicast)
-                        .then(|| process_matcher.as_ref().map(|matcher| matcher.subscribe()))
-                        .flatten();
                     // Decide process bypass before DNS or UdpGW handling. A
                     // bypassed process must see real DNS answers and raw UDP;
                     // otherwise its own traffic can recurse through the local
                     // proxy or attempt to connect to a virtual-DNS fake IP.
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                    let process_bypass = if local_multicast {
-                        false
+                    let policy = if local_multicast {
+                        None
                     } else {
                         match &process_matcher {
-                            Some(matcher) => matcher.matches(IpProtocol::Udp, info.src, info.dst).await,
-                            None => false,
+                            Some(matcher) => Some(matcher.match_session(IpProtocol::Udp, info.src, info.dst).await),
+                            None => None,
                         }
                     };
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                    let bypass = local_multicast || process_bypass;
+                    let bypass = local_multicast || policy.as_ref().is_some_and(process::SessionPolicy::bypass);
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     if local_multicast {
                         log::debug!(
@@ -1056,16 +1034,7 @@ where
                     };
 
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                    let result = run_until_process_policy_change(
-                        relay,
-                        process_matcher,
-                        policy_changes,
-                        IpProtocol::Udp,
-                        original_src,
-                        original_dst,
-                        bypass,
-                    )
-                    .await;
+                    let result = run_until_process_policy_change(relay, policy).await;
                     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let result = Some(relay.await);
 
@@ -1173,8 +1142,15 @@ where
     Ok(total)
 }
 
+fn reset_tcp_after_policy_change(tcp: &mut IpStackTcpStream, info: SessionInfo) {
+    log::info!("{info} process bypass decision changed; resetting the connection for reconnection");
+    if let Err(error) = tcp.abort() {
+        log::warn!("{info} could not send the policy-change TCP reset: {error}");
+    }
+}
+
 async fn handle_tcp_session(
-    mut tcp_stack: IpStackTcpStream,
+    tcp_stack: &mut IpStackTcpStream,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     bind: Option<DirectBind>,

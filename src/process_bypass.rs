@@ -83,7 +83,7 @@ impl ProcessBypass {
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", test))]
+    #[cfg(test)]
     pub(crate) fn contains_normalized(&self, name: &str) -> bool {
         match self.names.read() {
             Ok(names) => names.iter().any(|candidate| candidate == name),

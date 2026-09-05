@@ -657,7 +657,10 @@ mod tests {
         assert!(is_unusable_egress(&tunnel, None));
 
         let mut loopback = candidate("lo0", Some("127.0.0.1"));
-        loopback.flags |= netdev::interface::flags::IFF_LOOPBACK as u32;
+        // Unix exposes libc's signed flags; Windows already uses u32.
+        #[allow(clippy::unnecessary_cast)]
+        let loopback_flag = netdev::interface::flags::IFF_LOOPBACK as u32;
+        loopback.flags |= loopback_flag;
         assert!(is_unusable_egress(&loopback, None));
     }
 

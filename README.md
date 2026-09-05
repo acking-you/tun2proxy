@@ -218,7 +218,12 @@ Notes:
   bypassed process are sent directly so the process receives real addresses rather than virtual-DNS fake IPs. If an
   application cached a virtual address before it was selected, tun2proxy resolves the remembered domain again through
   a physical-interface-bound DNS socket before opening its direct relay.
-- Only implemented on **Windows and Linux**. On other platforms the flag is accepted but ignored (with a warning).
+- Live `ProcessBypass` updates compare the new policy with the owner/ancestor identities captured for each session.
+  They do not repeat OS socket lookups for established sessions or reinterpret a missing/reused socket as another
+  process. Unchanged relays stay open. Changed TCP relays send a reset before releasing their state (including DNS
+  over TCP); changed UDP relays are recreated on the next datagram. An unidentified session stays proxied until it
+  ends, and all new sessions still perform a fresh owner lookup. The TUN device and routes are not recreated.
+- Implemented on **Windows, Linux, and macOS**. On other platforms the flag is accepted but ignored (with a warning).
 - Not compatible with the Linux `--unshare` socket-transfer path; use it with a normal `--setup` run.
 
 ## CLI

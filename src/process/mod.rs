@@ -46,6 +46,39 @@ pub(crate) struct ProcessMatcher {
     cache: Mutex<Cache>,
 }
 
+/// The socket owner's identity is pinned for the lifetime of one relay. An OS
+/// table refresh can lose an owner, recycle a UDP port, or see a different
+/// ancestor chain; none of those events is a change to this session's policy.
+pub(crate) struct SessionPolicy {
+    names: ProcessBypass,
+    identities: Vec<String>,
+    changes: tokio::sync::watch::Receiver<u64>,
+    bypass: bool,
+}
+
+impl SessionPolicy {
+    pub(crate) fn bypass(&self) -> bool {
+        self.bypass
+    }
+
+    pub(crate) async fn wait_for_routing_change(mut self) {
+        loop {
+            if self.changes.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            if matches_policy(&self.names, &self.identities) != self.bypass {
+                return;
+            }
+        }
+    }
+}
+
+fn matches_policy(names: &ProcessBypass, identities: &[String]) -> bool {
+    // Read a single policy snapshot, even if an update races this decision.
+    let names = names.names();
+    identities.iter().any(|name| names.contains(name))
+}
+
 impl ProcessMatcher {
     /// Whether the supplied list contains at least one usable process name.
     /// Build a matcher around a runtime-updatable list. Returns `None` when the
@@ -60,57 +93,43 @@ impl ProcessMatcher {
         })
     }
 
-    /// Returns true if the session originating at `src` belongs to a process in
-    /// the bypass list. Runs the (briefly blocking) OS table walk on the
-    /// blocking pool so it never stalls the async accept loop.
-    pub(crate) async fn matches(self: &std::sync::Arc<Self>, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr) -> bool {
+    /// Resolve a new session once, including identities that do not currently
+    /// bypass. Policy updates then only compare names; they never launch an OS
+    /// socket/process-table walk for every established relay at once.
+    pub(crate) async fn match_session(
+        self: &std::sync::Arc<Self>,
+        protocol: IpProtocol,
+        src: SocketAddr,
+        dst: SocketAddr,
+    ) -> SessionPolicy {
+        // Subscribe before lookup so an update racing it cannot be missed.
+        let changes = self.names.subscribe();
         // Any snapshot taken after this instant necessarily includes this
         // socket: the packet has already reached the TUN before lookup starts.
         // Concurrent lookups can therefore share one refresh without allowing
         // a time-based stale-cache window.
         let requested_at = Instant::now();
         let this = self.clone();
-        match tokio::task::spawn_blocking(move || this.matches_blocking(protocol, src, dst, requested_at)).await {
+        let identities = match tokio::task::spawn_blocking(move || this.identities_blocking(protocol, src, dst, requested_at)).await {
             Ok(result) => result,
             Err(err) => {
                 log::warn!("process bypass lookup task failed: {err}");
-                false
+                Vec::new()
             }
+        };
+        let bypass = matches_policy(&self.names, &identities);
+        if bypass {
+            log::info!("bypassing {protocol} session {src} -> {dst}: process identities {identities:?}");
+        }
+        SessionPolicy {
+            names: self.names.clone(),
+            identities,
+            changes,
+            bypass,
         }
     }
 
-    /// Subscribe before evaluating a session so a policy update racing with
-    /// the initial socket-table lookup cannot be missed.
-    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.names.subscribe()
-    }
-
-    /// Wait until a policy update changes this established session's routing
-    /// decision. Callers then close the relay so the application reconnects
-    /// through the newly selected path.
-    pub(crate) async fn wait_for_routing_change(
-        self: &std::sync::Arc<Self>,
-        mut changes: tokio::sync::watch::Receiver<u64>,
-        protocol: IpProtocol,
-        src: SocketAddr,
-        dst: SocketAddr,
-        initial_bypass: bool,
-    ) -> bool {
-        loop {
-            if changes.changed().await.is_err() {
-                std::future::pending::<()>().await;
-            }
-            let bypass = self.matches(protocol, src, dst).await;
-            if bypass != initial_bypass {
-                log::info!(
-                    "process bypass policy changed established {protocol} session {src} -> {dst} from bypass={initial_bypass} to bypass={bypass}; closing it so the application reconnects"
-                );
-                return bypass;
-            }
-        }
-    }
-
-    fn matches_blocking(&self, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr, requested_at: Instant) -> bool {
+    fn identities_blocking(&self, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr, requested_at: Instant) -> Vec<String> {
         let mut cache = match self.cache.lock() {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
@@ -118,20 +137,20 @@ impl ProcessMatcher {
         if !snapshot_covers_request(cache.fetched_at, requested_at) {
             self.refresh(&mut cache);
         }
-        self.match_in_cache(&mut cache, protocol, src, dst)
+        self.identities_in_cache(&mut cache, protocol, src, dst)
     }
 
     /// Look the session up against the current snapshot, resolving and memoizing
     /// candidate process names. Does not refresh the snapshot.
-    fn match_in_cache(&self, cache: &mut Cache, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr) -> bool {
+    fn identities_in_cache(&self, cache: &mut Cache, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr) -> Vec<String> {
         // Collect candidate PIDs first to avoid borrowing `cache.entries` and
         // `cache.pid_names` simultaneously.
         let pids = candidate_pids(&cache.entries, protocol, src, dst);
         if pids.is_empty() {
             log::debug!("process bypass found no socket owner for {protocol} session {src} -> {dst}");
-            return false;
+            return Vec::new();
         }
-        let candidate_count = pids.len();
+        let mut identities = Vec::new();
         for pid in pids {
             let names = cache.pid_names.entry(pid).or_insert_with(|| {
                 imp::process_names(pid)
@@ -144,20 +163,12 @@ impl ProcessMatcher {
                 log::debug!("process bypass could not resolve executable identity for {protocol} session {src} -> {dst} owner pid {pid}");
                 continue;
             }
-            for (depth, name) in names.iter().enumerate() {
-                if self.names.contains_normalized(name) {
-                    let relation = if depth == 0 { "owner" } else { "ancestor" };
-                    log::info!("bypassing {protocol} session {src} -> {dst}: socket pid {pid} matched {relation} process `{name}`");
-                    return true;
-                }
-            }
+            identities.extend(names.iter().cloned());
             log::debug!("process bypass resolved socket pid {pid} to identity chain {names:?}");
         }
-        log::debug!(
-            "process bypass checked {candidate_count} socket owner candidate(s) for {protocol} session {src} -> {dst}; none matched {:?}",
-            self.names.names()
-        );
-        false
+        identities.sort_unstable();
+        identities.dedup();
+        identities
     }
 
     fn refresh(&self, cache: &mut Cache) {
@@ -343,7 +354,118 @@ mod tests {
             pid_names: HashMap::from([(42, vec!["protected-game".to_string(), "game-launcher".to_string()])]),
         };
 
-        assert!(matcher.match_in_cache(&mut cache, IpProtocol::Tcp, src, dst));
+        assert!(matches_policy(
+            &matcher.names,
+            &matcher.identities_in_cache(&mut cache, IpProtocol::Tcp, src, dst)
+        ));
+    }
+
+    #[tokio::test]
+    async fn adding_bypass_preserves_an_existing_direct_session_when_the_socket_snapshot_loses_its_owner() {
+        let names = ProcessBypass::new(["proxy_ui".to_string()]);
+        let matcher = std::sync::Arc::new(ProcessMatcher::new(names.clone()).unwrap());
+        let src: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let dst: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        // Synthetic snapshots only: no sockets, adapters, or OS routes are used.
+        *matcher.cache.lock().unwrap() = Cache {
+            fetched_at: Some(Instant::now() + Duration::from_secs(3600)),
+            entries: vec![entry(IpProtocol::Tcp, src.ip(), src.port(), Some(dst), 42)],
+            pid_names: HashMap::from([(42, vec!["proxy_ui".to_string()])]),
+        };
+        let policy = matcher.match_session(IpProtocol::Tcp, src, dst).await;
+        assert!(policy.bypass());
+        matcher.cache.lock().unwrap().entries.clear();
+        names.set_names(["proxy_ui".to_string(), "browser".to_string()]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), policy.wait_for_routing_change(),)
+                .await
+                .is_err(),
+            "adding another app must not disconnect the proxy's existing direct connection"
+        );
+    }
+
+    fn synthetic_matcher(
+        names: ProcessBypass,
+        identities: &[&str],
+        protocol: IpProtocol,
+    ) -> (std::sync::Arc<ProcessMatcher>, SocketAddr, SocketAddr) {
+        let src: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let dst: SocketAddr = "198.18.0.1:443".parse().unwrap();
+        let matcher = std::sync::Arc::new(ProcessMatcher::new(names).unwrap());
+        *matcher.cache.lock().unwrap() = Cache {
+            fetched_at: Some(Instant::now() + Duration::from_secs(3600)),
+            entries: vec![entry(protocol, src.ip(), src.port(), Some(dst), 42)],
+            pid_names: HashMap::from([(42, identities.iter().map(|name| (*name).to_string()).collect())]),
+        };
+        (matcher, src, dst)
+    }
+
+    #[tokio::test]
+    async fn selecting_an_ancestor_reroutes_existing_tcp_and_udp_even_if_the_socket_owner_disappears() {
+        for protocol in [IpProtocol::Tcp, IpProtocol::Udp] {
+            let names = ProcessBypass::new(["proxy_ui".to_string()]);
+            let (matcher, src, dst) = synthetic_matcher(names.clone(), &["browser-helper", "browser"], protocol);
+            let policy = matcher.match_session(protocol, src, dst).await;
+            assert!(!policy.bypass());
+            matcher.cache.lock().unwrap().entries.clear();
+            // Update before the waiter is first polled, as can happen during
+            // fake-IP resolution or an upstream connection handshake.
+            names.set_names(["proxy_ui".to_string(), "browser".to_string()]);
+            tokio::time::timeout(Duration::from_secs(1), policy.wait_for_routing_change())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_apply_only_interrupts_the_app_whose_route_changes() {
+        let names = ProcessBypass::new(["proxy_ui".to_string(), "browser".to_string()]);
+        let (proxy, src, dst) = synthetic_matcher(names.clone(), &["proxy_ui"], IpProtocol::Tcp);
+        let (browser, _, _) = synthetic_matcher(names.clone(), &["browser"], IpProtocol::Tcp);
+        let proxy = proxy.match_session(IpProtocol::Tcp, src, dst).await;
+        let browser = browser.match_session(IpProtocol::Tcp, src, dst).await;
+        let mut proxy_wait = Box::pin(proxy.wait_for_routing_change());
+        let mut browser_wait = Box::pin(browser.wait_for_routing_change());
+        for app in ["curl", "game", "music"] {
+            names.set_names(["proxy_ui".to_string(), "browser".to_string(), app.to_string()]);
+            assert!(tokio::time::timeout(Duration::from_millis(10), &mut proxy_wait).await.is_err());
+            assert!(tokio::time::timeout(Duration::from_millis(10), &mut browser_wait).await.is_err());
+        }
+        names.set_names(["proxy_ui".to_string()]);
+        tokio::time::timeout(Duration::from_secs(1), &mut browser_wait).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut proxy_wait).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_reused_udp_port_does_not_reassign_an_established_session_to_another_process() {
+        let names = ProcessBypass::new(["proxy_ui".to_string()]);
+        let (matcher, src, dst) = synthetic_matcher(names.clone(), &["ordinary-app"], IpProtocol::Udp);
+        let policy = matcher.match_session(IpProtocol::Udp, src, dst).await;
+        assert!(!policy.bypass());
+        matcher.cache.lock().unwrap().pid_names.insert(42, vec!["proxy_ui".to_string()]);
+        names.set_names(["proxy_ui".to_string(), "other-app".to_string()]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), policy.wait_for_routing_change())
+                .await
+                .is_err()
+        );
+        // A new relay still does a fresh ownership lookup.
+        assert!(matcher.match_session(IpProtocol::Udp, src, dst).await.bypass());
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_owner_cannot_be_promoted_to_direct_by_a_later_snapshot() {
+        let names = ProcessBypass::new(["proxy_ui".to_string()]);
+        let (matcher, src, dst) = synthetic_matcher(names.clone(), &[], IpProtocol::Tcp);
+        let policy = matcher.match_session(IpProtocol::Tcp, src, dst).await;
+        assert!(!policy.bypass());
+        matcher.cache.lock().unwrap().pid_names.insert(42, vec!["proxy_ui".to_string()]);
+        names.set_names(["proxy_ui".to_string(), "browser".to_string()]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), policy.wait_for_routing_change())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -357,8 +479,9 @@ mod tests {
 
         assert!(
             matcher
-                .matches(IpProtocol::Tcp, client.local_addr().unwrap(), client.peer_addr().unwrap())
+                .match_session(IpProtocol::Tcp, client.local_addr().unwrap(), client.peer_addr().unwrap())
                 .await
+                .bypass()
         );
     }
 
@@ -373,9 +496,9 @@ mod tests {
         let (_server, _) = listener.accept().await.unwrap();
         let source = client.local_addr().unwrap();
 
-        assert!(!matcher.matches(IpProtocol::Tcp, source, destination).await);
+        assert!(!matcher.match_session(IpProtocol::Tcp, source, destination).await.bypass());
         names.set_names([process_name]);
-        assert!(matcher.matches(IpProtocol::Tcp, source, destination).await);
+        assert!(matcher.match_session(IpProtocol::Tcp, source, destination).await.bypass());
     }
 
     fn entry(protocol: IpProtocol, ip: std::net::IpAddr, port: u16, remote: Option<SocketAddr>, pid: u32) -> SocketEntry {
