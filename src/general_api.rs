@@ -243,6 +243,56 @@ async fn wait_for_physical_default_route(tun_name: Option<&str>) {
     }
 }
 
+/// Check for a competing capture route without changing routes or DNS.
+#[cfg(target_os = "macos")]
+pub fn validate_macos_capture_routes() -> std::io::Result<()> {
+    // The primary service can still be Wi-Fi while more-specific VPN routes
+    // own Internet and fake-IP traffic. Inspect the selected routes themselves.
+    for destination in ["1.1.1.1", "198.18.0.1"] {
+        let output = std::process::Command::new("/sbin/route")
+            .args(["-n", "get", destination])
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!("could not inspect the macOS route to {destination}")));
+        }
+        let route_output = String::from_utf8_lossy(&output.stdout);
+        let interface = macos_route_interface(&route_output)?;
+        if interface.starts_with("utun") {
+            return Err(std::io::Error::other(format!(
+                "macOS traffic is already routed through tunnel `{interface}`. TUN capture cannot take over these routes safely; \
+                 the existing network configuration and local HTTP/SOCKS5 proxy were left unchanged"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_route_interface(output: &str) -> std::io::Result<&str> {
+    output
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.trim().split_once(':')?;
+            let value = value.trim();
+            (key == "interface" && !value.is_empty()).then_some(value)
+        })
+        .ok_or_else(|| std::io::Error::other("macOS route lookup did not report an interface"))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn macos_capture_check_reads_selected_route_instead_of_primary_service() {
+    assert_eq!(
+        macos_route_interface("route to: 1.1.1.1\ngateway: 192.168.255.10\n  interface: utun4\n").unwrap(),
+        "utun4"
+    );
+    assert_eq!(
+        macos_route_interface("route to: 1.1.1.1\ngateway: 192.0.2.1\n  interface: en0\n").unwrap(),
+        "en0"
+    );
+    assert!(macos_route_interface("route: not in table").is_err());
+}
+
 async fn general_run_async_with_process_bypass_setup(
     args: Args,
     tun_mtu: u16,
@@ -265,6 +315,11 @@ async fn general_run_async_with_process_bypass_setup(
         return Err(preexisting_windows_tunnel_error(&preexisting_tunnels));
     }
 
+    #[cfg(target_os = "macos")]
+    if args.setup {
+        validate_macos_capture_routes()?;
+    }
+
     // Resolve the physical egress before `tproxy_setup` installs the TUN
     // catch-all routes. Re-resolving the default interface afterwards selects
     // the TUN itself and sends direct relays back into the tunnel.
@@ -273,16 +328,19 @@ async fn general_run_async_with_process_bypass_setup(
     // list is updatable at runtime, and local-multicast egress needs a physical
     // interface regardless of it.
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    {
+    let preselected_egress = {
         // A hot switch stops the previous session and starts a new one. If any
         // capture route from the old session is still installed, the probe below
         // resolves to the TUN. Give teardown a moment to land first; the name
         // filter in `detect` covers whatever is left after this.
         wait_for_physical_default_route(args.tun.as_deref()).await;
         let iface = crate::direct::detect(args.bind_interface.as_deref(), args.tun.as_deref()).map_err(std::io::Error::from)?;
-        log::info!("Physical egress selected before route setup: {iface}");
-        args.bind_interface = Some(iface.name);
-    }
+        log::info!("Physical egress selected before route setup: {iface}, DNS {:?}", iface.dns_servers);
+        args.bind_interface = Some(iface.name.clone());
+        Some(std::sync::Arc::new(iface))
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    let preselected_egress = None;
 
     let mut tun_config = tun::Configuration::default();
 
@@ -436,13 +494,14 @@ async fn general_run_async_with_process_bypass_setup(
     // forwarding loop's JoinSet then owns and aborts all of its session tasks.
     // Tokio abort is cooperative, so this prevents leaked background work but
     // does not claim an instantaneous ordering against synchronous Drop.
-    let join_handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(crate::run_with_process_bypass_and_virtual_dns(
+    let join_handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(crate::run_with_preselected_egress(
         device,
         tun_mtu,
         args.clone(),
         shutdown_token.clone(),
         process_bypass,
         virtual_dns_state,
+        preselected_egress,
     )));
 
     // Preserve JoinError instead of returning through `?`: route/DNS cleanup

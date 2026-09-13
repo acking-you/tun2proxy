@@ -46,6 +46,8 @@ pub use {
     virtual_dns::VirtualDnsState,
 };
 
+#[cfg(target_os = "macos")]
+pub use general_api::validate_macos_capture_routes;
 pub use general_api::{
     general_run_async, general_run_async_with_process_bypass, general_run_async_with_process_bypass_and_ready,
     general_run_async_with_process_bypass_and_ready_and_virtual_dns, general_run_async_with_process_bypass_and_virtual_dns,
@@ -555,6 +557,21 @@ pub async fn run_with_process_bypass_and_virtual_dns<D>(
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    run_with_preselected_egress(device, mtu, args, shutdown_token, process_bypass, virtual_dns_state, None).await
+}
+
+async fn run_with_preselected_egress<D>(
+    device: D,
+    mtu: u16,
+    args: Args,
+    shutdown_token: CancellationToken,
+    process_bypass: ProcessBypass,
+    virtual_dns_state: Option<VirtualDnsState>,
+    preselected_egress: Option<DirectBind>,
+) -> crate::Result<usize>
+where
+    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     log::info!("{} {} starting...", env!("CARGO_PKG_NAME"), version_info!());
     log::info!("Proxy {} server: {}", args.proxy.proxy_type, args.proxy.addr);
 
@@ -598,16 +615,17 @@ where
     // global UDP-direct policy was configured, so discovery traffic never
     // recurses through the TUN.
     let direct_bind = {
-        // `bind_interface` was pinned by name before the capture routes were
-        // installed, so this normally resolves that exact device. Passing the TUN
-        // name keeps the tunnel out of the answer on the paths that reach here
-        // without a pre-resolved name.
-        let iface = direct::detect(args.bind_interface.as_deref(), args.tun.as_deref())?;
+        // Keep the whole pre-setup snapshot. Looking up the same name again
+        // after setup reads our virtual resolver as the physical DNS server.
+        let iface = match preselected_egress {
+            Some(iface) => iface,
+            None => Arc::new(direct::detect(args.bind_interface.as_deref(), args.tun.as_deref())?),
+        };
         log::info!("Direct relays and local multicast egress via {iface}");
-        Some(Arc::new(iface) as DirectBind)
+        Some(iface)
     };
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    let direct_bind: Option<DirectBind> = None;
+    let direct_bind: Option<DirectBind> = preselected_egress;
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     if process_bypass.is_configured() {
@@ -1067,6 +1085,31 @@ where
     }
     forwarding_result?;
     Ok(active_sessions)
+}
+
+#[cfg(all(test, any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+#[tokio::test]
+async fn forwarding_keeps_pre_setup_egress_instead_of_rereading_system_dns() {
+    let (_, device) = tokio::io::duplex(4096);
+    let token = CancellationToken::new();
+    token.cancel();
+    // Re-querying this intentionally nonexistent device would fail. The
+    // complete pre-setup snapshot must reach the forwarding loop unchanged.
+    let name = "test-physical-dns-snapshot".to_owned();
+    let egress = Arc::new(direct::BindInterface {
+        name: name.clone(),
+        ipv4_index: 1,
+        ipv6_index: 1,
+        ipv4_addr: Some("192.0.2.2".parse().unwrap()),
+        dns_servers: vec!["192.0.2.1".parse().unwrap()],
+    });
+    let args = Args {
+        bind_interface: Some(name),
+        dns: ArgDns::Virtual,
+        ..Args::default()
+    };
+    let result = run_with_preselected_egress(device, DEFAULT_MTU, args, token, ProcessBypass::new(Vec::new()), None, Some(egress)).await;
+    assert_eq!(result.unwrap(), 0);
 }
 
 async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<VirtualDns>>) -> crate::Result<()> {
