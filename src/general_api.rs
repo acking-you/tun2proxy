@@ -501,7 +501,7 @@ async fn general_run_async_with_process_bypass_setup(
         shutdown_token.clone(),
         process_bypass,
         virtual_dns_state,
-        preselected_egress,
+        crate::NetworkEnvironment::Physical(preselected_egress),
     )));
 
     // Preserve JoinError instead of returning through `?`: route/DNS cleanup

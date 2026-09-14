@@ -34,7 +34,6 @@ use tokio::{
 };
 pub use tokio_util::sync::CancellationToken;
 use tproxy_config::is_private_ip;
-use udp_stream::UdpStream;
 #[cfg(feature = "udpgw")]
 use udpgw::{UDPGW_KEEPALIVE_TIME, UDPGW_MAX_CONNECTIONS, UdpGwClientStream, UdpGwResponse};
 
@@ -338,16 +337,44 @@ async fn create_tcp_stream(
     }
 }
 
+/// A connected UDP socket must use send/recv. udp-stream's send_to on a
+/// connected socket returns EISCONN on macOS. Keeping the socket here also
+/// gives session cancellation ownership of the receiver, without a detached
+/// background task or a second packet queue.
+struct ConnectedUdpStream(UdpSocket);
+
+impl AsyncRead for ConnectedUdpStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.0.poll_recv(cx, buf)
+    }
+}
+
+impl AsyncWrite for ConnectedUdpStream {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        self.0.poll_send(cx, buf)
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 async fn create_udp_stream(
     socket_queue: &Option<Arc<SocketQueue>>,
     peer: SocketAddr,
     bind: Option<&DirectBind>,
-) -> std::io::Result<UdpStream> {
+) -> std::io::Result<ConnectedUdpStream> {
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     if let Some(iface) = bind {
         if socket_queue.is_none() {
             let socket = direct::bind_udp_bound(peer, iface)?;
-            return UdpStream::from_tokio(socket, peer).await;
+            return Ok(ConnectedUdpStream(socket));
         }
         log::warn!("process-bypass direct relay is incompatible with socket transfer; using default routing");
     }
@@ -360,12 +387,12 @@ async fn create_udp_stream(
             };
             let socket = UdpSocket::bind(bind_addr).await?;
             socket.connect(peer).await?;
-            UdpStream::from_tokio(socket, peer).await
+            Ok(ConnectedUdpStream(socket))
         }
         Some(queue) => {
             let socket = queue.recv_udp(peer.ip().into()).await?;
             socket.connect(peer).await?;
-            UdpStream::from_tokio(socket, peer).await
+            Ok(ConnectedUdpStream(socket))
         }
     }
 }
@@ -557,7 +584,49 @@ pub async fn run_with_process_bypass_and_virtual_dns<D>(
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    run_with_preselected_egress(device, mtu, args, shutdown_token, process_bypass, virtual_dns_state, None).await
+    run_with_preselected_egress(
+        device,
+        mtu,
+        args,
+        shutdown_token,
+        process_bypass,
+        virtual_dns_state,
+        NetworkEnvironment::Physical(None),
+    )
+    .await
+}
+
+/// The platform provider owns routes, DNS and exemption of its own sockets.
+/// This entry point never creates a device, discovers an egress interface or
+/// enumerates other processes. Only use it inside a system-managed VPN provider.
+pub async fn run_with_system_managed_network<D>(
+    device: D,
+    mtu: u16,
+    args: Args,
+    shutdown_token: CancellationToken,
+    virtual_dns_state: Option<VirtualDnsState>,
+) -> crate::Result<usize>
+where
+    D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if args.setup || !args.bypass_process.is_empty() || args.bind_interface.is_some() {
+        return Err("system-managed packet tunnels cannot configure routes, bind an interface or match processes".into());
+    }
+    run_with_preselected_egress(
+        device,
+        mtu,
+        args,
+        shutdown_token,
+        ProcessBypass::new(Vec::new()),
+        virtual_dns_state,
+        NetworkEnvironment::Provider,
+    )
+    .await
+}
+
+enum NetworkEnvironment {
+    Physical(Option<DirectBind>),
+    Provider,
 }
 
 async fn run_with_preselected_egress<D>(
@@ -567,7 +636,7 @@ async fn run_with_preselected_egress<D>(
     shutdown_token: CancellationToken,
     process_bypass: ProcessBypass,
     virtual_dns_state: Option<VirtualDnsState>,
-    preselected_egress: Option<DirectBind>,
+    network_environment: NetworkEnvironment,
 ) -> crate::Result<usize>
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -608,24 +677,33 @@ where
     // `--bypass-process` are relayed directly to their destination through the
     // physical interface instead of being forwarded to the proxy.
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    let process_matcher = process::ProcessMatcher::new(process_bypass.clone()).map(Arc::new);
+    let process_matcher = match &network_environment {
+        NetworkEnvironment::Physical(_) => process::ProcessMatcher::new(process_bypass.clone()).map(Arc::new),
+        NetworkEnvironment::Provider => None,
+    };
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     // Local multicast cannot be meaningfully forwarded through an Internet
     // proxy. Keep a physical egress available even when no process bypass or
     // global UDP-direct policy was configured, so discovery traffic never
     // recurses through the TUN.
-    let direct_bind = {
-        // Keep the whole pre-setup snapshot. Looking up the same name again
-        // after setup reads our virtual resolver as the physical DNS server.
-        let iface = match preselected_egress {
-            Some(iface) => iface,
-            None => Arc::new(direct::detect(args.bind_interface.as_deref(), args.tun.as_deref())?),
-        };
-        log::info!("Direct relays and local multicast egress via {iface}");
-        Some(iface)
+    let direct_bind = match network_environment {
+        NetworkEnvironment::Provider => None,
+        NetworkEnvironment::Physical(preselected_egress) => {
+            // Keep the whole pre-setup snapshot. Looking up the same name again
+            // after setup reads our virtual resolver as the physical DNS server.
+            let iface = match preselected_egress {
+                Some(iface) => iface,
+                None => Arc::new(direct::detect(args.bind_interface.as_deref(), args.tun.as_deref())?),
+            };
+            log::info!("Direct relays and local multicast egress via {iface}");
+            Some(iface)
+        }
     };
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    let direct_bind: Option<DirectBind> = preselected_egress;
+    let direct_bind: Option<DirectBind> = match network_environment {
+        NetworkEnvironment::Physical(egress) => egress,
+        NetworkEnvironment::Provider => None,
+    };
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     if process_bypass.is_configured() {
@@ -1108,8 +1186,62 @@ async fn forwarding_keeps_pre_setup_egress_instead_of_rereading_system_dns() {
         dns: ArgDns::Virtual,
         ..Args::default()
     };
-    let result = run_with_preselected_egress(device, DEFAULT_MTU, args, token, ProcessBypass::new(Vec::new()), None, Some(egress)).await;
+    let result = run_with_preselected_egress(
+        device,
+        DEFAULT_MTU,
+        args,
+        token,
+        ProcessBypass::new(Vec::new()),
+        None,
+        NetworkEnvironment::Physical(Some(egress)),
+    )
+    .await;
     assert_eq!(result.unwrap(), 0);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn system_managed_provider_rejects_os_setup_and_process_matching() {
+    for args in [
+        Args {
+            setup: true,
+            ..Args::default()
+        },
+        Args {
+            setup: false,
+            bypass_process: vec!["example".into()],
+            ..Args::default()
+        },
+        Args {
+            setup: false,
+            bind_interface: Some("invalid-interface".into()),
+            ..Args::default()
+        },
+    ] {
+        let (_, device) = tokio::io::duplex(4096);
+        let error = run_with_system_managed_network(device, DEFAULT_MTU, args, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("system-managed packet tunnels cannot"));
+    }
+    let (_host, device) = tokio::io::duplex(4096);
+    let token = CancellationToken::new();
+    token.cancel();
+    assert_eq!(
+        run_with_system_managed_network(
+            device,
+            DEFAULT_MTU,
+            Args {
+                setup: false,
+                ..Args::default()
+            },
+            token,
+            None
+        )
+        .await
+        .unwrap(),
+        0
+    );
 }
 
 async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<VirtualDns>>) -> crate::Result<()> {
