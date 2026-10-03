@@ -704,6 +704,32 @@ where
         NetworkEnvironment::Physical(egress) => egress,
         NetworkEnvironment::Provider => None,
     };
+    // Windows can replace interface indices and DHCP DNS settings on reconnect.
+    // Refresh off the forwarding executor; existing streams retain their bind.
+    #[cfg(target_os = "windows")]
+    let egress_updates = direct_bind.as_ref().map(|initial| {
+        let (updates, current) = tokio::sync::watch::channel(Arc::clone(initial));
+        let manual = args.bind_interface.clone();
+        let tun = args.tun.clone();
+        managed_tasks.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let manual = manual.clone();
+                let tun = tun.clone();
+                match tokio::task::spawn_blocking(move || direct::detect(manual.as_deref(), tun.as_deref())).await {
+                    Ok(Ok(next)) => {
+                        if **updates.borrow() != next {
+                            log::info!("Physical egress changed; new direct sessions will use {next}");
+                            updates.send_replace(Arc::new(next));
+                        }
+                    }
+                    Ok(Err(error)) => log::debug!("Physical egress unavailable; retaining last known interface: {error}"),
+                    Err(error) => log::warn!("Physical egress lookup failed: {error}"),
+                }
+            }
+        });
+        current
+    });
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     if process_bypass.is_configured() {
@@ -864,8 +890,9 @@ where
         };
         let max_sessions = args.max_sessions;
         match ip_stack_stream {
-            IpStackStream::Tcp(tcp) => {
+            IpStackStream::Tcp(mut tcp) => {
                 let Some(session_permit) = session_counts.try_acquire(IpProtocol::Tcp, max_sessions) else {
+                    let _ = tcp.abort();
                     if args.exit_on_fatal_error {
                         log::info!("Too many sessions that over {max_sessions}, exiting...");
                         break Ok(());
@@ -880,8 +907,10 @@ where
                 let virtual_dns_portals = virtual_dns_portals.clone();
                 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let process_matcher = process_matcher.clone();
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 let direct_bind = direct_bind.clone();
+                #[cfg(target_os = "windows")]
+                let direct_bind = egress_updates.as_ref().map(|updates| Arc::clone(&updates.borrow()));
                 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 // The source-process lookup may briefly touch the OS, so the
@@ -984,10 +1013,14 @@ where
                             }
 
                             if let Some(Err(err)) = result {
+                                let _ = tcp.abort();
                                 log::error!("{info} error \"{err}\"");
                             }
                         }
-                        Err(err) => log::error!("{info} failed to create proxy handler: {err}"),
+                        Err(err) => {
+                            let _ = tcp.abort();
+                            log::error!("{info} failed to create proxy handler: {err}");
+                        }
                     }
                 });
             }
@@ -1007,8 +1040,10 @@ where
                 let udp_strategy = args.udp_strategy;
                 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let process_matcher = process_matcher.clone();
-                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 let direct_bind = direct_bind.clone();
+                #[cfg(target_os = "windows")]
+                let direct_bind = egress_updates.as_ref().map(|updates| Arc::clone(&updates.borrow()));
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 #[cfg(feature = "udpgw")]
                 let udpgw_client = udpgw_client.clone();
@@ -1339,36 +1374,40 @@ async fn handle_tcp_session(
     // For a process-bypass session `server_addr` is the original destination and
     // `bind` pins the egress to the physical interface; otherwise it is the proxy
     // and `bind` is `None` (normal routing).
-    let mut server = create_tcp_stream(&socket_queue, server_addr, bind.as_ref()).await?;
+    let server = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut server = create_tcp_stream(&socket_queue, server_addr, bind.as_ref()).await?;
+        handle_proxy_session(&mut server, proxy_handler).await?;
+        Ok::<_, Error>(server)
+    })
+    .await
+    .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "TUN TCP setup exceeded 10 seconds"))??;
 
     log::debug!("Beginning {session_info}");
-
-    if let Err(e) = handle_proxy_session(&mut server, proxy_handler).await {
-        tcp_stack.shutdown().await?;
-        return Err(e);
-    }
 
     let (mut t_rx, mut t_tx) = tokio::io::split(tcp_stack);
     let (mut s_rx, mut s_tx) = tokio::io::split(server);
 
-    let res = tokio::join!(
+    // EOF still half-closes the opposite writer. An error must cancel the
+    // other pump instead of retaining a dead session until the idle timeout.
+    let res = tokio::try_join!(
         async move {
-            let r = copy_and_record_traffic(&mut t_rx, &mut s_tx, true).await;
+            let copied = copy_and_record_traffic(&mut t_rx, &mut s_tx, true).await?;
             if let Err(err) = s_tx.shutdown().await {
                 log::trace!("{session_info} s_tx shutdown error {err}");
             }
-            r
+            Ok::<_, std::io::Error>(copied)
         },
         async move {
-            let r = copy_and_record_traffic(&mut s_rx, &mut t_tx, false).await;
+            let copied = copy_and_record_traffic(&mut s_rx, &mut t_tx, false).await?;
             if let Err(err) = t_tx.shutdown().await {
                 log::trace!("{session_info} t_tx shutdown error {err}");
             }
-            r
+            Ok::<_, std::io::Error>(copied)
         },
     );
     log::debug!("Ending {session_info} with {res:?}");
 
+    res?;
     Ok(())
 }
 
