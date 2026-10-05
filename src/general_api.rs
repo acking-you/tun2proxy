@@ -302,9 +302,6 @@ async fn general_run_async_with_process_bypass_setup(
     virtual_dns_state: Option<VirtualDnsState>,
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> std::io::Result<usize> {
-    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-    let mut args = args;
-
     // Capture this before creating our adapter. If setup later fails, the
     // diagnostic can identify tunnel software that was already active rather
     // than mistakenly reporting the adapter created by this invocation.
@@ -336,7 +333,8 @@ async fn general_run_async_with_process_bypass_setup(
         wait_for_physical_default_route(args.tun.as_deref()).await;
         let iface = crate::direct::detect(args.bind_interface.as_deref(), args.tun.as_deref()).map_err(std::io::Error::from)?;
         log::info!("Physical egress selected before route setup: {iface}, DNS {:?}", iface.dns_servers);
-        args.bind_interface = Some(iface.name.clone());
+        // Keep the caller's automatic/manual selection policy separate from
+        // this snapshot: later Windows refreshes must be free to change egress.
         Some(std::sync::Arc::new(iface))
     };
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]

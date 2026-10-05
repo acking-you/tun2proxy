@@ -213,6 +213,9 @@ struct InstallRecord {
     dns_before: DnsSnapshot,
     dns_changed: bool,
     owned_routes: Vec<RouteSpec>,
+    // Required bypasses survive borrowing a preexisting row. Only owned_routes
+    // grants permission to delete a row during recovery or teardown.
+    desired_bypasses: Vec<RouteSpec>,
     interface_snapshots: Arc<Mutex<Vec<InterfaceSnapshot>>>,
     removed: bool,
 }
@@ -445,6 +448,7 @@ fn install_transaction<O: NetworkOperations>(operations: &mut O, args: &TproxyAr
         dns_before,
         dns_changed: false,
         owned_routes: Vec::with_capacity(planned.len()),
+        desired_bypasses: planned.iter().filter(|route| route.interface_luid != tun_luid).cloned().collect(),
         interface_snapshots: Arc::new(Mutex::new(Vec::new())),
         removed: false,
     };
@@ -698,33 +702,50 @@ fn select_physical_route<'a>(
 
 fn reconcile_bypass_routes<O: NetworkOperations>(operations: &mut O, record: &mut InstallRecord) -> io::Result<()> {
     let routes = operations.physical_routes()?;
-    let owned = record.owned_routes.clone();
-    for old in owned.iter().filter(|route| route.interface_luid != record.tun_luid) {
-        let Some(physical) = select_physical_route(&routes, old.destination, record.tun_luid, &owned) else {
+    for desired in &mut record.desired_bypasses {
+        let Some(physical) = select_physical_route(&routes, desired.destination, record.tun_luid, &record.owned_routes) else {
             // Offline is not permission to remove the loop barrier or capture routes.
             continue;
         };
         let new = RouteSpec {
             interface_luid: physical.interface_luid,
             next_hop: physical.next_hop,
-            ..old.clone()
+            ..desired.clone()
         };
-        if new == *old {
-            if !routes.iter().any(|(route, _)| route == old) {
-                operations.create_route(old)?;
-            }
-            continue;
-        }
         // Install first, then retire only a row this session owns. Keep both
         // ownership records if deletion fails, so teardown can retry safely.
-        if !record.owned_routes.contains(&new) && operations.create_route(&new)? == AddOutcome::Created {
+        if !routes.iter().any(|(route, _)| route == &new)
+            && operations.create_route(&new)? == AddOutcome::Created
+            && !record.owned_routes.contains(&new)
+        {
             record.owned_routes.push(new.clone());
         }
-        operations.delete_route(old)?;
-        record.owned_routes.retain(|route| route != old);
-        log::info!("Physical bypass route refreshed after network change: {old} -> {new}");
+        *desired = new;
+        let mut index = 0;
+        while index < record.owned_routes.len() {
+            let old = &record.owned_routes[index];
+            if old.interface_luid != record.tun_luid
+                && old.destination == desired.destination
+                && old.prefix_len == desired.prefix_len
+                && old != desired
+            {
+                operations.delete_route(old)?;
+                log::info!("Physical bypass route refreshed after network change: {old} -> {desired}");
+                record.owned_routes.remove(index);
+            } else {
+                index += 1;
+            }
+        }
     }
     Ok(())
+}
+
+fn physical_route_metric(route: &MIB_IPFORWARD_ROW2, iface: &MIB_IPINTERFACE_ROW) -> Option<u32> {
+    (iface.Connected
+        && !(iface.DisableDefaultRoutes && route.DestinationPrefix.PrefixLength == 0)
+        && route.ValidLifetime != 0
+        && !route.Loopback)
+        .then_some(iface.Metric)
 }
 
 pub(crate) fn physical_default_interface(tun_name: Option<&str>) -> Option<u32> {
@@ -746,6 +767,15 @@ fn contextual_error(context: &str, error: io::Error) -> io::Error {
 }
 
 struct IpHelperOperations;
+
+struct MibTable(*mut std::ffi::c_void);
+
+impl Drop for MibTable {
+    fn drop(&mut self) {
+        // Both table APIs transfer this allocation to the caller.
+        unsafe { FreeMibTable(self.0) };
+    }
+}
 
 impl NetworkOperations for IpHelperOperations {
     fn interface_luid(&mut self, alias: &str) -> io::Result<u64> {
@@ -778,29 +808,28 @@ impl NetworkOperations for IpHelperOperations {
         if table.is_null() {
             return Err(io::Error::other("GetIpForwardTable2 returned a null table"));
         }
-        // Copy the rows before inspecting them so every error path frees the OS allocation.
+        let _table = MibTable(table.cast());
+        // Borrow the OS rows until the guard releases them, including on errors.
         let rows = unsafe {
             let table_ref = &*table;
-            std::slice::from_raw_parts(table_ref.Table.as_ptr(), table_ref.NumEntries as usize).to_vec()
+            std::slice::from_raw_parts(table_ref.Table.as_ptr(), table_ref.NumEntries as usize)
         };
-        unsafe { FreeMibTable(table.cast()) };
         let mut interfaces = HashMap::new();
         let mut routes = Vec::new();
         for row in rows {
             let luid = unsafe { row.InterfaceLuid.Value };
             let family = unsafe { row.DestinationPrefix.Prefix.si_family };
-            let metric = interfaces.entry((luid, family)).or_insert_with(|| {
+            let iface = interfaces.entry((luid, family)).or_insert_with(|| {
                 let mut iface = MIB_IPINTERFACE_ROW::default();
                 unsafe { InitializeIpInterfaceEntry(&mut iface) };
                 iface.Family = family;
                 iface.InterfaceLuid = NET_LUID_LH { Value: luid };
                 let status = unsafe { GetIpInterfaceEntry(&mut iface) };
-                (status == NO_ERROR && iface.Connected).then_some(iface.Metric)
+                (status == NO_ERROR).then_some(iface)
             });
-            let Some(metric) = metric else { continue };
-            if row.ValidLifetime == 0 || row.Loopback {
+            let Some(metric) = iface.as_ref().and_then(|iface| physical_route_metric(row, iface)) else {
                 continue;
-            }
+            };
             routes.push((
                 RouteSpec {
                     destination: route_address(&row.DestinationPrefix.Prefix)?.ip,
@@ -809,7 +838,7 @@ impl NetworkOperations for IpHelperOperations {
                     interface_luid: luid,
                     metric: row.Metric,
                 },
-                *metric,
+                metric,
             ));
         }
         Ok(routes)
@@ -842,6 +871,7 @@ impl NetworkOperations for IpHelperOperations {
         if table.is_null() {
             return Err(io::Error::other("GetIpInterfaceTable returned a null IPv4 interface table"));
         }
+        let _table = MibTable(table.cast());
 
         let mut targets = Vec::new();
         let table_ref = unsafe { &*table };
@@ -863,7 +893,6 @@ impl NetworkOperations for IpHelperOperations {
                 });
             }
         }
-        unsafe { FreeMibTable(table.cast()) };
         Ok(targets)
     }
 
@@ -1244,6 +1273,63 @@ mod tests {
             .extend([Ok(AddOutcome::Preexisting), Ok(AddOutcome::Preexisting)]);
         reconcile_bypass_routes(&mut operations, &mut record).unwrap();
         assert!(record.owned_routes.iter().all(|route| route.interface_luid == record.tun_luid));
+        assert_eq!(record.desired_bypasses.len(), 2);
+
+        // The borrowed adapter disappears. Both destinations must still be
+        // reconciled on a subsequent network change.
+        operations.routes = vec![(default_route(0x99, "192.168.22.1"), 10)];
+        operations.events.clear();
+        reconcile_bypass_routes(&mut operations, &mut record).unwrap();
+        assert_eq!(operations.events.iter().filter(|event| event.starts_with("add:")).count(), 2);
+        assert!(!operations.events.iter().any(|event| event.starts_with("delete:")));
+        assert!(record.desired_bypasses.iter().all(|route| route.interface_luid == 0x99));
+        assert_eq!(record.owned_routes.iter().filter(|route| route.interface_luid == 0x99).count(), 2);
+        assert!(!record.owned_routes.iter().any(|route| route.interface_luid == 0x88));
+    }
+
+    #[test]
+    fn initially_preexisting_bypasses_are_restored_if_removed() {
+        let mut operations = MockOperations::default();
+        operations
+            .add_results
+            .extend([Ok(AddOutcome::Preexisting), Ok(AddOutcome::Preexisting)]);
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        assert_eq!(record.desired_bypasses.len(), 2);
+        assert!(record.owned_routes.iter().all(|route| route.interface_luid == record.tun_luid));
+
+        // Recreate a missing borrowed row on the same adapter and own only the
+        // replacement we actually installed.
+        operations.routes = vec![(default_route(0x77, "192.0.2.1"), 10)];
+        reconcile_bypass_routes(&mut operations, &mut record).unwrap();
+        assert!(record.desired_bypasses.iter().all(|route| record.owned_routes.contains(route)));
+        operations.events.clear();
+        cleanup_transaction(&mut operations, &mut record).unwrap();
+        assert_eq!(operations.events.iter().filter(|event| event.starts_with("delete:")).count(), 5);
+    }
+
+    #[test]
+    fn disabled_default_routes_do_not_hide_valid_specific_routes() {
+        let mut route = MIB_IPFORWARD_ROW2 {
+            ValidLifetime: u32::MAX,
+            ..Default::default()
+        };
+        let mut iface = MIB_IPINTERFACE_ROW {
+            Connected: true,
+            Metric: 10,
+            DisableDefaultRoutes: true,
+            ..Default::default()
+        };
+        assert_eq!(physical_route_metric(&route, &iface), None);
+        route.DestinationPrefix.PrefixLength = 24;
+        assert_eq!(physical_route_metric(&route, &iface), Some(10));
+        iface.Connected = false;
+        assert_eq!(physical_route_metric(&route, &iface), None);
+        iface.Connected = true;
+        iface.DisableDefaultRoutes = false;
+        route.DestinationPrefix.PrefixLength = 0;
+        assert_eq!(physical_route_metric(&route, &iface), Some(10));
+        route.ValidLifetime = 0;
+        assert_eq!(physical_route_metric(&route, &iface), None);
     }
 
     #[test]
