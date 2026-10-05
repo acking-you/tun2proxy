@@ -8,7 +8,7 @@ homepage = "https://github.com/tun2proxy/tun2proxy"
 authors = ["B. Blechschmidt", "ssrlive"]
 description = "Tunnel interface to proxy"
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [lib]
 crate-type = ["staticlib", "cdylib", "lib"]
@@ -37,10 +37,8 @@ dotenvy = "0.15.7"
 env_logger = "0.11.10"
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
 hashlink = "0.12.0"
-# Keep the DNS wire API aligned with embedders that still use the 0.26 alpha
-# resolver API. Cargo otherwise unifies both dependencies on stable 0.26 and
-# breaks those embedders at compile time.
-hickory-proto = "=0.26.0-alpha.1"
+# Includes the bounded name-compression fix for GHSA-q2qq-hmj6-3wpp.
+hickory-proto = "=0.26.1"
 httparse = "1.10.1"
 internet-checksum = "0.2.1"
 # The sibling fork, which carries a fix for an active half-close that never

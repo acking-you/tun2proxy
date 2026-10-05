@@ -25,11 +25,11 @@ pub unsafe extern "C" fn tun2proxy_run_with_cli_args(cli_args: *const c_char, tu
 static TUN_QUIT: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>> = std::sync::Mutex::new(None);
 
 pub(crate) fn tun2proxy_stop_internal() -> c_int {
-    if let Ok(mut lock) = TUN_QUIT.lock() {
-        if let Some(shutdown_token) = lock.take() {
-            shutdown_token.cancel();
-            return 0;
-        }
+    if let Ok(mut lock) = TUN_QUIT.lock()
+        && let Some(shutdown_token) = lock.take()
+    {
+        shutdown_token.cancel();
+        return 0;
     }
     -1
 }
@@ -196,10 +196,10 @@ async fn general_run_async_with_process_bypass_inner(
         &mut ready,
     )
     .await;
-    if let Err(error) = &result {
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(Err(error.to_string()));
-        }
+    if let Err(error) = &result
+        && let Some(ready) = ready.take()
+    {
+        let _ = ready.send(Err(error.to_string()));
     }
     result
 }

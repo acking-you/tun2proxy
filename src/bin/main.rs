@@ -10,10 +10,10 @@ fn main() -> Result<(), BoxError> {
     }
 
     #[cfg(windows)]
-    if args.setup {
-        if let Some(exit_code) = tun2proxy::windows_elevation::relaunch_if_needed()? {
-            std::process::exit(exit_code as i32);
-        }
+    if args.setup
+        && let Some(exit_code) = tun2proxy::windows_elevation::relaunch_if_needed()?
+    {
+        std::process::exit(exit_code as i32);
     }
 
     #[cfg(unix)]

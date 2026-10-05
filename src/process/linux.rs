@@ -9,12 +9,11 @@ use std::path::Path;
 /// `/proc/<pid>/comm` (which the kernel truncates to 15 bytes) when the symlink
 /// cannot be read.
 fn process_name(pid: u32) -> Option<String> {
-    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
-        if let Some(name) = exe.file_name().and_then(|n| n.to_str()) {
-            if !name.is_empty() {
-                return Some(name.to_string());
-            }
-        }
+    if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe"))
+        && let Some(name) = exe.file_name().and_then(|n| n.to_str())
+        && !name.is_empty()
+    {
+        return Some(name.to_string());
     }
 
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;

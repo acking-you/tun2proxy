@@ -27,21 +27,20 @@ pub fn build_dns_response(mut request: Message, ip: Option<IpAddr>, ttl: u32) ->
         _ => None,
     }
     .map(|mut record| {
-        record.set_dns_class(query_class);
+        record.dns_class = query_class;
         record
     });
 
-    request = request.to_response();
-    request
-        .set_authoritative(false)
-        .set_truncated(false)
-        .set_recursion_available(true)
-        .set_authentic_data(false)
-        .set_response_code(ResponseCode::NoError);
-    request.answers_mut().clear();
-    request.name_servers_mut().clear();
-    request.additionals_mut().clear();
-    _ = request.take_signature();
+    request = request.into_response();
+    request.metadata.authoritative = false;
+    request.metadata.truncation = false;
+    request.metadata.recursion_available = true;
+    request.metadata.authentic_data = false;
+    request.metadata.response_code = ResponseCode::NoError;
+    request.answers.clear();
+    request.authorities.clear();
+    request.additionals.clear();
+    request.signature = None;
 
     if let Some(record) = record {
         request.add_answer(record);
@@ -50,13 +49,13 @@ pub fn build_dns_response(mut request: Message, ip: Option<IpAddr>, ttl: u32) ->
 }
 
 pub fn remove_ipv6_entries(message: &mut Message) {
-    message.answers_mut().retain(|answer| !matches!(answer.data(), RData::AAAA(_)));
-    message.name_servers_mut().retain(|record| !matches!(record.data(), RData::AAAA(_)));
-    message.additionals_mut().retain(|record| !matches!(record.data(), RData::AAAA(_)));
+    message.answers.retain(|answer| !matches!(answer.data, RData::AAAA(_)));
+    message.authorities.retain(|record| !matches!(record.data, RData::AAAA(_)));
+    message.additionals.retain(|record| !matches!(record.data, RData::AAAA(_)));
 }
 
 pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, String> {
-    let query = message.queries().first().ok_or("DNS response has no question")?;
+    let query = message.queries.first().ok_or("DNS response has no question")?;
     match extract_address_or_cname(message, query)? {
         AddressLookup::Address(ip) => Ok(ip),
         AddressLookup::Cname(name) => Err(name),
@@ -64,42 +63,42 @@ pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, Stri
 }
 
 pub fn extract_domain_from_dns_message(message: &Message) -> Result<String, String> {
-    let query = message.queries().first().ok_or("DnsRequest no query body")?;
+    let query = message.queries.first().ok_or("DnsRequest no query body")?;
     // Display intentionally renders IDNA labels as Unicode. Proxy protocols
     // and OS resolvers need the wire-safe ASCII/Punycode representation.
     Ok(query.name().to_ascii())
 }
 
 pub fn validate_dns_query(message: &Message) -> Result<&Query, String> {
-    if message.message_type() != MessageType::Query {
+    if message.message_type != MessageType::Query {
         return Err("DNS request is not a query".to_string());
     }
-    if message.op_code() != OpCode::Query {
-        return Err(format!("unsupported DNS opcode {:?}", message.op_code()));
+    if message.op_code != OpCode::Query {
+        return Err(format!("unsupported DNS opcode {:?}", message.op_code));
     }
-    if message.queries().len() != 1 {
+    if message.queries.len() != 1 {
         return Err(format!(
             "DNS request must contain exactly one question, got {}",
-            message.queries().len()
+            message.queries.len()
         ));
     }
-    Ok(&message.queries()[0])
+    Ok(&message.queries[0])
 }
 
 pub fn validate_dns_response(message: &Message, request_id: u16, expected_query: &Query) -> Result<(), String> {
-    if message.message_type() != MessageType::Response {
+    if message.message_type != MessageType::Response {
         return Err("DNS reply has the query bit set".to_string());
     }
-    if message.op_code() != OpCode::Query {
-        return Err(format!("DNS reply has unexpected opcode {:?}", message.op_code()));
+    if message.op_code != OpCode::Query {
+        return Err(format!("DNS reply has unexpected opcode {:?}", message.op_code));
     }
-    if message.id() != request_id {
+    if message.id != request_id {
         return Err("DNS response ID mismatch".to_string());
     }
-    let Some(actual_query) = message.queries().first() else {
+    let Some(actual_query) = message.queries.first() else {
         return Err("DNS response has no question".to_string());
     };
-    if message.queries().len() != 1
+    if message.queries.len() != 1
         || !names_equal(actual_query.name(), expected_query.name())
         || actual_query.query_type() != expected_query.query_type()
         || actual_query.query_class() != expected_query.query_class()
@@ -110,8 +109,8 @@ pub fn validate_dns_response(message: &Message, request_id: u16, expected_query:
 }
 
 pub fn extract_address_or_cname(message: &Message, query: &Query) -> Result<AddressLookup, String> {
-    if message.response_code() != ResponseCode::NoError {
-        return Err(format!("{:?}", message.response_code()));
+    if message.response_code != ResponseCode::NoError {
+        return Err(format!("{:?}", message.response_code));
     }
 
     let mut current = query.name().clone();
@@ -119,8 +118,8 @@ pub fn extract_address_or_cname(message: &Message, query: &Query) -> Result<Addr
     let want_ipv6 = query.query_type() == hickory_proto::rr::RecordType::AAAA;
     for _ in 0..MAX_CNAME_DEPTH {
         let mut cname = None;
-        for answer in message.answers().iter().filter(|answer| names_equal(answer.name(), &current)) {
-            match answer.data() {
+        for answer in message.answers.iter().filter(|answer| names_equal(&answer.name, &current)) {
+            match &answer.data {
                 RData::A(address) if !want_ipv6 => {
                     return Ok(AddressLookup::Address(IpAddr::V4((*address).into())));
                 }
@@ -229,12 +228,12 @@ mod tests {
         let aaaa_response = build_dns_response(query(RecordType::AAAA), Some(ipv4), 5).unwrap();
         let https_response = build_dns_response(query(RecordType::HTTPS), Some(ipv4), 5).unwrap();
 
-        assert_eq!(a_response.answers().len(), 1);
-        assert!(aaaa_response.answers().is_empty());
-        assert!(https_response.answers().is_empty());
-        assert!(a_response.recursion_available());
-        assert!(!a_response.truncated());
-        assert!(!a_response.authentic_data());
+        assert_eq!(a_response.answers.len(), 1);
+        assert!(aaaa_response.answers.is_empty());
+        assert!(https_response.answers.is_empty());
+        assert!(a_response.recursion_available);
+        assert!(!a_response.truncation);
+        assert!(!a_response.authentic_data);
     }
 
     #[test]
@@ -243,7 +242,7 @@ mod tests {
         let mut message = Message::new(2, MessageType::Query, OpCode::Query);
         message.add_query(Query::query(Name::from_ascii(ascii).unwrap(), RecordType::A));
 
-        assert_eq!(message.queries()[0].name().to_string(), "rr1---sn-npoe7ndl.ångströ.com");
+        assert_eq!(message.queries[0].name().to_string(), "rr1---sn-npoe7ndl.ångströ.com");
         assert_eq!(extract_domain_from_dns_message(&message).unwrap(), ascii);
     }
 
@@ -253,7 +252,7 @@ mod tests {
         let query_packet = query(RecordType::A);
         assert!(validate_dns_response(&query_packet, 1, &expected).is_err());
 
-        let wrong = query(RecordType::AAAA).to_response();
+        let wrong = query(RecordType::AAAA).into_response();
         assert!(validate_dns_response(&wrong, 1, &expected).is_err());
 
         let mut wrong_name = Message::new(1, MessageType::Response, OpCode::Query);
@@ -271,7 +270,7 @@ mod tests {
         let wire = response.to_vec().unwrap();
         let decoded = Message::from_vec(&wire).unwrap();
 
-        assert!(decoded.queries()[0].name().is_fqdn());
+        assert!(decoded.queries[0].name().is_fqdn());
         assert!(validate_dns_response(&decoded, 7, &expected).is_ok());
     }
 
@@ -319,7 +318,7 @@ mod tests {
         buffered.extend_from_slice(&wire[split..]);
         let messages = drain_tcp_messages(&mut buffered).unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].queries()[0].query_type(), RecordType::AAAA);
+        assert_eq!(messages[0].queries[0].query_type(), RecordType::AAAA);
         assert!(buffered.is_empty());
     }
 }

@@ -46,10 +46,10 @@ pub(super) fn process_names(pid: u32) -> Vec<String> {
     // A process can start or exit while ToolHelp is taking its snapshot. Keep
     // the path query as a narrow fallback for that race and older environments
     // where snapshot creation fails.
-    if names.is_empty() {
-        if let Some(name) = process_name_from_handle(pid) {
-            names.push(name);
-        }
+    if names.is_empty()
+        && let Some(name) = process_name_from_handle(pid)
+    {
+        names.push(name);
     }
     names
 }
