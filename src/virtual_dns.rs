@@ -203,10 +203,9 @@ impl VirtualDns {
     fn retry_dirty_persistence(&mut self) {
         if self.persistence.as_ref().is_some_and(PersistentCache::is_dirty)
             && let Err(error) = self.rewrite_persistence()
+            && let Some(persistence) = &self.persistence
         {
-            if let Some(persistence) = &self.persistence {
-                log::warn!("Failed to repair virtual DNS cache at {}: {error}", persistence.path().display());
-            }
+            log::warn!("Failed to repair virtual DNS cache at {}: {error}", persistence.path().display());
         }
     }
 
@@ -373,8 +372,8 @@ mod tests {
 
         assert_eq!(name, "example.com.");
         assert_eq!(ip, None);
-        assert!(response.answers().is_empty());
-        assert!(response.recursion_available());
+        assert!(response.answers.is_empty());
+        assert!(response.recursion_available);
         assert!(dns.lru_cache.is_empty());
         assert!(dns.name_to_ip.is_empty());
     }

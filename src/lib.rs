@@ -493,7 +493,7 @@ async fn resolve_domain_over_proxy(
         let query = Query::query(name, query_type);
         let request_id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
         let mut request = Message::new(request_id, MessageType::Query, OpCode::Query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         request.add_query(query.clone());
         let request = request.to_vec().map_err(std::io::Error::other)?;
 
@@ -521,10 +521,10 @@ async fn resolve_domain_over_proxy(
 
         let response = Message::from_vec(&response).map_err(std::io::Error::other)?;
         dns::validate_dns_response(&response, request_id, &query).map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
-        if response.response_code() != ResponseCode::NoError {
+        if response.response_code != ResponseCode::NoError {
             return Err(std::io::Error::other(format!(
                 "proxied DNS query for `{current}` failed with {:?}",
-                response.response_code()
+                response.response_code
             )));
         }
         match dns::extract_address_or_cname(&response, &query).map_err(|error| std::io::Error::new(ErrorKind::NotFound, error))? {
@@ -1177,15 +1177,15 @@ where
                 });
             }
             IpStackStream::UnknownTransport(u) => {
-                if let Some(flows) = echo_flows.as_mut() {
-                    if flows.is_echo(&u) {
-                        let destination = resolve_virtual_domain(virtual_dns.as_ref(), u.dst_addr()).await;
-                        match destination {
-                            Ok(domain) => flows.dispatch(u, domain, &mut managed_tasks),
-                            Err(error) => log::debug!("Cannot resolve ICMP Echo destination: {error}"),
-                        }
-                        continue;
+                if let Some(flows) = echo_flows.as_mut()
+                    && flows.is_echo(&u)
+                {
+                    let destination = resolve_virtual_domain(virtual_dns.as_ref(), u.dst_addr()).await;
+                    match destination {
+                        Ok(domain) => flows.dispatch(u, domain, &mut managed_tasks),
+                        Err(error) => log::debug!("Cannot resolve ICMP Echo destination: {error}"),
                     }
+                    continue;
                 }
                 log_unknown_transport(&u);
                 continue;
@@ -1689,8 +1689,8 @@ async fn handle_dns_over_tcp_session(
 
                 let query = dns::parse_data_to_dns_message(buf1, false)?;
                 let question = dns::validate_dns_query(&query)?.clone();
-                if outstanding_queries.contains_key(&query.id()) {
-                    return Err(format!("duplicate in-flight DNS query ID {}", query.id()).into());
+                if outstanding_queries.contains_key(&query.id) {
+                    return Err(format!("duplicate in-flight DNS query ID {}", query.id).into());
                 }
                 if outstanding_queries.len() >= MAX_OUTSTANDING_DNS_QUERIES {
                     return Err(format!(
@@ -1698,7 +1698,7 @@ async fn handle_dns_over_tcp_session(
                     )
                     .into());
                 }
-                outstanding_queries.insert(query.id(), question);
+                outstanding_queries.insert(query.id, question);
 
                 // Insert the DNS message length in front of the payload
                 let len = u16::try_from(buf1.len())?;
@@ -1721,9 +1721,9 @@ async fn handle_dns_over_tcp_session(
 
                 for mut message in dns::drain_tcp_messages(&mut server_buffer)? {
                     let expected_query = outstanding_queries
-                        .remove(&message.id())
-                        .ok_or_else(|| format!("unsolicited DNS-over-TCP response ID {}", message.id()))?;
-                    dns::validate_dns_response(&message, message.id(), &expected_query)?;
+                        .remove(&message.id)
+                        .ok_or_else(|| format!("unsolicited DNS-over-TCP response ID {}", message.id))?;
+                    dns::validate_dns_response(&message, message.id, &expected_query)?;
 
                     let name = dns::extract_domain_from_dns_message(&message)?;
                     let ip = dns::extract_ipaddr_from_dns_message(&message);
@@ -1895,8 +1895,8 @@ mod virtual_dns_transport_tests {
         let mut response = vec![0_u8; usize::from(response_len)];
         client.read_exact(&mut response).await.unwrap();
         let response = Message::from_vec(&response).unwrap();
-        assert_eq!(response.message_type(), MessageType::Response);
-        assert_eq!(response.answers().len(), 1);
+        assert_eq!(response.message_type, MessageType::Response);
+        assert_eq!(response.answers.len(), 1);
 
         drop(client);
         server_task.await.unwrap().unwrap();

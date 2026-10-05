@@ -433,15 +433,15 @@ pub(crate) async fn resolve_domain_bound(
         let query = Query::query(name, query_type);
         let request_id = NEXT_DNS_QUERY_ID.fetch_add(1, Ordering::Relaxed);
         let mut request = Message::new(request_id, MessageType::Query, OpCode::Query);
-        request.set_recursion_desired(true);
+        request.metadata.recursion_desired = true;
         request.add_query(query.clone());
         let request = request.to_vec().map_err(std::io::Error::other)?;
 
         let response = query_dns_bound(&request, request_id, &query, &current, dns_server, iface).await?;
-        if response.response_code() != ResponseCode::NoError {
+        if response.response_code != ResponseCode::NoError {
             return Err(std::io::Error::other(format!(
                 "direct DNS query for `{current}` failed with {:?}",
-                response.response_code()
+                response.response_code
             )));
         }
         match crate::dns::extract_address_or_cname(&response, &query)
@@ -473,10 +473,10 @@ async fn query_dns_bound(
         let server = SocketAddr::new(*dns_server, 53);
         for _ in 0..DNS_UDP_ATTEMPTS {
             match tokio::time::timeout(DNS_UDP_TIMEOUT, query_dns_udp(request, request_id, expected_query, server, iface)).await {
-                Ok(Ok(response)) if response.truncated() => break,
+                Ok(Ok(response)) if response.truncation => break,
                 Ok(Ok(response))
                     if matches!(
-                        response.response_code(),
+                        response.response_code,
                         hickory_proto::op::ResponseCode::NoError | hickory_proto::op::ResponseCode::NXDomain
                     ) =>
                 {
@@ -485,7 +485,7 @@ async fn query_dns_bound(
                 Ok(Ok(response)) => {
                     last_error = Some(std::io::Error::other(format!(
                         "UDP DNS query to {dns_server} failed with {:?}",
-                        response.response_code()
+                        response.response_code
                     )));
                     continue 'servers;
                 }
@@ -501,7 +501,7 @@ async fn query_dns_bound(
         match tokio::time::timeout(DNS_TCP_TIMEOUT, query_dns_tcp(request, request_id, expected_query, server, iface)).await {
             Ok(Ok(response))
                 if matches!(
-                    response.response_code(),
+                    response.response_code,
                     hickory_proto::op::ResponseCode::NoError | hickory_proto::op::ResponseCode::NXDomain
                 ) =>
             {
@@ -510,7 +510,7 @@ async fn query_dns_bound(
             Ok(Ok(response)) => {
                 last_error = Some(std::io::Error::other(format!(
                     "TCP DNS query to {dns_server} failed with {:?}",
-                    response.response_code()
+                    response.response_code
                 )));
             }
             Ok(Err(error)) => last_error = Some(error),
