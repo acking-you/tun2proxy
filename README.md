@@ -24,6 +24,15 @@ A tunnel interface for HTTP and SOCKS proxies on Linux, Android, macOS, iOS and 
 - UdpGW (UDP gateway) support for UDP over TCP, see the [wiki](https://github.com/tun2proxy/tun2proxy/wiki/UDP-gateway-feature) for more information
 - Session info embedding for per-app routing on Android (see below)
 
+This fork also offers opt-in `--icmp-echo` for IPv4/IPv6 ping through
+proxy-everything's loopback SOCKS5 extension. It requires an unauthenticated
+loopback endpoint implementing private command `0xe0`; ordinary HTTP/SOCKS
+servers do not provide this command. The extension is disabled by default.
+Its 64 flow / four queued packet limits and four-second request deadlines keep
+Echo from blocking TCP/UDP. Only matching real remote Echo replies are returned;
+arbitrary IP protocols and fragmented Echo are outside its scope. The parent
+repository documents the [wire format and exit requirements](https://github.com/acking-you/proxy-everything/blob/fix/tun-resilience-20261003/docs/tun-icmp-echo.md).
+
 ## Session Info for Per-App Routing (Android)
 
 To enable per-app traffic routing on Android 10+, you can embed session information (protocol, source IP, source port) in the SOCKS5 username field. This allows your proxy server to call `getConnectionOwnerUid()` to identify which app initiated the connection.

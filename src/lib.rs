@@ -73,6 +73,7 @@ mod dump_logger;
 mod error;
 mod general_api;
 mod http;
+pub mod icmp;
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod network_config;
 mod no_proxy;
@@ -756,6 +757,7 @@ where
     ipstack_config.udp_timeout(std::time::Duration::from_secs(args.udp_timeout));
 
     let mut ip_stack = ipstack::IpStack::new(ipstack_config, device);
+    let mut echo_flows = icmp::EchoFlows::new(&args, mtu)?;
 
     // Delay spawning socket-transfer producers until all fallible forwarding
     // initialization above has succeeded. From this point onward every return
@@ -1175,6 +1177,16 @@ where
                 });
             }
             IpStackStream::UnknownTransport(u) => {
+                if let Some(flows) = echo_flows.as_mut() {
+                    if flows.is_echo(&u) {
+                        let destination = resolve_virtual_domain(virtual_dns.as_ref(), u.dst_addr()).await;
+                        match destination {
+                            Ok(domain) => flows.dispatch(u, domain, &mut managed_tasks),
+                            Err(error) => log::debug!("Cannot resolve ICMP Echo destination: {error}"),
+                        }
+                        continue;
+                    }
+                }
                 log_unknown_transport(&u);
                 continue;
             }

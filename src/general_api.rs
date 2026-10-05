@@ -302,6 +302,7 @@ async fn general_run_async_with_process_bypass_setup(
     virtual_dns_state: Option<VirtualDnsState>,
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> std::io::Result<usize> {
+    crate::icmp::validate_options(&args)?;
     // Capture this before creating our adapter. If setup later fails, the
     // diagnostic can identify tunnel software that was already active rather
     // than mistakenly reporting the adapter created by this invocation.

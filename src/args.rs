@@ -164,6 +164,12 @@ pub struct Args {
     #[serde(default)]
     pub udp_strategy: ArgUdpStrategy,
 
+    /// Relay ICMP Echo through proxy-everything's loopback SOCKS5 extension.
+    /// This is not supported by ordinary SOCKS5 servers.
+    #[arg(long)]
+    #[serde(default)]
+    pub icmp_echo: bool,
+
     /// Verbosity level
     #[arg(short, long, value_name = "level", value_enum, default_value = "info")]
     pub verbosity: ArgVerbosity,
@@ -249,6 +255,7 @@ impl Default for Args {
             tcp_timeout: 600,
             udp_timeout: 10,
             udp_strategy: ArgUdpStrategy::default(),
+            icmp_echo: false,
             verbosity: ArgVerbosity::Info,
             virtual_dns_pool: IpCidr::from_str("198.18.0.0/15").unwrap(),
             virtual_dns_portals: vec![],
