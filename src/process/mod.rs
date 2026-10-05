@@ -44,6 +44,7 @@ struct Cache {
 pub(crate) struct ProcessMatcher {
     names: ProcessBypass,
     cache: Mutex<Cache>,
+    lookup_slot: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// The socket owner's identity is pinned for the lifetime of one relay. An OS
@@ -90,6 +91,7 @@ impl ProcessMatcher {
         Some(Self {
             names,
             cache: Mutex::new(Cache::default()),
+            lookup_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -110,7 +112,20 @@ impl ProcessMatcher {
         // a time-based stale-cache window.
         let requested_at = Instant::now();
         let this = self.clone();
-        let identities = match tokio::task::spawn_blocking(move || this.identities_blocking(protocol, src, dst, requested_at)).await {
+        // Queue asynchronously instead of parking a blocking-pool thread for
+        // every captured socket. Keep ownership in the OS job after cancellation.
+        let permit = self
+            .lookup_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("lookup semaphore is never closed");
+        let identities = match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            this.identities_blocking(protocol, src, dst, requested_at)
+        })
+        .await
+        {
             Ok(result) => result,
             Err(err) => {
                 log::warn!("process bypass lookup task failed: {err}");

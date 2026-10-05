@@ -28,7 +28,7 @@ const DNS_UDP_TIMEOUT: Duration = Duration::from_millis(750);
 const DNS_TCP_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The physical interface direct relays egress through.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BindInterface {
     /// IPv4 interface index, used by Windows `IP_UNICAST_IF` and macOS
     /// `IP_BOUND_IF`.
@@ -189,6 +189,14 @@ pub(crate) fn detect(manual: Option<&str>, tun_name: Option<&str>) -> crate::Res
             BindInterface::from_netdev(iface)
         }
         None => {
+            #[cfg(target_os = "windows")]
+            if let Some(index) = crate::windows_network_config::physical_default_interface(tun_name)
+                && let Some(iface) = netdev::get_interfaces()
+                    .into_iter()
+                    .find(|iface| iface.index == index && !is_unusable_egress(iface, tun_name))
+            {
+                return BindInterface::from_netdev(iface);
+            }
             // `netdev` picks the default interface by asking the OS which source
             // address it would use for an arbitrary address, not by reading the
             // routing table. While TUN capture routes are installed that probe

@@ -8,7 +8,7 @@
 //! it, and every changed interface property is restored exactly.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{Arc, Mutex, mpsc},
@@ -24,14 +24,14 @@ use windows_sys::{
             IpHelper::{
                 ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToAlias, ConvertInterfaceLuidToGuid, CreateIpForwardEntry2,
                 DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_NAMESERVER, DeleteIpForwardEntry2, FreeMibTable,
-                GetBestRoute2, GetIpInterfaceEntry, GetIpInterfaceTable, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
+                GetBestRoute2, GetIpForwardTable2, GetIpInterfaceEntry, GetIpInterfaceTable, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
                 InitializeIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, SetIpInterfaceEntry,
             },
             Ndis::{IF_MAX_STRING_SIZE, NET_LUID_LH},
         },
         Networking::WinSock::{
-            AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, IN6_ADDR, MIB_IPPROTO_NETMGMT, NlroManual, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
-            SOCKADDR_INET,
+            AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR, MIB_IPPROTO_NETMGMT, NlroManual, SOCKADDR_IN, SOCKADDR_IN6,
+            SOCKADDR_IN6_0, SOCKADDR_INET,
         },
         System::LibraryLoader::{GetProcAddress, LoadLibraryW},
     },
@@ -197,6 +197,7 @@ struct InterfaceSnapshot {
 trait NetworkOperations {
     fn interface_luid(&mut self, alias: &str) -> io::Result<u64>;
     fn best_route(&mut self, destination: IpAddr) -> io::Result<(u64, RouteAddress)>;
+    fn physical_routes(&mut self) -> io::Result<Vec<(RouteSpec, u32)>>;
     fn create_route(&mut self, route: &RouteSpec) -> io::Result<AddOutcome>;
     fn delete_route(&mut self, route: &RouteSpec) -> io::Result<()>;
     fn wsl_hns_interfaces(&mut self) -> io::Result<Vec<InterfaceTarget>>;
@@ -212,6 +213,9 @@ struct InstallRecord {
     dns_before: DnsSnapshot,
     dns_changed: bool,
     owned_routes: Vec<RouteSpec>,
+    // Required bypasses survive borrowing a preexisting row. Only owned_routes
+    // grants permission to delete a row during recovery or teardown.
+    desired_bypasses: Vec<RouteSpec>,
     interface_snapshots: Arc<Mutex<Vec<InterfaceSnapshot>>>,
     removed: bool,
 }
@@ -223,7 +227,7 @@ struct InterfaceMonitor {
 }
 
 impl InterfaceMonitor {
-    fn start(tun_target: InterfaceTarget, snapshots: Arc<Mutex<Vec<InterfaceSnapshot>>>) -> io::Result<Self> {
+    fn start(tun_target: InterfaceTarget, record: Arc<Mutex<InstallRecord>>) -> io::Result<Self> {
         let (stop, receiver) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("tun2proxy-windows-interface-monitor".into())
@@ -233,8 +237,12 @@ impl InterfaceMonitor {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let mut operations = IpHelperOperations;
-                            if let Err(error) = reconcile_interface_settings(&mut operations, &tun_target, &snapshots) {
+                            let mut record = record.lock().unwrap_or_else(|error| error.into_inner());
+                            if let Err(error) = reconcile_interface_settings(&mut operations, &tun_target, &record.interface_snapshots) {
                                 log::warn!("Could not reconcile Windows TUN/WSL forwarding settings; retrying: {error}");
+                            }
+                            if let Err(error) = reconcile_bypass_routes(&mut operations, &mut record) {
+                                log::debug!("Could not refresh physical bypass routes; retrying: {error}");
                             }
                         }
                     }
@@ -263,24 +271,28 @@ impl InterfaceMonitor {
 /// forwarding task exits with an error or its future is cancelled.
 #[derive(Debug)]
 pub(crate) struct WindowsNetworkConfig {
-    record: InstallRecord,
+    record: Arc<Mutex<InstallRecord>>,
     interface_monitor: Option<InterfaceMonitor>,
 }
 
 impl WindowsNetworkConfig {
     pub(crate) fn install(args: &TproxyArgs) -> io::Result<Self> {
         let mut operations = IpHelperOperations;
-        let mut record = install_transaction(&mut operations, args)?;
+        let record = Arc::new(Mutex::new(install_transaction(&mut operations, args)?));
         let interface_monitor = if args.ipv4_default_route {
             let target = InterfaceTarget {
-                luid: record.tun_luid,
+                luid: record.lock().unwrap_or_else(|error| error.into_inner()).tun_luid,
                 alias: args.tun_name.clone(),
                 role: InterfaceRole::Tun,
             };
-            match InterfaceMonitor::start(target, Arc::clone(&record.interface_snapshots)) {
+            match InterfaceMonitor::start(target, Arc::clone(&record)) {
                 Ok(monitor) => Some(monitor),
                 Err(error) => {
-                    return Err(rollback_after_setup_failure(&mut operations, &mut record, error));
+                    return Err(rollback_after_setup_failure(
+                        &mut operations,
+                        &mut record.lock().unwrap_or_else(|error| error.into_inner()),
+                        error,
+                    ));
                 }
             }
         } else {
@@ -292,7 +304,7 @@ impl WindowsNetworkConfig {
     pub(crate) fn remove(mut self) -> io::Result<()> {
         self.stop_interface_monitor();
         let mut operations = IpHelperOperations;
-        cleanup_transaction(&mut operations, &mut self.record)
+        cleanup_transaction(&mut operations, &mut self.record.lock().unwrap_or_else(|error| error.into_inner()))
     }
 
     fn stop_interface_monitor(&mut self) {
@@ -305,12 +317,12 @@ impl WindowsNetworkConfig {
 impl Drop for WindowsNetworkConfig {
     fn drop(&mut self) {
         self.stop_interface_monitor();
-        if self.record.removed {
+        if self.record.lock().unwrap_or_else(|error| error.into_inner()).removed {
             return;
         }
         log::warn!("Windows network configuration guard dropped before explicit teardown; restoring owned settings now");
         let mut operations = IpHelperOperations;
-        if let Err(error) = cleanup_transaction(&mut operations, &mut self.record) {
+        if let Err(error) = cleanup_transaction(&mut operations, &mut self.record.lock().unwrap_or_else(|error| error.into_inner())) {
             log::error!("Failed to fully restore Windows TUN network configuration during drop: {error}");
         }
     }
@@ -436,6 +448,7 @@ fn install_transaction<O: NetworkOperations>(operations: &mut O, args: &TproxyAr
         dns_before,
         dns_changed: false,
         owned_routes: Vec::with_capacity(planned.len()),
+        desired_bypasses: planned.iter().filter(|route| route.interface_luid != tun_luid).cloned().collect(),
         interface_snapshots: Arc::new(Mutex::new(Vec::new())),
         removed: false,
     };
@@ -660,11 +673,109 @@ fn cleanup_transaction<O: NetworkOperations>(operations: &mut O, record: &mut In
     }
 }
 
+fn contains_destination(route: &RouteSpec, destination: IpAddr) -> bool {
+    match (route.destination, destination) {
+        (IpAddr::V4(network), IpAddr::V4(ip)) if route.prefix_len <= 32 => {
+            let mask = u32::MAX.checked_shl(u32::from(32 - route.prefix_len)).unwrap_or(0);
+            u32::from(network) & mask == u32::from(ip) & mask
+        }
+        (IpAddr::V6(network), IpAddr::V6(ip)) if route.prefix_len <= 128 => {
+            let mask = u128::MAX.checked_shl(u32::from(128 - route.prefix_len)).unwrap_or(0);
+            u128::from(network) & mask == u128::from(ip) & mask
+        }
+        _ => false,
+    }
+}
+
+fn select_physical_route<'a>(
+    routes: &'a [(RouteSpec, u32)],
+    destination: IpAddr,
+    tun_luid: u64,
+    owned: &[RouteSpec],
+) -> Option<&'a RouteSpec> {
+    routes
+        .iter()
+        .filter(|(route, _)| route.interface_luid != tun_luid && !owned.contains(route) && contains_destination(route, destination))
+        .min_by_key(|(route, metric)| (std::cmp::Reverse(route.prefix_len), u64::from(route.metric) + u64::from(*metric)))
+        .map(|(route, _)| route)
+}
+
+fn reconcile_bypass_routes<O: NetworkOperations>(operations: &mut O, record: &mut InstallRecord) -> io::Result<()> {
+    let routes = operations.physical_routes()?;
+    for desired in &mut record.desired_bypasses {
+        let Some(physical) = select_physical_route(&routes, desired.destination, record.tun_luid, &record.owned_routes) else {
+            // Offline is not permission to remove the loop barrier or capture routes.
+            continue;
+        };
+        let new = RouteSpec {
+            interface_luid: physical.interface_luid,
+            next_hop: physical.next_hop,
+            ..desired.clone()
+        };
+        // Install first, then retire only a row this session owns. Keep both
+        // ownership records if deletion fails, so teardown can retry safely.
+        if !routes.iter().any(|(route, _)| route == &new)
+            && operations.create_route(&new)? == AddOutcome::Created
+            && !record.owned_routes.contains(&new)
+        {
+            record.owned_routes.push(new.clone());
+        }
+        *desired = new;
+        let mut index = 0;
+        while index < record.owned_routes.len() {
+            let old = &record.owned_routes[index];
+            if old.interface_luid != record.tun_luid
+                && old.destination == desired.destination
+                && old.prefix_len == desired.prefix_len
+                && old != desired
+            {
+                operations.delete_route(old)?;
+                log::info!("Physical bypass route refreshed after network change: {old} -> {desired}");
+                record.owned_routes.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn physical_route_metric(route: &MIB_IPFORWARD_ROW2, iface: &MIB_IPINTERFACE_ROW) -> Option<u32> {
+    (iface.Connected
+        && !(iface.DisableDefaultRoutes && route.DestinationPrefix.PrefixLength == 0)
+        && route.ValidLifetime != 0
+        && !route.Loopback)
+        .then_some(iface.Metric)
+}
+
+pub(crate) fn physical_default_interface(tun_name: Option<&str>) -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex;
+    let mut operations = IpHelperOperations;
+    let tun_luid = tun_name.and_then(|name| operations.interface_luid(name).ok()).unwrap_or(0);
+    let routes = operations.physical_routes().ok()?;
+    let route = select_physical_route(&routes, IpAddr::V4(Ipv4Addr::UNSPECIFIED), tun_luid, &[])?;
+    let luid = NET_LUID_LH {
+        Value: route.interface_luid,
+    };
+    let mut index = 0;
+    win32_result(unsafe { ConvertInterfaceLuidToIndex(&luid, &mut index) }).ok()?;
+    Some(index)
+}
+
 fn contextual_error(context: &str, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("Failed to {context}: {error}"))
 }
 
 struct IpHelperOperations;
+
+struct MibTable(*mut std::ffi::c_void);
+
+impl Drop for MibTable {
+    fn drop(&mut self) {
+        // Both table APIs transfer this allocation to the caller.
+        unsafe { FreeMibTable(self.0) };
+    }
+}
 
 impl NetworkOperations for IpHelperOperations {
     fn interface_luid(&mut self, alias: &str) -> io::Result<u64> {
@@ -689,6 +800,48 @@ impl NetworkOperations for IpHelperOperations {
             route_address(&destination)?.ip
         );
         Ok((luid, next_hop))
+    }
+
+    fn physical_routes(&mut self) -> io::Result<Vec<(RouteSpec, u32)>> {
+        let mut table = std::ptr::null_mut();
+        win32_result(unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table) })?;
+        if table.is_null() {
+            return Err(io::Error::other("GetIpForwardTable2 returned a null table"));
+        }
+        let _table = MibTable(table.cast());
+        // Borrow the OS rows until the guard releases them, including on errors.
+        let rows = unsafe {
+            let table_ref = &*table;
+            std::slice::from_raw_parts(table_ref.Table.as_ptr(), table_ref.NumEntries as usize)
+        };
+        let mut interfaces = HashMap::new();
+        let mut routes = Vec::new();
+        for row in rows {
+            let luid = unsafe { row.InterfaceLuid.Value };
+            let family = unsafe { row.DestinationPrefix.Prefix.si_family };
+            let iface = interfaces.entry((luid, family)).or_insert_with(|| {
+                let mut iface = MIB_IPINTERFACE_ROW::default();
+                unsafe { InitializeIpInterfaceEntry(&mut iface) };
+                iface.Family = family;
+                iface.InterfaceLuid = NET_LUID_LH { Value: luid };
+                let status = unsafe { GetIpInterfaceEntry(&mut iface) };
+                (status == NO_ERROR).then_some(iface)
+            });
+            let Some(metric) = iface.as_ref().and_then(|iface| physical_route_metric(row, iface)) else {
+                continue;
+            };
+            routes.push((
+                RouteSpec {
+                    destination: route_address(&row.DestinationPrefix.Prefix)?.ip,
+                    prefix_len: row.DestinationPrefix.PrefixLength,
+                    next_hop: route_address(&row.NextHop)?,
+                    interface_luid: luid,
+                    metric: row.Metric,
+                },
+                metric,
+            ));
+        }
+        Ok(routes)
     }
 
     fn create_route(&mut self, route: &RouteSpec) -> io::Result<AddOutcome> {
@@ -718,6 +871,7 @@ impl NetworkOperations for IpHelperOperations {
         if table.is_null() {
             return Err(io::Error::other("GetIpInterfaceTable returned a null IPv4 interface table"));
         }
+        let _table = MibTable(table.cast());
 
         let mut targets = Vec::new();
         let table_ref = unsafe { &*table };
@@ -739,7 +893,6 @@ impl NetworkOperations for IpHelperOperations {
                 });
             }
         }
-        unsafe { FreeMibTable(table.cast()) };
         Ok(targets)
     }
 
@@ -944,6 +1097,7 @@ mod tests {
     #[derive(Default)]
     struct MockOperations {
         events: Vec<String>,
+        routes: Vec<(RouteSpec, u32)>,
         add_results: VecDeque<io::Result<AddOutcome>>,
         delete_failures_remaining: usize,
         dns_failure: bool,
@@ -965,6 +1119,10 @@ mod tests {
                 self.best_route_luid.unwrap_or(0x77),
                 RouteAddress::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
             ))
+        }
+
+        fn physical_routes(&mut self) -> io::Result<Vec<(RouteSpec, u32)>> {
+            Ok(self.routes.clone())
         }
 
         fn create_route(&mut self, route: &RouteSpec) -> io::Result<AddOutcome> {
@@ -1040,6 +1198,151 @@ mod tests {
             alias: "vEthernet (WSL (Hyper-V firewall))".into(),
             role: InterfaceRole::WslHns,
         }
+    }
+
+    fn default_route(luid: u64, gateway: &str) -> RouteSpec {
+        RouteSpec {
+            destination: "0.0.0.0".parse().unwrap(),
+            prefix_len: 0,
+            next_hop: RouteAddress::new(gateway.parse().unwrap()),
+            interface_luid: luid,
+            metric: 10,
+        }
+    }
+
+    #[test]
+    fn recovery_replaces_only_owned_bypasses_and_preserves_capture() {
+        let mut operations = MockOperations::default();
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        let captured = record
+            .owned_routes
+            .iter()
+            .filter(|route| route.interface_luid == record.tun_luid)
+            .cloned()
+            .collect::<Vec<_>>();
+        operations.routes = vec![(default_route(0x88, "192.168.21.1"), 25)];
+        operations.events.clear();
+        reconcile_bypass_routes(&mut operations, &mut record).unwrap();
+        assert!(
+            record
+                .owned_routes
+                .iter()
+                .filter(|route| route.interface_luid != record.tun_luid)
+                .all(|route| route.interface_luid == 0x88)
+        );
+        assert!(captured.iter().all(|route| record.owned_routes.contains(route)));
+        assert!(operations.events[0].starts_with("add:"));
+        assert!(operations.events[1].starts_with("delete:"));
+        assert!(!operations.events.iter().any(|event| event.contains("0.0.0.0/0")));
+    }
+
+    #[test]
+    fn failed_replacement_or_offline_network_keeps_the_loop_barrier() {
+        let mut operations = MockOperations::default();
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        let before = record.owned_routes.clone();
+        reconcile_bypass_routes(&mut operations, &mut record).unwrap();
+        assert_eq!(record.owned_routes, before);
+        operations.routes = vec![(default_route(0x88, "192.168.21.1"), 25)];
+        operations.add_results.push_back(Err(io::Error::other("injected add failure")));
+        assert!(reconcile_bypass_routes(&mut operations, &mut record).is_err());
+        assert_eq!(record.owned_routes, before);
+    }
+
+    #[test]
+    fn failed_old_route_deletion_retains_both_ownership_records_for_cleanup() {
+        let mut operations = MockOperations::default();
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        let before = record.owned_routes.clone();
+        operations.routes = vec![(default_route(0x88, "192.168.21.1"), 25)];
+        operations.delete_failures_remaining = 1;
+        assert!(reconcile_bypass_routes(&mut operations, &mut record).is_err());
+        assert_eq!(record.owned_routes.len(), before.len() + 1);
+        assert!(before.iter().all(|route| record.owned_routes.contains(route)));
+        cleanup_transaction(&mut operations, &mut record).unwrap();
+        assert!(record.owned_routes.is_empty());
+    }
+
+    #[test]
+    fn existing_replacement_route_is_never_claimed_for_teardown() {
+        let mut operations = MockOperations::default();
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        operations.routes = vec![(default_route(0x88, "192.168.21.1"), 25)];
+        operations
+            .add_results
+            .extend([Ok(AddOutcome::Preexisting), Ok(AddOutcome::Preexisting)]);
+        reconcile_bypass_routes(&mut operations, &mut record).unwrap();
+        assert!(record.owned_routes.iter().all(|route| route.interface_luid == record.tun_luid));
+        assert_eq!(record.desired_bypasses.len(), 2);
+
+        // The borrowed adapter disappears. Both destinations must still be
+        // reconciled on a subsequent network change.
+        operations.routes = vec![(default_route(0x99, "192.168.22.1"), 10)];
+        operations.events.clear();
+        reconcile_bypass_routes(&mut operations, &mut record).unwrap();
+        assert_eq!(operations.events.iter().filter(|event| event.starts_with("add:")).count(), 2);
+        assert!(!operations.events.iter().any(|event| event.starts_with("delete:")));
+        assert!(record.desired_bypasses.iter().all(|route| route.interface_luid == 0x99));
+        assert_eq!(record.owned_routes.iter().filter(|route| route.interface_luid == 0x99).count(), 2);
+        assert!(!record.owned_routes.iter().any(|route| route.interface_luid == 0x88));
+    }
+
+    #[test]
+    fn initially_preexisting_bypasses_are_restored_if_removed() {
+        let mut operations = MockOperations::default();
+        operations
+            .add_results
+            .extend([Ok(AddOutcome::Preexisting), Ok(AddOutcome::Preexisting)]);
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        assert_eq!(record.desired_bypasses.len(), 2);
+        assert!(record.owned_routes.iter().all(|route| route.interface_luid == record.tun_luid));
+
+        // Recreate a missing borrowed row on the same adapter and own only the
+        // replacement we actually installed.
+        operations.routes = vec![(default_route(0x77, "192.0.2.1"), 10)];
+        reconcile_bypass_routes(&mut operations, &mut record).unwrap();
+        assert!(record.desired_bypasses.iter().all(|route| record.owned_routes.contains(route)));
+        operations.events.clear();
+        cleanup_transaction(&mut operations, &mut record).unwrap();
+        assert_eq!(operations.events.iter().filter(|event| event.starts_with("delete:")).count(), 5);
+    }
+
+    #[test]
+    fn disabled_default_routes_do_not_hide_valid_specific_routes() {
+        let mut route = MIB_IPFORWARD_ROW2 {
+            ValidLifetime: u32::MAX,
+            ..Default::default()
+        };
+        let mut iface = MIB_IPINTERFACE_ROW {
+            Connected: true,
+            Metric: 10,
+            DisableDefaultRoutes: true,
+            ..Default::default()
+        };
+        assert_eq!(physical_route_metric(&route, &iface), None);
+        route.DestinationPrefix.PrefixLength = 24;
+        assert_eq!(physical_route_metric(&route, &iface), Some(10));
+        iface.Connected = false;
+        assert_eq!(physical_route_metric(&route, &iface), None);
+        iface.Connected = true;
+        iface.DisableDefaultRoutes = false;
+        route.DestinationPrefix.PrefixLength = 0;
+        assert_eq!(physical_route_metric(&route, &iface), Some(10));
+        route.ValidLifetime = 0;
+        assert_eq!(physical_route_metric(&route, &iface), None);
+    }
+
+    #[test]
+    fn physical_selection_ignores_our_routes_and_obeys_prefix_then_total_metric() {
+        let tun = default_route(0x55, "10.0.0.1");
+        let old = default_route(0x77, "192.0.2.1");
+        let preferred = default_route(0x88, "192.168.21.1");
+        let routes = vec![(tun, 0), (old.clone(), 1), (preferred.clone(), 20)];
+        assert_eq!(
+            select_physical_route(&routes, "8.8.8.8".parse().unwrap(), 0x55, &[old]),
+            Some(&preferred)
+        );
+        assert!(!contains_destination(&preferred, "::1".parse().unwrap()));
     }
 
     #[test]
