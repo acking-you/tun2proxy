@@ -24,6 +24,11 @@ A tunnel interface for HTTP and SOCKS proxies on Linux, Android, macOS, iOS and 
 - UdpGW (UDP gateway) support for UDP over TCP, see the [wiki](https://github.com/tun2proxy/tun2proxy/wiki/UDP-gateway-feature) for more information
 - Session info embedding for per-app routing on Android (see below)
 
+TCP forwarding preserves application data received in the same read as the
+successful HTTP CONNECT, SOCKS4 or SOCKS5 reply. This includes server-first
+protocols such as SSH, whose greeting must reach the client before it sends
+application data. The proxy handshake and application wire formats are unchanged.
+
 This fork also offers opt-in `--icmp-echo` for IPv4/IPv6 ping through
 proxy-everything's loopback SOCKS5 extension. It requires an unauthenticated
 loopback endpoint implementing private command `0xe0`; ordinary HTTP/SOCKS

@@ -129,7 +129,7 @@ impl SocksProxyImpl {
         self.server_inbuf.drain(0..8);
 
         self.state = SocksState::Established;
-        Ok(())
+        self.state_change()
     }
 
     fn receive_server_hello_socks5(&mut self) -> std::io::Result<()> {
@@ -244,7 +244,7 @@ impl SocksProxyImpl {
         }
 
         self.state = SocksState::Established;
-        Ok(())
+        self.state_change()
     }
 
     fn relay_traffic(&mut self) -> Result<(), Error> {

@@ -1372,7 +1372,7 @@ fn reset_tcp_after_policy_change(tcp: &mut IpStackTcpStream, info: SessionInfo) 
 }
 
 async fn handle_tcp_session(
-    tcp_stack: &mut IpStackTcpStream,
+    tcp_stack: &mut (impl AsyncRead + AsyncWrite + Unpin),
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     bind: Option<DirectBind>,
@@ -1386,10 +1386,15 @@ async fn handle_tcp_session(
     // For a process-bypass session `server_addr` is the original destination and
     // `bind` pins the egress to the physical interface; otherwise it is the proxy
     // and `bind` is `None` (normal routing).
-    let server = tokio::time::timeout(Duration::from_secs(10), async {
+    let (server, prefetched) = tokio::time::timeout(Duration::from_secs(10), async {
         let mut server = create_tcp_stream(&socket_queue, server_addr, bind.as_ref()).await?;
-        handle_proxy_session(&mut server, proxy_handler).await?;
-        Ok::<_, Error>(server)
+        handle_proxy_session(&mut server, proxy_handler.clone()).await?;
+        // The last handshake read can also contain server-first application
+        // data. Preserve it before switching from the parser to raw TCP reads.
+        let mut handler = proxy_handler.lock().await;
+        let prefetched = handler.peek_data(OutgoingDirection::ToClient).buffer.to_vec();
+        handler.consume_data(OutgoingDirection::ToClient, prefetched.len());
+        Ok::<_, Error>((server, prefetched))
     })
     .await
     .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "TUN TCP setup exceeded 10 seconds"))??;
@@ -1410,6 +1415,8 @@ async fn handle_tcp_session(
             Ok::<_, std::io::Error>(copied)
         },
         async move {
+            // These bytes were already counted by the handshake reader.
+            t_tx.write_all(&prefetched).await?;
             let copied = copy_and_record_traffic(&mut s_rx, &mut t_tx, false).await?;
             if let Err(err) = t_tx.shutdown().await {
                 log::trace!("{session_info} t_tx shutdown error {err}");
@@ -1794,6 +1801,83 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
     }
     crate::traffic_status::traffic_status_update(tx, rx)?;
     Ok(proxy_handler.get_udp_associate())
+}
+
+#[cfg(test)]
+mod tcp_handshake_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn server_first_data_survives_coalesced_proxy_reply() {
+        for protocol in [ProxyType::Socks4, ProxyType::Socks5, ProxyType::Http] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let manager: Arc<dyn ProxyHandlerManager> = match protocol {
+                ProxyType::Socks4 => Arc::new(SocksProxyManager::new(address, socks5_impl::protocol::Version::V4, None)),
+                ProxyType::Socks5 => Arc::new(SocksProxyManager::new(address, socks5_impl::protocol::Version::V5, None)),
+                ProxyType::Http => Arc::new(HttpManager::new(address, None)),
+                _ => unreachable!(),
+            };
+            let info = SessionInfo::new("127.0.0.1:12345".parse().unwrap(), "127.0.0.1:22".parse().unwrap(), IpProtocol::Tcp);
+            let handler = manager.new_proxy_handler(info, None, false).await.unwrap();
+            let peer = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut reply = match protocol {
+                    ProxyType::Socks4 => {
+                        let mut request = [0; 9];
+                        socket.read_exact(&mut request).await.unwrap();
+                        assert_eq!(&request[..2], &[4, 1]);
+                        vec![0, 0x5a, 0, 0, 0, 0, 0, 0]
+                    }
+                    ProxyType::Socks5 => {
+                        let mut hello = [0; 2];
+                        socket.read_exact(&mut hello).await.unwrap();
+                        assert_eq!(hello[0], 5);
+                        socket.read_exact(&mut vec![0; hello[1] as usize]).await.unwrap();
+                        socket.write_all(&[5, 0]).await.unwrap();
+                        let mut request = [0; 10];
+                        socket.read_exact(&mut request).await.unwrap();
+                        assert_eq!(&request[..4], &[5, 1, 0, 1]);
+                        vec![5, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+                    }
+                    ProxyType::Http => {
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            request.push(socket.read_u8().await.unwrap());
+                        }
+                        b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec()
+                    }
+                    _ => unreachable!(),
+                };
+                // SSH/SMTP send a greeting before the client writes anything.
+                // A proxy may coalesce it with its successful CONNECT response.
+                reply.extend_from_slice(b"SSH-2.0-test\r\n");
+                socket.write_all(&reply).await.unwrap();
+                let mut acknowledgement = [0; 2];
+                socket.read_exact(&mut acknowledgement).await.unwrap();
+                assert_eq!(&acknowledgement, b"ok");
+            };
+            let (mut client, mut stack) = tokio::io::duplex(1024);
+            let relay = handle_tcp_session(&mut stack, handler, None, None);
+            let application = async {
+                let mut greeting = [0; 14];
+                client.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(&greeting, b"SSH-2.0-test\r\n");
+                client.write_all(b"ok").await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut tail = Vec::new();
+                client.read_to_end(&mut tail).await.unwrap();
+                assert!(tail.is_empty(), "greeting must be delivered exactly once");
+            };
+            // No detached tasks: a timeout drops both sides and their sockets.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let (result, (), ()) = tokio::join!(relay, peer, application);
+                result.unwrap();
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{protocol:?} lost the server greeting"));
+        }
+    }
 }
 
 #[cfg(test)]

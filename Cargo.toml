@@ -27,39 +27,39 @@ default = ["udpgw"]
 udpgw = []
 
 [dependencies]
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 base64easy = "0.1.7"
-chrono = "0.4.44"
-clap = { version = "4.6.1", features = ["derive", "wrap_help", "color"] }
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive", "wrap_help", "color"] }
 ctrlc2 = { version = "4.0.0", features = ["async", "termination"] }
 digest_auth = "0.3.1"
 dotenvy = "0.15.7"
-env_logger = "0.11.10"
+env_logger = "0.11.11"
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
-hashlink = "0.12.0"
+hashlink = "0.12.2"
 # Includes the bounded name-compression fix for GHSA-q2qq-hmj6-3wpp.
-hickory-proto = "=0.26.1"
+hickory-proto = "=0.26.3"
 httparse = "1.10.1"
 internet-checksum = "0.2.1"
 # The sibling fork, which carries a fix for an active half-close that never
 # completes while data is still in flight. No version requirement, so the fork
 # stays on the upstream pre-release version and its only diff is the fix.
 ipstack = { path = "../ipstack" }
-log = { version = "0.4.30", features = ["std"] }
+log = { version = "0.4.34", features = ["std"] }
 percent-encoding = "2.3.2"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 shlex = "2.0.1"
-socks5-impl = { version = "0.8.3", default-features = false, features = [
+socks5-impl = { version = "0.9.8", default-features = false, features = [
     "tokio",
     "serde",
 ] }
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
-tokio-util = { version = "0.7.18", features = ["rt"] }
-tproxy-config = { version = "^7.0.7", default-features = false }
-tun = { version = "0.8.10", features = ["async"] }
-unicase = "2.9.0"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+tproxy-config = { version = "^7.0.9", default-features = false }
+tun = { version = "0.8.14", features = ["async"] }
+unicase = "2.10.0"
 url = "2.5.8"
 
 [target.'cfg(target_os="android")'.dependencies]
@@ -67,16 +67,16 @@ android_logger = "0.15.1"
 jni = { version = "0.22.4", default-features = false }
 
 [target.'cfg(target_os="linux")'.dependencies]
-bincode-next = "2.1.0"
+bincode-next = "3.1.1"
 
 # Process-based bypass feature (`--bypass-process`): only built on the platforms
 # that implement source-process lookup and physical-interface binding. Keeping
 # these here avoids pulling them (and breaking the build) on iOS/Android, where
 # the platform VPN API owns per-application routing instead.
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
-netdev = "0.44.0"
+netdev = "0.46.3"
 netstat2 = "0.11.2"
-socket2 = "0.6.4"
+socket2 = "0.6.5"
 
 [target.'cfg(target_os="windows")'.dependencies]
 windows-service = "0.8.1"
@@ -105,8 +105,8 @@ nix = { version = "0.31.3", default-features = false, features = [
 ] }
 
 [build-dependencies]
-chrono = "0.4.44"
-serde_json = "1.0.150"
+chrono = "0.4.45"
+serde_json = "1.0.151"
 
 # [profile.release]
 # strip = "symbols"
