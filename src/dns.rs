@@ -52,6 +52,9 @@ pub fn remove_ipv6_entries(message: &mut Message) {
     message.answers.retain(|answer| !matches!(answer.data, RData::AAAA(_)));
     message.authorities.retain(|record| !matches!(record.data, RData::AAAA(_)));
     message.additionals.retain(|record| !matches!(record.data, RData::AAAA(_)));
+    // Filtering changes signed contents: do not claim DNSSEC authentication.
+    message.metadata.authentic_data = false;
+    message.signature = None;
 }
 
 pub fn extract_ipaddr_from_dns_message(message: &Message) -> Result<IpAddr, String> {

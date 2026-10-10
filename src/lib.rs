@@ -1007,14 +1007,17 @@ where
                         (handler_result, None)
                     };
 
+                    let filter_dns_ipv6 = !bypass && dns == ArgDns::OverTcp && info.dst.port() == DNS_PORT && !ipv6_enabled;
                     match handler_result {
                         Ok(proxy_handler) => {
                             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                            let result =
-                                run_until_process_policy_change(handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind), policy)
-                                    .await;
+                            let result = run_until_process_policy_change(
+                                handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind, filter_dns_ipv6),
+                                policy,
+                            )
+                            .await;
                             #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-                            let result = Some(handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind).await);
+                            let result = Some(handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind, filter_dns_ipv6).await);
 
                             if result.is_none() {
                                 reset_tcp_after_policy_change(&mut tcp, info);
@@ -1382,6 +1385,7 @@ async fn handle_tcp_session(
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     bind: Option<DirectBind>,
+    filter_dns_ipv6: bool,
 ) -> crate::Result<()> {
     let (session_info, server_addr) = {
         let handler = proxy_handler.lock().await;
@@ -1422,8 +1426,12 @@ async fn handle_tcp_session(
         },
         async move {
             // These bytes were already counted by the handshake reader.
-            t_tx.write_all(&prefetched).await?;
-            let copied = copy_and_record_traffic(&mut s_rx, &mut t_tx, false).await?;
+            let copied = if filter_dns_ipv6 {
+                copy_ipv4_dns_responses(&mut s_rx, &mut t_tx, prefetched).await?
+            } else {
+                t_tx.write_all(&prefetched).await?;
+                copy_and_record_traffic(&mut s_rx, &mut t_tx, false).await?
+            };
             if let Err(err) = t_tx.shutdown().await {
                 log::trace!("{session_info} t_tx shutdown error {err}");
             }
@@ -1434,6 +1442,37 @@ async fn handle_tcp_session(
 
     res?;
     Ok(())
+}
+
+// DNS over TCP can fragment or pipeline frames, including data prefetched by
+// the proxy handshake. Never emit a partial unfiltered reply to an IPv4 TUN.
+async fn copy_ipv4_dns_responses(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    mut pending: Vec<u8>,
+) -> std::io::Result<u64> {
+    let mut total = 0;
+    let mut buffer = [0; 4096];
+    loop {
+        for mut message in dns::drain_tcp_messages(&mut pending).map_err(std::io::Error::other)? {
+            dns::remove_ipv6_entries(&mut message);
+            let packet = message.to_vec().map_err(std::io::Error::other)?;
+            let length = u16::try_from(packet.len()).map_err(std::io::Error::other)?;
+            writer.write_u16(length).await?;
+            writer.write_all(&packet).await?;
+        }
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return if pending.is_empty() {
+                Ok(total)
+            } else {
+                Err(std::io::Error::new(ErrorKind::UnexpectedEof, "incomplete DNS-over-TCP response"))
+            };
+        }
+        total += count as u64;
+        let _ = crate::traffic_status::traffic_status_update(0, count);
+        pending.extend_from_slice(&buffer[..count]);
+    }
 }
 
 #[cfg(feature = "udpgw")]
@@ -1864,7 +1903,7 @@ mod tcp_handshake_tests {
                 assert_eq!(&acknowledgement, b"ok");
             };
             let (mut client, mut stack) = tokio::io::duplex(1024);
-            let relay = handle_tcp_session(&mut stack, handler, None, None);
+            let relay = handle_tcp_session(&mut stack, handler, None, None, false);
             let application = async {
                 let mut greeting = [0; 14];
                 client.read_exact(&mut greeting).await.unwrap();
@@ -1894,6 +1933,58 @@ mod virtual_dns_transport_tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn ipv4_tcp_dns_filters_prefetched_and_fragmented_pipelined_answers() {
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_ascii("example.test").unwrap(), RecordType::AAAA));
+        let mut answer = dns::build_dns_response(query, Some("2001:db8::7".parse().unwrap()), 30).unwrap();
+        answer.metadata.authentic_data = true;
+        let bytes = answer.to_vec().unwrap();
+        let mut frame = (bytes.len() as u16).to_be_bytes().to_vec();
+        frame.extend_from_slice(&bytes);
+        let frames = [frame.as_slice(), frame.as_slice()].concat();
+        let (mut input, mut reader) = tokio::io::duplex(16);
+        let (mut writer, mut output) = tokio::io::duplex(1024);
+        let prefetched = frames[..3].to_vec();
+        let source = async {
+            for chunk in frames[3..].chunks(3) {
+                input.write_all(chunk).await.unwrap();
+            }
+            input.shutdown().await.unwrap();
+        };
+        let relay = async {
+            copy_ipv4_dns_responses(&mut reader, &mut writer, prefetched).await.unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let sink = async {
+            let mut filtered = Vec::new();
+            output.read_to_end(&mut filtered).await.unwrap();
+            let messages = dns::drain_tcp_messages(&mut filtered).unwrap();
+            assert_eq!(messages.len(), 2);
+            assert!(filtered.is_empty());
+            for message in messages {
+                assert_eq!(message.id, 7);
+                assert!(message.answers.is_empty());
+                assert!(!message.authentic_data);
+                assert_eq!(message.queries[0].query_type(), RecordType::AAAA);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(source, relay, sink);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipv4_tcp_dns_rejects_truncated_frames_without_forwarding_bytes() {
+        let mut reader = std::io::Cursor::new(vec![0, 12, 1]);
+        let mut output = Vec::new();
+        let error = copy_ipv4_dns_responses(&mut reader, &mut output, Vec::new()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+        assert!(output.is_empty());
+    }
 
     #[test]
     fn session_permits_enforce_limit_and_release_on_drop() {
