@@ -435,6 +435,16 @@ async fn general_run_async_with_process_bypass_setup(
         tproxy_args = tproxy_args.tun_name(&tun_name);
     }
 
+    // A cloned Windows writer retains the Wintun session/adapter even after
+    // the forwarding task (and its device) exits, panics or is aborted. Declare
+    // it before the network guard so cancellation also restores routes, DNS and
+    // interface properties before releasing the last adapter reference.
+    #[cfg(target_os = "windows")]
+    let (_adapter_lifetime, device) = {
+        let (writer, reader) = device.split()?;
+        (writer.clone(), tokio::io::join(reader, writer))
+    };
+
     // Keep the platform setup guard alive for the forwarding lifetime. On
     // Windows its Drop implementation synchronously retries owned-route and
     // DNS cleanup if explicit teardown cannot complete.

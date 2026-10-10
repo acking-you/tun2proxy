@@ -657,14 +657,12 @@ where
     // remaining children on drop and also lets normal shutdown await their
     // cancellation before route and DNS teardown begins.
     let mut managed_tasks = tokio::task::JoinSet::new();
-    let virtual_dns = if args.dns == ArgDns::Virtual {
-        Some(match virtual_dns_state {
-            Some(state) => state.resolver(),
-            None => Arc::new(Mutex::new(VirtualDns::new(args.virtual_dns_pool))),
-        })
-    } else {
-        None
-    };
+    // Keep reverse mappings when Fake-IP is disabled: applications can retain
+    // previous DNS answers across an upgrade or a change of DNS mode. Only the
+    // Virtual branches below allocate new fake addresses.
+    let virtual_dns = virtual_dns_state
+        .map(|state| state.resolver())
+        .or_else(|| (args.dns == ArgDns::Virtual).then(|| Arc::new(Mutex::new(VirtualDns::new(args.virtual_dns_pool)))));
 
     use socks5_impl::protocol::Version::{V4, V5};
     let mgr: Arc<dyn ProxyHandlerManager> = match args.proxy.proxy_type {
@@ -931,6 +929,14 @@ where
                     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let bypass = false;
 
+                    // Windows and platform VPNs advertise a private DNS portal.
+                    // TCP fallback must use the same upstream resolver as UDP
+                    // DNS; connecting the portal through SOCKS would loop/fail.
+                    let mut info = info;
+                    if !bypass && dns == ArgDns::OverTcp && info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
+                        info.dst.set_ip(dns_addr);
+                    }
+
                     if !bypass && dns == ArgDns::Virtual && info.dst.port() == DNS_PORT {
                         let relay = async {
                             match virtual_dns.clone() {
@@ -1001,14 +1007,17 @@ where
                         (handler_result, None)
                     };
 
+                    let filter_dns_ipv6 = !bypass && dns == ArgDns::OverTcp && info.dst.port() == DNS_PORT && !ipv6_enabled;
                     match handler_result {
                         Ok(proxy_handler) => {
                             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-                            let result =
-                                run_until_process_policy_change(handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind), policy)
-                                    .await;
+                            let result = run_until_process_policy_change(
+                                handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind, filter_dns_ipv6),
+                                policy,
+                            )
+                            .await;
                             #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-                            let result = Some(handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind).await);
+                            let result = Some(handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind, filter_dns_ipv6).await);
 
                             if result.is_none() {
                                 reset_tcp_after_policy_change(&mut tcp, info);
@@ -1313,7 +1322,7 @@ async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<Vi
 }
 
 fn is_virtual_dns_tls_probe(dns: ArgDns, portals: &[IpAddr], destination: SocketAddr) -> bool {
-    dns == ArgDns::Virtual && destination.port() == DNS_OVER_TLS_PORT && portals.contains(&destination.ip())
+    dns != ArgDns::Direct && destination.port() == DNS_OVER_TLS_PORT && portals.contains(&destination.ip())
 }
 
 async fn handle_virtual_dns_tcp_session<S>(mut tcp: S, dns: Arc<Mutex<VirtualDns>>) -> crate::Result<()>
@@ -1372,10 +1381,11 @@ fn reset_tcp_after_policy_change(tcp: &mut IpStackTcpStream, info: SessionInfo) 
 }
 
 async fn handle_tcp_session(
-    tcp_stack: &mut IpStackTcpStream,
+    tcp_stack: &mut (impl AsyncRead + AsyncWrite + Unpin),
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     bind: Option<DirectBind>,
+    filter_dns_ipv6: bool,
 ) -> crate::Result<()> {
     let (session_info, server_addr) = {
         let handler = proxy_handler.lock().await;
@@ -1386,10 +1396,15 @@ async fn handle_tcp_session(
     // For a process-bypass session `server_addr` is the original destination and
     // `bind` pins the egress to the physical interface; otherwise it is the proxy
     // and `bind` is `None` (normal routing).
-    let server = tokio::time::timeout(Duration::from_secs(10), async {
+    let (server, prefetched) = tokio::time::timeout(Duration::from_secs(10), async {
         let mut server = create_tcp_stream(&socket_queue, server_addr, bind.as_ref()).await?;
-        handle_proxy_session(&mut server, proxy_handler).await?;
-        Ok::<_, Error>(server)
+        handle_proxy_session(&mut server, proxy_handler.clone()).await?;
+        // The last handshake read can also contain server-first application
+        // data. Preserve it before switching from the parser to raw TCP reads.
+        let mut handler = proxy_handler.lock().await;
+        let prefetched = handler.peek_data(OutgoingDirection::ToClient).buffer.to_vec();
+        handler.consume_data(OutgoingDirection::ToClient, prefetched.len());
+        Ok::<_, Error>((server, prefetched))
     })
     .await
     .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "TUN TCP setup exceeded 10 seconds"))??;
@@ -1410,7 +1425,13 @@ async fn handle_tcp_session(
             Ok::<_, std::io::Error>(copied)
         },
         async move {
-            let copied = copy_and_record_traffic(&mut s_rx, &mut t_tx, false).await?;
+            // These bytes were already counted by the handshake reader.
+            let copied = if filter_dns_ipv6 {
+                copy_ipv4_dns_responses(&mut s_rx, &mut t_tx, prefetched).await?
+            } else {
+                t_tx.write_all(&prefetched).await?;
+                copy_and_record_traffic(&mut s_rx, &mut t_tx, false).await?
+            };
             if let Err(err) = t_tx.shutdown().await {
                 log::trace!("{session_info} t_tx shutdown error {err}");
             }
@@ -1421,6 +1442,37 @@ async fn handle_tcp_session(
 
     res?;
     Ok(())
+}
+
+// DNS over TCP can fragment or pipeline frames, including data prefetched by
+// the proxy handshake. Never emit a partial unfiltered reply to an IPv4 TUN.
+async fn copy_ipv4_dns_responses(
+    reader: &mut (impl AsyncRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    mut pending: Vec<u8>,
+) -> std::io::Result<u64> {
+    let mut total = 0;
+    let mut buffer = [0; 4096];
+    loop {
+        for mut message in dns::drain_tcp_messages(&mut pending).map_err(std::io::Error::other)? {
+            dns::remove_ipv6_entries(&mut message);
+            let packet = message.to_vec().map_err(std::io::Error::other)?;
+            let length = u16::try_from(packet.len()).map_err(std::io::Error::other)?;
+            writer.write_u16(length).await?;
+            writer.write_all(&packet).await?;
+        }
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            return if pending.is_empty() {
+                Ok(total)
+            } else {
+                Err(std::io::Error::new(ErrorKind::UnexpectedEof, "incomplete DNS-over-TCP response"))
+            };
+        }
+        total += count as u64;
+        let _ = crate::traffic_status::traffic_status_update(0, count);
+        pending.extend_from_slice(&buffer[..count]);
+    }
 }
 
 #[cfg(feature = "udpgw")]
@@ -1797,6 +1849,83 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
 }
 
 #[cfg(test)]
+mod tcp_handshake_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn server_first_data_survives_coalesced_proxy_reply() {
+        for protocol in [ProxyType::Socks4, ProxyType::Socks5, ProxyType::Http] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let manager: Arc<dyn ProxyHandlerManager> = match protocol {
+                ProxyType::Socks4 => Arc::new(SocksProxyManager::new(address, socks5_impl::protocol::Version::V4, None)),
+                ProxyType::Socks5 => Arc::new(SocksProxyManager::new(address, socks5_impl::protocol::Version::V5, None)),
+                ProxyType::Http => Arc::new(HttpManager::new(address, None)),
+                _ => unreachable!(),
+            };
+            let info = SessionInfo::new("127.0.0.1:12345".parse().unwrap(), "127.0.0.1:22".parse().unwrap(), IpProtocol::Tcp);
+            let handler = manager.new_proxy_handler(info, None, false).await.unwrap();
+            let peer = async {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut reply = match protocol {
+                    ProxyType::Socks4 => {
+                        let mut request = [0; 9];
+                        socket.read_exact(&mut request).await.unwrap();
+                        assert_eq!(&request[..2], &[4, 1]);
+                        vec![0, 0x5a, 0, 0, 0, 0, 0, 0]
+                    }
+                    ProxyType::Socks5 => {
+                        let mut hello = [0; 2];
+                        socket.read_exact(&mut hello).await.unwrap();
+                        assert_eq!(hello[0], 5);
+                        socket.read_exact(&mut vec![0; hello[1] as usize]).await.unwrap();
+                        socket.write_all(&[5, 0]).await.unwrap();
+                        let mut request = [0; 10];
+                        socket.read_exact(&mut request).await.unwrap();
+                        assert_eq!(&request[..4], &[5, 1, 0, 1]);
+                        vec![5, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+                    }
+                    ProxyType::Http => {
+                        let mut request = Vec::new();
+                        while !request.ends_with(b"\r\n\r\n") {
+                            request.push(socket.read_u8().await.unwrap());
+                        }
+                        b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec()
+                    }
+                    _ => unreachable!(),
+                };
+                // SSH/SMTP send a greeting before the client writes anything.
+                // A proxy may coalesce it with its successful CONNECT response.
+                reply.extend_from_slice(b"SSH-2.0-test\r\n");
+                socket.write_all(&reply).await.unwrap();
+                let mut acknowledgement = [0; 2];
+                socket.read_exact(&mut acknowledgement).await.unwrap();
+                assert_eq!(&acknowledgement, b"ok");
+            };
+            let (mut client, mut stack) = tokio::io::duplex(1024);
+            let relay = handle_tcp_session(&mut stack, handler, None, None, false);
+            let application = async {
+                let mut greeting = [0; 14];
+                client.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(&greeting, b"SSH-2.0-test\r\n");
+                client.write_all(b"ok").await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut tail = Vec::new();
+                client.read_to_end(&mut tail).await.unwrap();
+                assert!(tail.is_empty(), "greeting must be delivered exactly once");
+            };
+            // No detached tasks: a timeout drops both sides and their sockets.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let (result, (), ()) = tokio::join!(relay, peer, application);
+                result.unwrap();
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{protocol:?} lost the server greeting"));
+        }
+    }
+}
+
+#[cfg(test)]
 mod virtual_dns_transport_tests {
     use hickory_proto::{
         op::{Message, MessageType, OpCode, Query},
@@ -1804,6 +1933,58 @@ mod virtual_dns_transport_tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn ipv4_tcp_dns_filters_prefetched_and_fragmented_pipelined_answers() {
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(Name::from_ascii("example.test").unwrap(), RecordType::AAAA));
+        let mut answer = dns::build_dns_response(query, Some("2001:db8::7".parse().unwrap()), 30).unwrap();
+        answer.metadata.authentic_data = true;
+        let bytes = answer.to_vec().unwrap();
+        let mut frame = (bytes.len() as u16).to_be_bytes().to_vec();
+        frame.extend_from_slice(&bytes);
+        let frames = [frame.as_slice(), frame.as_slice()].concat();
+        let (mut input, mut reader) = tokio::io::duplex(16);
+        let (mut writer, mut output) = tokio::io::duplex(1024);
+        let prefetched = frames[..3].to_vec();
+        let source = async {
+            for chunk in frames[3..].chunks(3) {
+                input.write_all(chunk).await.unwrap();
+            }
+            input.shutdown().await.unwrap();
+        };
+        let relay = async {
+            copy_ipv4_dns_responses(&mut reader, &mut writer, prefetched).await.unwrap();
+            writer.shutdown().await.unwrap();
+        };
+        let sink = async {
+            let mut filtered = Vec::new();
+            output.read_to_end(&mut filtered).await.unwrap();
+            let messages = dns::drain_tcp_messages(&mut filtered).unwrap();
+            assert_eq!(messages.len(), 2);
+            assert!(filtered.is_empty());
+            for message in messages {
+                assert_eq!(message.id, 7);
+                assert!(message.answers.is_empty());
+                assert!(!message.authentic_data);
+                assert_eq!(message.queries[0].query_type(), RecordType::AAAA);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(source, relay, sink);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipv4_tcp_dns_rejects_truncated_frames_without_forwarding_bytes() {
+        let mut reader = std::io::Cursor::new(vec![0, 12, 1]);
+        let mut output = Vec::new();
+        let error = copy_ipv4_dns_responses(&mut reader, &mut output, Vec::new()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+        assert!(output.is_empty());
+    }
 
     #[test]
     fn session_permits_enforce_limit_and_release_on_drop() {
@@ -1824,6 +2005,11 @@ mod virtual_dns_transport_tests {
 
     #[test]
     fn dns_tls_probe_only_matches_configured_virtual_portal() {
+        assert!(is_virtual_dns_tls_probe(
+            ArgDns::OverTcp,
+            &["172.19.0.2".parse().unwrap()],
+            "172.19.0.2:853".parse().unwrap()
+        ));
         let portals = ["172.19.0.2".parse().unwrap()];
 
         assert!(is_virtual_dns_tls_probe(
