@@ -657,14 +657,12 @@ where
     // remaining children on drop and also lets normal shutdown await their
     // cancellation before route and DNS teardown begins.
     let mut managed_tasks = tokio::task::JoinSet::new();
-    let virtual_dns = if args.dns == ArgDns::Virtual {
-        Some(match virtual_dns_state {
-            Some(state) => state.resolver(),
-            None => Arc::new(Mutex::new(VirtualDns::new(args.virtual_dns_pool))),
-        })
-    } else {
-        None
-    };
+    // Keep reverse mappings when Fake-IP is disabled: applications can retain
+    // previous DNS answers across an upgrade or a change of DNS mode. Only the
+    // Virtual branches below allocate new fake addresses.
+    let virtual_dns = virtual_dns_state
+        .map(|state| state.resolver())
+        .or_else(|| (args.dns == ArgDns::Virtual).then(|| Arc::new(Mutex::new(VirtualDns::new(args.virtual_dns_pool)))));
 
     use socks5_impl::protocol::Version::{V4, V5};
     let mgr: Arc<dyn ProxyHandlerManager> = match args.proxy.proxy_type {
@@ -930,6 +928,14 @@ where
                     let bypass = policy.as_ref().is_some_and(process::SessionPolicy::bypass);
                     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let bypass = false;
+
+                    // Windows and platform VPNs advertise a private DNS portal.
+                    // TCP fallback must use the same upstream resolver as UDP
+                    // DNS; connecting the portal through SOCKS would loop/fail.
+                    let mut info = info;
+                    if !bypass && dns == ArgDns::OverTcp && info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
+                        info.dst.set_ip(dns_addr);
+                    }
 
                     if !bypass && dns == ArgDns::Virtual && info.dst.port() == DNS_PORT {
                         let relay = async {
@@ -1313,7 +1319,7 @@ async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<Vi
 }
 
 fn is_virtual_dns_tls_probe(dns: ArgDns, portals: &[IpAddr], destination: SocketAddr) -> bool {
-    dns == ArgDns::Virtual && destination.port() == DNS_OVER_TLS_PORT && portals.contains(&destination.ip())
+    dns != ArgDns::Direct && destination.port() == DNS_OVER_TLS_PORT && portals.contains(&destination.ip())
 }
 
 async fn handle_virtual_dns_tcp_session<S>(mut tcp: S, dns: Arc<Mutex<VirtualDns>>) -> crate::Result<()>
@@ -1908,6 +1914,11 @@ mod virtual_dns_transport_tests {
 
     #[test]
     fn dns_tls_probe_only_matches_configured_virtual_portal() {
+        assert!(is_virtual_dns_tls_probe(
+            ArgDns::OverTcp,
+            &["172.19.0.2".parse().unwrap()],
+            "172.19.0.2:853".parse().unwrap()
+        ));
         let portals = ["172.19.0.2".parse().unwrap()];
 
         assert!(is_virtual_dns_tls_probe(
