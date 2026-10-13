@@ -48,7 +48,7 @@ pub use {
 #[cfg(target_os = "macos")]
 pub use general_api::validate_macos_capture_routes;
 pub use general_api::{
-    general_run_async, general_run_async_with_process_bypass, general_run_async_with_process_bypass_and_ready,
+    NetworkTeardownError, general_run_async, general_run_async_with_process_bypass, general_run_async_with_process_bypass_and_ready,
     general_run_async_with_process_bypass_and_ready_and_virtual_dns, general_run_async_with_process_bypass_and_virtual_dns,
 };
 
@@ -904,6 +904,7 @@ where
                 let mgr = mgr.clone();
                 let socket_queue = socket_queue.clone();
                 let dns = args.dns;
+                let tcp_setup_timeout = Duration::from_secs(args.tcp_timeout);
                 let virtual_dns_portals = virtual_dns_portals.clone();
                 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let process_matcher = process_matcher.clone();
@@ -1012,12 +1013,14 @@ where
                         Ok(proxy_handler) => {
                             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                             let result = run_until_process_policy_change(
-                                handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind, filter_dns_ipv6),
+                                handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind, filter_dns_ipv6, tcp_setup_timeout),
                                 policy,
                             )
                             .await;
                             #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-                            let result = Some(handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind, filter_dns_ipv6).await);
+                            let result = Some(
+                                handle_tcp_session(&mut tcp, proxy_handler, socket_queue, bind, filter_dns_ipv6, tcp_setup_timeout).await,
+                            );
 
                             if result.is_none() {
                                 reset_tcp_after_policy_change(&mut tcp, info);
@@ -1386,6 +1389,7 @@ async fn handle_tcp_session(
     socket_queue: Option<Arc<SocketQueue>>,
     bind: Option<DirectBind>,
     filter_dns_ipv6: bool,
+    setup_timeout: Duration,
 ) -> crate::Result<()> {
     let (session_info, server_addr) = {
         let handler = proxy_handler.lock().await;
@@ -1396,7 +1400,11 @@ async fn handle_tcp_session(
     // For a process-bypass session `server_addr` is the original destination and
     // `bind` pins the egress to the physical interface; otherwise it is the proxy
     // and `bind` is `None` (normal routing).
-    let (server, prefetched) = tokio::time::timeout(Duration::from_secs(10), async {
+    // The local SOCKS reply waits for the upstream TCP connection. Its OS SYN
+    // retries must not be cut short by a second, hidden TUN setup deadline.
+    // Reuse the configured TCP timeout so a silent proxy still releases its
+    // session slot; do not invent a shorter, separate connection policy.
+    let (server, prefetched) = tokio::time::timeout(setup_timeout, async {
         let mut server = create_tcp_stream(&socket_queue, server_addr, bind.as_ref()).await?;
         handle_proxy_session(&mut server, proxy_handler.clone()).await?;
         // The last handshake read can also contain server-first application
@@ -1407,7 +1415,12 @@ async fn handle_tcp_session(
         Ok::<_, Error>((server, prefetched))
     })
     .await
-    .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "TUN TCP setup exceeded 10 seconds"))??;
+    .map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::TimedOut,
+            format!("TUN TCP setup exceeded configured TCP timeout {setup_timeout:?}"),
+        )
+    })??;
 
     log::debug!("Beginning {session_info}");
 
@@ -1853,6 +1866,28 @@ mod tcp_handshake_tests {
     use super::*;
 
     #[tokio::test]
+    async fn tcp_setup_uses_the_configured_timeout_instead_of_ten_seconds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let manager = HttpManager::new(listener.local_addr().unwrap(), None);
+        let info = SessionInfo::new("127.0.0.1:12345".parse().unwrap(), "127.0.0.1:80".parse().unwrap(), IpProtocol::Tcp);
+        let handler = manager.new_proxy_handler(info, None, false).await.unwrap();
+        let (_client, mut stack) = tokio::io::duplex(1024);
+        let relay = tokio::spawn(async move { handle_tcp_session(&mut stack, handler, None, None, false, Duration::from_secs(60)).await });
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.unwrap());
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+        assert!(!relay.is_finished());
+        tokio::time::advance(Duration::from_secs(40)).await;
+        assert!(relay.await.unwrap().unwrap_err().to_string().contains("configured TCP timeout"));
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
     async fn server_first_data_survives_coalesced_proxy_reply() {
         for protocol in [ProxyType::Socks4, ProxyType::Socks5, ProxyType::Http] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1903,7 +1938,7 @@ mod tcp_handshake_tests {
                 assert_eq!(&acknowledgement, b"ok");
             };
             let (mut client, mut stack) = tokio::io::duplex(1024);
-            let relay = handle_tcp_session(&mut stack, handler, None, None, false);
+            let relay = handle_tcp_session(&mut stack, handler, None, None, false, Duration::from_secs(600));
             let application = async {
                 let mut greeting = [0; 14];
                 client.read_exact(&mut greeting).await.unwrap();

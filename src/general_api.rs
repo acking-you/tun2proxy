@@ -1,6 +1,16 @@
 use crate::{Args, ProcessBypass, VirtualDnsState};
 use std::os::raw::{c_char, c_int, c_ushort};
 
+/// Distinguishes a failed route/DNS restore from a forwarding failure whose
+/// network configuration has already been restored.
+#[derive(Debug, thiserror::Error)]
+#[error("TUN network teardown failed: {cleanup}; forwarding error: {forwarding:?}")]
+pub struct NetworkTeardownError {
+    #[source]
+    pub cleanup: std::io::Error,
+    pub forwarding: Option<String>,
+}
+
 /// # Safety
 /// Run the tun2proxy component with command line arguments
 /// Parameters:
@@ -293,6 +303,28 @@ fn macos_capture_check_reads_selected_route_instead_of_primary_service() {
     assert!(macos_route_interface("route: not in table").is_err());
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn configure_tun_name(args: &mut Args, network: tproxy_config::TproxyArgs, actual_name: String) -> tproxy_config::TproxyArgs {
+    // Automatic device names must reach both route setup and forwarding. The
+    // Windows refresh excludes this adapter's LUID; leaving args.tun empty
+    // makes our /1 capture route win its route lookup.
+    let network = network.tun_name(&actual_name);
+    args.tun = Some(actual_name);
+    network
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+#[test]
+fn automatic_device_name_is_shared_by_setup_and_egress_refresh() {
+    let mut args = Args::default();
+    assert!(args.tun.is_none());
+    let network = configure_tun_name(&mut args, tproxy_config::TproxyArgs::new(), "assigned-tunnel".into());
+    assert_eq!(network.tun_name, "assigned-tunnel");
+    assert_eq!(args.tun.as_deref(), Some(network.tun_name.as_str()));
+    // Discovering the name must not pin automatic selection to the old egress.
+    assert!(args.bind_interface.is_none());
+}
+
 async fn general_run_async_with_process_bypass_setup(
     args: Args,
     tun_mtu: u16,
@@ -303,6 +335,8 @@ async fn general_run_async_with_process_bypass_setup(
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> std::io::Result<usize> {
     crate::icmp::validate_options(&args)?;
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    let mut args = args;
     // Capture this before creating our adapter. If setup later fails, the
     // diagnostic can identify tunnel software that was already active rather
     // than mistakenly reporting the adapter created by this invocation.
@@ -431,8 +465,7 @@ async fn general_run_async_with_process_bypass_setup(
 
     #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     if let Ok(tun_name) = tun::AbstractDevice::tun_name(&*device) {
-        // Above line is equivalent to: `use tun::AbstractDevice; if let Ok(tun_name) = device.tun_name() {`
-        tproxy_args = tproxy_args.tun_name(&tun_name);
+        tproxy_args = configure_tun_name(&mut args, tproxy_args, tun_name);
     }
 
     // A cloned Windows writer retains the Wintun session/adapter even after
@@ -526,25 +559,14 @@ async fn general_run_async_with_process_bypass_setup(
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     let cleanup_result: std::io::Result<()> = Ok(());
 
-    let forwarding_result = match forwarding_task_result {
-        Ok(result) => result,
-        Err(join_error) => {
-            return match cleanup_result {
-                Ok(()) => Err(std::io::Error::other(format!("TUN forwarding task failed: {join_error}"))),
-                Err(cleanup_error) => Err(std::io::Error::other(format!(
-                    "TUN forwarding task failed: {join_error}; network teardown also failed: {cleanup_error}"
-                ))),
-            };
-        }
-    };
+    let forwarding_result =
+        forwarding_task_result.unwrap_or_else(|error| Err(std::io::Error::other(format!("TUN forwarding task failed: {error}")).into()));
 
     if let Err(cleanup_error) = cleanup_result {
-        return match forwarding_result {
-            Ok(_) => Err(cleanup_error),
-            Err(forwarding_error) => Err(std::io::Error::other(format!(
-                "TUN forwarding failed: {forwarding_error}; network teardown also failed: {cleanup_error}"
-            ))),
-        };
+        return Err(std::io::Error::other(NetworkTeardownError {
+            cleanup: cleanup_error,
+            forwarding: forwarding_result.err().map(|error| error.to_string()),
+        }));
     }
 
     match forwarding_result {
