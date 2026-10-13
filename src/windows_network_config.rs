@@ -1346,6 +1346,18 @@ mod tests {
     }
 
     #[test]
+    fn egress_refresh_excludes_capture_routes_using_the_created_adapter_luid() {
+        let mut capture = default_route(0x55, "10.0.0.1");
+        capture.prefix_len = 1;
+        let preferred = default_route(0x88, "192.168.21.1");
+        let routes = vec![(capture.clone(), 0), (preferred.clone(), 20)];
+        let probe = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        // A missing automatically assigned name previously became LUID 0.
+        assert_eq!(select_physical_route(&routes, probe, 0, &[]), Some(&capture));
+        assert_eq!(select_physical_route(&routes, probe, 0x55, &[]), Some(&preferred));
+    }
+
+    #[test]
     fn adds_owned_default_for_forwarding_consumers_and_preserves_physical_route() {
         let mut operations = MockOperations {
             wsl_targets: vec![wsl_target(0x66), wsl_target(0x67)],
