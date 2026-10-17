@@ -509,6 +509,10 @@ async fn general_run_async_with_process_bypass_setup(
     }
 
     log::info!("TUN adapter and system routes are ready");
+    #[cfg(windows)]
+    if let (Some(state), Some(controller)) = (&restore, &args.upstream_bypass) {
+        state.attach_upstream_bypass(controller);
+    }
     if let Some(ready) = ready.take() {
         let _ = ready.send(Ok(()));
     }
