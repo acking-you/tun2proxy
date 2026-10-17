@@ -9,6 +9,5 @@ xcuserdata/
 .VSCodeCounter/
 build/
 tmp/
-Cargo.lock
 target/
 .idea/

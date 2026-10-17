@@ -28,6 +28,7 @@ jobs:
     - uses: ./.github/actions/checkout-ipstack
     - uses: dtolnay/rust-toolchain@stable
       with:
+        toolchain: nightly-2026-01-26
         components: clippy, rustfmt
 
     - name: rustfmt
@@ -36,21 +37,21 @@ jobs:
 
     - name: check
       if: ${{ !cancelled() }}
-      run: cargo check --verbose
+      run: cargo check --verbose --locked
 
     - name: clippy
       if: ${{ !cancelled() }}
-      run: cargo clippy --all-targets --all-features -- -D warnings
+      run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
     - name: Build
       if: ${{ !cancelled() }}
       run: |
-        cargo build --verbose --tests --all-features
+        cargo build --locked --verbose --tests --all-features
         cargo clean
-        cargo build --verbose
+        cargo build --locked --verbose
 
     - name: Test
-      run: cargo test --all-features
+      run: cargo test --locked --all-features
 
     - name: Abort on error
       if: ${{ failure() }}
@@ -66,19 +67,20 @@ jobs:
     - uses: ./.github/actions/checkout-ipstack
     - uses: dtolnay/rust-toolchain@stable
       with:
+        toolchain: nightly-2026-01-26
         components: clippy, rustfmt
     - name: Install cargo ndk and rust compiler for android target
       if: ${{ !cancelled() }}
       run: |
-        cargo install --locked cargo-ndk
+        cargo +stable install --locked cargo-ndk
         rustup target add x86_64-linux-android
     - name: clippy
       if: ${{ !cancelled() }}
-      run: cargo ndk -t x86_64 clippy --all-features -- -D warnings
+      run: cargo ndk -t x86_64 clippy --locked --all-features -- -D warnings
     - name: Build
       if: ${{ !cancelled() }}
       run: |
-        cargo ndk -t x86_64 rustc --verbose --all-features --lib --crate-type=cdylib
+        cargo ndk -t x86_64 rustc --locked --verbose --all-features --lib --crate-type=cdylib
     - name: Abort on error
       if: ${{ failure() }}
       run: echo "Android build job failed" && false
@@ -93,19 +95,20 @@ jobs:
     - uses: ./.github/actions/checkout-ipstack
     - uses: dtolnay/rust-toolchain@stable
       with:
+        toolchain: nightly-2026-01-26
         components: clippy, rustfmt
-    - name: Install cargo lipo and rust compiler for ios target
+    - name: Install rust compiler for iOS targets
       if: ${{ !cancelled() }}
       run: |
-        cargo install --locked cargo-lipo
         rustup target add x86_64-apple-ios aarch64-apple-ios
     - name: clippy
       if: ${{ !cancelled() }}
-      run: cargo clippy --target x86_64-apple-ios --all-features -- -D warnings
+      run: cargo clippy --locked --target x86_64-apple-ios --all-features -- -D warnings
     - name: Build
       if: ${{ !cancelled() }}
       run: |
-        cargo lipo --verbose --all-features
+        cargo build --locked --target aarch64-apple-ios --lib --all-features
+        cargo build --locked --target x86_64-apple-ios --lib --all-features
     - name: Abort on error
       if: ${{ failure() }}
       run: echo "iOS build job failed" && false

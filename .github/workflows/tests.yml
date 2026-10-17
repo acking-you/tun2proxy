@@ -18,6 +18,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/checkout-ipstack
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2026-01-26
       - name: Populate .env
         env:
           DOTENV: ${{ secrets.DOTENV }}
@@ -39,7 +41,7 @@ jobs:
           pip install -r tests/requirements.txt
       
       - name: Build project
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Run tests
         run: |
