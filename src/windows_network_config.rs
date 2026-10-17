@@ -41,6 +41,61 @@ use windows_sys::{
 const CAPTURE_ROUTE_METRIC: u32 = 6;
 const BYPASS_ROUTE_METRIC: u32 = 1;
 const FORWARDING_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const BYPASS_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+enum NetworkCommand {
+    Stop,
+    AddBypasses {
+        addresses: Vec<IpAddr>,
+        reply: tokio::sync::oneshot::Sender<io::Result<()>>,
+    },
+}
+
+/// Adds upstream host routes to a live Windows TUN without recreating its
+/// adapter or changing DNS. Routes remain owned by the session until teardown,
+/// including old upstreams still used by established connections.
+#[derive(Clone, Debug, Default)]
+pub struct WindowsRouteBypass {
+    sender: Arc<Mutex<Option<mpsc::Sender<NetworkCommand>>>>,
+}
+
+impl WindowsRouteBypass {
+    fn attach(&self, sender: mpsc::Sender<NetworkCommand>) {
+        *self.sender.lock().unwrap_or_else(|error| error.into_inner()) = Some(sender);
+    }
+
+    /// Wait for confirmed installation before publishing a new upstream.
+    /// Timeout never authorizes the caller to change its endpoint. An OS call
+    /// already in progress may finish later; its route is still tracked for
+    /// cleanup, but the worker never changes the application's upstream.
+    pub async fn add_addresses(&self, addresses: Vec<IpAddr>) -> io::Result<()> {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "TUN route controller is not ready"))?;
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(NetworkCommand::AddBypasses { addresses, reply })
+            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "TUN route controller has stopped"))?;
+        tokio::time::timeout(BYPASS_UPDATE_TIMEOUT, receiver)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "TUN upstream bypass update exceeded 5 seconds; previous upstream retained",
+                )
+            })?
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "TUN route worker ended before confirming the upstream bypass",
+                )
+            })?
+    }
+}
 
 type GetInterfaceDnsSettingsFn = unsafe extern "system" fn(GUID, *mut DNS_INTERFACE_SETTINGS) -> u32;
 type SetInterfaceDnsSettingsFn = unsafe extern "system" fn(GUID, *const DNS_INTERFACE_SETTINGS) -> u32;
@@ -222,7 +277,7 @@ struct InstallRecord {
 
 #[derive(Debug)]
 struct InterfaceMonitor {
-    stop: mpsc::Sender<()>,
+    stop: mpsc::Sender<NetworkCommand>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -234,7 +289,18 @@ impl InterfaceMonitor {
             .spawn(move || {
                 loop {
                     match receiver.recv_timeout(FORWARDING_RECONCILE_INTERVAL) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Ok(NetworkCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Ok(NetworkCommand::AddBypasses { addresses, reply }) => {
+                            // Expired requests queued behind an OS operation must
+                            // not start another network mutation.
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let mut operations = IpHelperOperations;
+                            let mut record = record.lock().unwrap_or_else(|error| error.into_inner());
+                            let result = add_upstream_bypasses(&mut operations, &mut record, &addresses);
+                            let _ = reply.send(result);
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let mut operations = IpHelperOperations;
                             let mut record = record.lock().unwrap_or_else(|error| error.into_inner());
@@ -256,7 +322,7 @@ impl InterfaceMonitor {
     }
 
     fn stop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.stop.send(NetworkCommand::Stop);
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
         {
@@ -276,6 +342,12 @@ pub(crate) struct WindowsNetworkConfig {
 }
 
 impl WindowsNetworkConfig {
+    pub(crate) fn attach_upstream_bypass(&self, controller: &WindowsRouteBypass) {
+        if let Some(monitor) = &self.interface_monitor {
+            controller.attach(monitor.stop.clone());
+        }
+    }
+
     pub(crate) fn install(args: &TproxyArgs) -> io::Result<Self> {
         let mut operations = IpHelperOperations;
         let record = Arc::new(Mutex::new(install_transaction(&mut operations, args)?));
@@ -735,6 +807,62 @@ fn reconcile_bypass_routes<O: NetworkOperations>(operations: &mut O, record: &mu
             } else {
                 index += 1;
             }
+        }
+    }
+    Ok(())
+}
+
+fn add_upstream_bypasses<O: NetworkOperations>(operations: &mut O, record: &mut InstallRecord, addresses: &[IpAddr]) -> io::Result<()> {
+    if record.removed {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "TUN network configuration has been removed",
+        ));
+    }
+    let routes = operations.physical_routes()?;
+    let mut planned = Vec::new();
+    for &destination in addresses {
+        if destination.is_loopback() || destination.is_unspecified() {
+            continue;
+        }
+        let physical = select_physical_route(&routes, destination, record.tun_luid, &record.owned_routes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NetworkUnreachable,
+                format!("no physical route for upstream {destination}"),
+            )
+        })?;
+        let route = RouteSpec {
+            destination,
+            prefix_len: if destination.is_ipv4() { 32 } else { 128 },
+            next_hop: physical.next_hop,
+            interface_luid: physical.interface_luid,
+            metric: BYPASS_ROUTE_METRIC,
+        };
+        if !planned.contains(&route) {
+            planned.push(route);
+        }
+    }
+    // Do not retire old upstreams: established TCP/UDP associations still use
+    // them. Track every successful addition even if a later address fails, so
+    // teardown can remove it without ever touching borrowed or capture routes.
+    for route in planned {
+        if operations
+            .create_route(&route)
+            .map_err(|error| contextual_error(&format!("install live upstream bypass {route}"), error))?
+            == AddOutcome::Created
+            && !record.owned_routes.contains(&route)
+        {
+            record.owned_routes.push(route.clone());
+        }
+        log::info!("Live upstream physical bypass confirmed: {route}");
+        if let Some(desired) = record
+            .desired_bypasses
+            .iter_mut()
+            .find(|old| old.destination == route.destination && old.prefix_len == route.prefix_len)
+        {
+            *desired = route;
+        } else {
+            record.desired_bypasses.push(route);
         }
     }
     Ok(())
@@ -1216,6 +1344,83 @@ mod tests {
             interface_luid: luid,
             metric: 10,
         }
+    }
+
+    #[test]
+    fn live_upstream_addition_preserves_capture_dns_and_old_connections() {
+        let mut operations = MockOperations::default();
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        let old_routes = record.owned_routes.clone();
+        operations.routes = vec![
+            (default_route(record.tun_luid, "10.0.0.1"), 1),
+            (default_route(0x88, "192.168.21.1"), 25),
+        ];
+        operations.events.clear();
+        let ip = "198.51.100.7".parse().unwrap();
+        add_upstream_bypasses(&mut operations, &mut record, &[ip, ip]).unwrap();
+        assert_eq!(operations.events, ["add:198.51.100.7/32"]);
+        assert!(old_routes.iter().all(|route| record.owned_routes.contains(route)));
+        assert_eq!(record.owned_routes.last().unwrap().interface_luid, 0x88);
+        assert!(record.dns_changed);
+
+        // Re-selecting the same endpoint borrows the existing row, without
+        // duplicating ownership. A borrowed route is never deleted by teardown.
+        operations.add_results.push_back(Ok(AddOutcome::Preexisting));
+        add_upstream_bypasses(&mut operations, &mut record, &[ip]).unwrap();
+        assert_eq!(record.owned_routes.len(), old_routes.len() + 1);
+        operations.add_results.push_back(Ok(AddOutcome::Preexisting));
+        add_upstream_bypasses(&mut operations, &mut record, &["198.51.100.8".parse().unwrap()]).unwrap();
+        operations.events.clear();
+        cleanup_transaction(&mut operations, &mut record).unwrap();
+        assert_eq!(
+            operations.events.iter().filter(|event| *event == "delete:198.51.100.7/32").count(),
+            1
+        );
+        assert!(!operations.events.iter().any(|event| event == "delete:198.51.100.8/32"));
+    }
+
+    #[test]
+    fn failed_live_update_keeps_old_routes_and_tracks_partial_additions_for_cleanup() {
+        let mut operations = MockOperations::default();
+        let mut record = install_transaction(&mut operations, &test_args()).unwrap();
+        let before = record.owned_routes.clone();
+        operations.routes = vec![(default_route(0x88, "192.168.21.1"), 25)];
+        operations.events.clear();
+        operations.add_results.extend([
+            Ok(AddOutcome::Created),
+            Err(io::Error::other("injected route installation failure")),
+        ]);
+        let error = add_upstream_bypasses(
+            &mut operations,
+            &mut record,
+            &["198.51.100.7".parse().unwrap(), "198.51.100.8".parse().unwrap()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("198.51.100.8"));
+        assert!(before.iter().all(|route| record.owned_routes.contains(route)));
+        assert!(operations.events.iter().all(|event| event.starts_with("add:")));
+        operations.events.clear();
+        cleanup_transaction(&mut operations, &mut record).unwrap();
+        assert!(operations.events.iter().any(|event| event == "delete:198.51.100.7/32"));
+        assert!(!operations.events.iter().any(|event| event == "delete:198.51.100.8/32"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_route_worker_times_out_and_marks_queued_request_cancelled() {
+        let controller = WindowsRouteBypass::default();
+        let (sender, receiver) = mpsc::channel();
+        controller.attach(sender);
+        let error = controller.add_addresses(vec!["198.51.100.7".parse().unwrap()]).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let NetworkCommand::AddBypasses { reply, .. } = receiver.try_recv().unwrap() else {
+            panic!("expected upstream route request");
+        };
+        assert!(reply.is_closed(), "a delayed worker must skip the expired request");
+        drop(receiver);
+        assert_eq!(
+            controller.add_addresses(Vec::new()).await.unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
     }
 
     #[test]

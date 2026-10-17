@@ -51,6 +51,8 @@ pub use general_api::{
     NetworkTeardownError, general_run_async, general_run_async_with_process_bypass, general_run_async_with_process_bypass_and_ready,
     general_run_async_with_process_bypass_and_ready_and_virtual_dns, general_run_async_with_process_bypass_and_virtual_dns,
 };
+#[cfg(windows)]
+pub use windows_network_config::WindowsRouteBypass;
 
 pub const FORCE_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 

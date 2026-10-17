@@ -94,6 +94,12 @@ pub struct Args {
     #[serde(skip)]
     pub elevated_console_pid: Option<u32>,
 
+    /// In-process controller for live upstream host routes; never serialized.
+    #[cfg(windows)]
+    #[arg(skip)]
+    #[serde(skip)]
+    pub upstream_bypass: Option<crate::WindowsRouteBypass>,
+
     /// DNS handling strategy
     #[arg(short, long, value_name = "strategy", value_enum, default_value = "direct")]
     pub dns: ArgDns,
@@ -246,6 +252,8 @@ impl Default for Args {
             setup,
             #[cfg(windows)]
             elevated_console_pid: None,
+            #[cfg(windows)]
+            upstream_bypass: None,
             dns: ArgDns::default(),
             dns_addr: "8.8.8.8".parse().unwrap(),
             bypass: vec![],
