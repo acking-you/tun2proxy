@@ -46,10 +46,12 @@ const BYPASS_UPDATE_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 enum NetworkCommand {
     Stop,
-    AddBypasses {
+    PrepareBypasses {
         addresses: Vec<IpAddr>,
         reply: tokio::sync::oneshot::Sender<io::Result<()>>,
     },
+    CommitBypasses,
+    RollbackBypasses,
 }
 
 /// Adds upstream host routes to a live Windows TUN without recreating its
@@ -58,6 +60,36 @@ enum NetworkCommand {
 #[derive(Clone, Debug, Default)]
 pub struct WindowsRouteBypass {
     sender: Arc<Mutex<Option<mpsc::Sender<NetworkCommand>>>>,
+    operation: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// A prepared route update. Dropping it rolls back only routes created by this
+/// update; committing retains them for the lifetime of the TUN session.
+#[derive(Debug)]
+pub struct WindowsPreparedBypass {
+    sender: mpsc::Sender<NetworkCommand>,
+    _operation: tokio::sync::OwnedMutexGuard<()>,
+    committed: bool,
+}
+
+impl WindowsPreparedBypass {
+    pub fn commit(mut self) -> io::Result<()> {
+        self.sender
+            .send(NetworkCommand::CommitBypasses)
+            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "TUN route controller has stopped"))?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for WindowsPreparedBypass {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Send before releasing the operation guard so a following update
+            // cannot borrow a provisional route that is about to be removed.
+            let _ = self.sender.send(NetworkCommand::RollbackBypasses);
+        }
+    }
 }
 
 impl WindowsRouteBypass {
@@ -70,15 +102,29 @@ impl WindowsRouteBypass {
     /// already in progress may finish later; its route is still tracked for
     /// cleanup, but the worker never changes the application's upstream.
     pub async fn add_addresses(&self, addresses: Vec<IpAddr>) -> io::Result<()> {
+        self.prepare_addresses(addresses).await?.commit()
+    }
+
+    /// Prepare routes for a probe. Keep the returned guard until the endpoint
+    /// can be published; cancellation and every error path roll the update back.
+    pub async fn prepare_addresses(&self, addresses: Vec<IpAddr>) -> io::Result<WindowsPreparedBypass> {
+        let operation = tokio::time::timeout(BYPASS_UPDATE_TIMEOUT, self.operation.clone().lock_owned())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "another TUN bypass preparation is still pending"))?;
         let sender = self
             .sender
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "TUN route controller is not ready"))?;
+        let prepared = WindowsPreparedBypass {
+            sender: sender.clone(),
+            _operation: operation,
+            committed: false,
+        };
         let (reply, receiver) = tokio::sync::oneshot::channel();
         sender
-            .send(NetworkCommand::AddBypasses { addresses, reply })
+            .send(NetworkCommand::PrepareBypasses { addresses, reply })
             .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "TUN route controller has stopped"))?;
         tokio::time::timeout(BYPASS_UPDATE_TIMEOUT, receiver)
             .await
@@ -93,7 +139,8 @@ impl WindowsRouteBypass {
                     io::ErrorKind::BrokenPipe,
                     "TUN route worker ended before confirming the upstream bypass",
                 )
-            })?
+            })??;
+        Ok(prepared)
     }
 }
 
@@ -275,6 +322,12 @@ struct InstallRecord {
     removed: bool,
 }
 
+#[derive(Debug, Default)]
+struct PreparedBypasses {
+    added: Vec<RouteSpec>,
+    desired: Vec<RouteSpec>,
+}
+
 #[derive(Debug)]
 struct InterfaceMonitor {
     stop: mpsc::Sender<NetworkCommand>,
@@ -287,10 +340,12 @@ impl InterfaceMonitor {
         let thread = thread::Builder::new()
             .name("tun2proxy-windows-interface-monitor".into())
             .spawn(move || {
+                let mut pending = None;
+                let mut rollback_routes = Vec::new();
                 loop {
                     match receiver.recv_timeout(FORWARDING_RECONCILE_INTERVAL) {
                         Ok(NetworkCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Ok(NetworkCommand::AddBypasses { addresses, reply }) => {
+                        Ok(NetworkCommand::PrepareBypasses { addresses, reply }) => {
                             // Expired requests queued behind an OS operation must
                             // not start another network mutation.
                             if reply.is_closed() {
@@ -298,8 +353,30 @@ impl InterfaceMonitor {
                             }
                             let mut operations = IpHelperOperations;
                             let mut record = record.lock().unwrap_or_else(|error| error.into_inner());
-                            let result = add_upstream_bypasses(&mut operations, &mut record, &addresses);
+                            rollback_upstream_bypasses(&mut operations, &mut record, &mut rollback_routes);
+                            let result = if rollback_routes.is_empty() {
+                                let update = pending.insert(PreparedBypasses::default());
+                                add_upstream_bypasses(&mut operations, &mut record, &addresses, update)
+                            } else {
+                                Err(io::Error::other(
+                                    "previous upstream bypass rollback is still pending; retry after cleanup",
+                                ))
+                            };
                             let _ = reply.send(result);
+                        }
+                        Ok(NetworkCommand::CommitBypasses) => {
+                            if let Some(update) = pending.take() {
+                                let mut record = record.lock().unwrap_or_else(|error| error.into_inner());
+                                commit_upstream_bypasses(&mut record, update);
+                            }
+                        }
+                        Ok(NetworkCommand::RollbackBypasses) => {
+                            if let Some(update) = pending.take() {
+                                rollback_routes.extend(update.added);
+                            }
+                            let mut operations = IpHelperOperations;
+                            let mut record = record.lock().unwrap_or_else(|error| error.into_inner());
+                            rollback_upstream_bypasses(&mut operations, &mut record, &mut rollback_routes);
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             let mut operations = IpHelperOperations;
@@ -307,7 +384,12 @@ impl InterfaceMonitor {
                             if let Err(error) = reconcile_interface_settings(&mut operations, &tun_target, &record.interface_snapshots) {
                                 log::warn!("Could not reconcile Windows TUN/WSL forwarding settings; retrying: {error}");
                             }
-                            if let Err(error) = reconcile_bypass_routes(&mut operations, &mut record) {
+                            rollback_upstream_bypasses(&mut operations, &mut record, &mut rollback_routes);
+                            // A probe owns provisional rows until its decision.
+                            // Do not replace those rows during that short window.
+                            if pending.is_none()
+                                && let Err(error) = reconcile_bypass_routes(&mut operations, &mut record)
+                            {
                                 log::debug!("Could not refresh physical bypass routes; retrying: {error}");
                             }
                         }
@@ -812,7 +894,12 @@ fn reconcile_bypass_routes<O: NetworkOperations>(operations: &mut O, record: &mu
     Ok(())
 }
 
-fn add_upstream_bypasses<O: NetworkOperations>(operations: &mut O, record: &mut InstallRecord, addresses: &[IpAddr]) -> io::Result<()> {
+fn add_upstream_bypasses<O: NetworkOperations>(
+    operations: &mut O,
+    record: &mut InstallRecord,
+    addresses: &[IpAddr],
+    update: &mut PreparedBypasses,
+) -> io::Result<()> {
     if record.removed {
         return Err(io::Error::new(
             io::ErrorKind::NotConnected,
@@ -853,8 +940,16 @@ fn add_upstream_bypasses<O: NetworkOperations>(operations: &mut O, record: &mut 
             && !record.owned_routes.contains(&route)
         {
             record.owned_routes.push(route.clone());
+            update.added.push(route.clone());
         }
         log::info!("Live upstream physical bypass confirmed: {route}");
+        update.desired.push(route);
+    }
+    Ok(())
+}
+
+fn commit_upstream_bypasses(record: &mut InstallRecord, update: PreparedBypasses) {
+    for route in update.desired {
         if let Some(desired) = record
             .desired_bypasses
             .iter_mut()
@@ -865,7 +960,20 @@ fn add_upstream_bypasses<O: NetworkOperations>(operations: &mut O, record: &mut 
             record.desired_bypasses.push(route);
         }
     }
-    Ok(())
+}
+
+fn rollback_upstream_bypasses<O: NetworkOperations>(operations: &mut O, record: &mut InstallRecord, routes: &mut Vec<RouteSpec>) {
+    routes.retain(|route| match operations.delete_route(route) {
+        Ok(()) => {
+            record.owned_routes.retain(|owned| owned != route);
+            log::info!("Rolled back provisional upstream bypass: {route}");
+            false
+        }
+        Err(error) => {
+            log::warn!("Could not roll back provisional upstream bypass {route}; retaining ownership and retrying: {error}");
+            true
+        }
+    });
 }
 
 fn physical_route_metric(route: &MIB_IPFORWARD_ROW2, iface: &MIB_IPINTERFACE_ROW) -> Option<u32> {
@@ -1357,7 +1465,9 @@ mod tests {
         ];
         operations.events.clear();
         let ip = "198.51.100.7".parse().unwrap();
-        add_upstream_bypasses(&mut operations, &mut record, &[ip, ip]).unwrap();
+        let mut update = PreparedBypasses::default();
+        add_upstream_bypasses(&mut operations, &mut record, &[ip, ip], &mut update).unwrap();
+        commit_upstream_bypasses(&mut record, update);
         assert_eq!(operations.events, ["add:198.51.100.7/32"]);
         assert!(old_routes.iter().all(|route| record.owned_routes.contains(route)));
         assert_eq!(record.owned_routes.last().unwrap().interface_luid, 0x88);
@@ -1366,10 +1476,14 @@ mod tests {
         // Re-selecting the same endpoint borrows the existing row, without
         // duplicating ownership. A borrowed route is never deleted by teardown.
         operations.add_results.push_back(Ok(AddOutcome::Preexisting));
-        add_upstream_bypasses(&mut operations, &mut record, &[ip]).unwrap();
+        let mut update = PreparedBypasses::default();
+        add_upstream_bypasses(&mut operations, &mut record, &[ip], &mut update).unwrap();
+        commit_upstream_bypasses(&mut record, update);
         assert_eq!(record.owned_routes.len(), old_routes.len() + 1);
         operations.add_results.push_back(Ok(AddOutcome::Preexisting));
-        add_upstream_bypasses(&mut operations, &mut record, &["198.51.100.8".parse().unwrap()]).unwrap();
+        let mut update = PreparedBypasses::default();
+        add_upstream_bypasses(&mut operations, &mut record, &["198.51.100.8".parse().unwrap()], &mut update).unwrap();
+        commit_upstream_bypasses(&mut record, update);
         operations.events.clear();
         cleanup_transaction(&mut operations, &mut record).unwrap();
         assert_eq!(
@@ -1380,29 +1494,43 @@ mod tests {
     }
 
     #[test]
-    fn failed_live_update_keeps_old_routes_and_tracks_partial_additions_for_cleanup() {
+    fn failed_live_update_rolls_back_only_new_routes_and_retries_cleanup() {
         let mut operations = MockOperations::default();
         let mut record = install_transaction(&mut operations, &test_args()).unwrap();
         let before = record.owned_routes.clone();
+        let desired_before = record.desired_bypasses.clone();
         operations.routes = vec![(default_route(0x88, "192.168.21.1"), 25)];
         operations.events.clear();
         operations.add_results.extend([
+            Ok(AddOutcome::Preexisting),
             Ok(AddOutcome::Created),
             Err(io::Error::other("injected route installation failure")),
         ]);
+        let mut update = PreparedBypasses::default();
         let error = add_upstream_bypasses(
             &mut operations,
             &mut record,
-            &["198.51.100.7".parse().unwrap(), "198.51.100.8".parse().unwrap()],
+            &[
+                "198.51.100.6".parse().unwrap(),
+                "198.51.100.7".parse().unwrap(),
+                "198.51.100.8".parse().unwrap(),
+            ],
+            &mut update,
         )
         .unwrap_err();
         assert!(error.to_string().contains("198.51.100.8"));
         assert!(before.iter().all(|route| record.owned_routes.contains(route)));
         assert!(operations.events.iter().all(|event| event.starts_with("add:")));
         operations.events.clear();
-        cleanup_transaction(&mut operations, &mut record).unwrap();
-        assert!(operations.events.iter().any(|event| event == "delete:198.51.100.7/32"));
-        assert!(!operations.events.iter().any(|event| event == "delete:198.51.100.8/32"));
+        operations.delete_failures_remaining = 1;
+        rollback_upstream_bypasses(&mut operations, &mut record, &mut update.added);
+        assert_eq!(update.added.len(), 1);
+        assert!(record.owned_routes.contains(&update.added[0]));
+        rollback_upstream_bypasses(&mut operations, &mut record, &mut update.added);
+        assert!(update.added.is_empty());
+        assert_eq!(record.owned_routes, before);
+        assert_eq!(record.desired_bypasses, desired_before);
+        assert_eq!(operations.events, ["delete:198.51.100.7/32", "delete:198.51.100.7/32"]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1412,15 +1540,44 @@ mod tests {
         controller.attach(sender);
         let error = controller.add_addresses(vec!["198.51.100.7".parse().unwrap()]).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        let NetworkCommand::AddBypasses { reply, .. } = receiver.try_recv().unwrap() else {
+        let NetworkCommand::PrepareBypasses { reply, .. } = receiver.try_recv().unwrap() else {
             panic!("expected upstream route request");
         };
         assert!(reply.is_closed(), "a delayed worker must skip the expired request");
+        assert!(matches!(receiver.try_recv().unwrap(), NetworkCommand::RollbackBypasses));
         drop(receiver);
         assert_eq!(
             controller.add_addresses(Vec::new()).await.unwrap_err().kind(),
             io::ErrorKind::NotConnected
         );
+    }
+
+    #[tokio::test]
+    async fn probe_guard_commits_or_rolls_back_before_the_next_preparation() {
+        let controller = WindowsRouteBypass::default();
+        let (sender, receiver) = mpsc::channel();
+        controller.attach(sender);
+        for commit in [false, true] {
+            let prepare = controller.prepare_addresses(vec!["198.51.100.7".parse().unwrap()]);
+            let respond = async {
+                tokio::task::yield_now().await;
+                let NetworkCommand::PrepareBypasses { reply, .. } = receiver.try_recv().unwrap() else {
+                    panic!("expected preparation");
+                };
+                reply.send(Ok(())).unwrap();
+            };
+            let (result, ()) = tokio::join!(prepare, respond);
+            let prepared = result.unwrap();
+            assert!(controller.operation.try_lock().is_err());
+            if commit {
+                prepared.commit().unwrap();
+                assert!(matches!(receiver.try_recv().unwrap(), NetworkCommand::CommitBypasses));
+            } else {
+                drop(prepared);
+                assert!(matches!(receiver.try_recv().unwrap(), NetworkCommand::RollbackBypasses));
+            }
+            assert!(controller.operation.try_lock().is_ok());
+        }
     }
 
     #[test]
