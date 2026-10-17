@@ -748,11 +748,19 @@ fn physical_route_metric(route: &MIB_IPFORWARD_ROW2, iface: &MIB_IPINTERFACE_ROW
         .then_some(iface.Metric)
 }
 
-pub(crate) fn physical_default_interface(tun_name: Option<&str>) -> Option<u32> {
+pub(crate) fn physical_default_interface(tun_name: Option<&str>, candidates: &[u32]) -> Option<u32> {
     use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex;
     let mut operations = IpHelperOperations;
     let tun_luid = tun_name.and_then(|name| operations.interface_luid(name).ok()).unwrap_or(0);
-    let routes = operations.physical_routes().ok()?;
+    let mut routes = operations.physical_routes().ok()?;
+    routes.retain(|(route, _)| {
+        let luid = NET_LUID_LH {
+            Value: route.interface_luid,
+        };
+        let mut index = 0;
+        // SAFETY: input LUID comes from the OS snapshot and output is writable.
+        (unsafe { ConvertInterfaceLuidToIndex(&luid, &mut index) }) == NO_ERROR && candidates.contains(&index)
+    });
     let route = select_physical_route(&routes, IpAddr::V4(Ipv4Addr::UNSPECIFIED), tun_luid, &[])?;
     let luid = NET_LUID_LH {
         Value: route.interface_luid,

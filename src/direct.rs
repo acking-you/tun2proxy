@@ -29,7 +29,7 @@ const DNS_TCP_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The physical interface direct relays egress through.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BindInterface {
+pub struct BindInterface {
     /// IPv4 interface index, used by Windows `IP_UNICAST_IF` and macOS
     /// `IP_BOUND_IF`.
     pub ipv4_index: u32,
@@ -59,11 +59,13 @@ impl BindInterface {
             .map(|network| network.addr())
             .find(|address| !address.is_unspecified() && !address.is_loopback());
         #[cfg(target_os = "windows")]
-        let (ipv4_index, ipv6_index) = windows_interface_indices(&iface)?;
+        let (ipv4_index, ipv6_index, dns_servers) = windows_interface_details(&iface)?;
         // Both BSD-style socket options take the same `if_nametoindex` value for
         // either family, so one index serves both.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let (ipv4_index, ipv6_index) = (iface.index, iface.index);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let dns_servers = iface.dns_servers;
 
         if ipv4_index == 0 && ipv6_index == 0 {
             return Err(format!("network interface `{}` has an invalid index 0", iface.name).into());
@@ -72,19 +74,19 @@ impl BindInterface {
             ipv4_index,
             ipv6_index,
             ipv4_addr,
-            dns_servers: iface.dns_servers,
+            dns_servers,
             name: iface.name,
         })
     }
 }
 
 #[cfg(target_os = "windows")]
-fn windows_interface_indices(iface: &netdev::Interface) -> std::io::Result<(u32, u32)> {
+fn windows_interface_details(iface: &netdev::Interface) -> std::io::Result<(u32, u32, Vec<IpAddr>)> {
     use std::ffi::CStr;
     use windows_sys::Win32::{
         Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS},
         NetworkManagement::IpHelper::{GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH},
-        Networking::WinSock::AF_UNSPEC,
+        Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6},
     };
 
     let mut size = 0_u32;
@@ -111,7 +113,27 @@ fn windows_interface_indices(iface: &netdev::Interface) -> std::io::Result<(u32,
             Some(unsafe { CStr::from_ptr(adapter.AdapterName.cast()) }.to_string_lossy())
         };
         if (iface.index != 0 && ipv4_index == iface.index) || adapter_name.as_deref() == Some(iface.name.as_str()) {
-            return Ok((ipv4_index, adapter.Ipv6IfIndex));
+            let mut dns_servers = Vec::new();
+            let mut dns = adapter.FirstDnsServerAddress;
+            while !dns.is_null() {
+                // SAFETY: nodes and addresses belong to the live, aligned
+                // GetAdaptersAddresses buffer. Check family-specific lengths
+                // before reading; an IPv4 address is shorter than SOCKADDR_IN6.
+                let row = unsafe { &*dns };
+                let address = row.Address;
+                if !address.lpSockaddr.is_null() && address.iSockaddrLength >= 2 {
+                    let family = unsafe { std::ptr::read_unaligned(address.lpSockaddr.cast::<u16>()) };
+                    if family == AF_INET && address.iSockaddrLength as usize >= std::mem::size_of::<SOCKADDR_IN>() {
+                        let address = unsafe { std::ptr::read_unaligned(address.lpSockaddr.cast::<SOCKADDR_IN>()) };
+                        dns_servers.push(IpAddr::V4(unsafe { address.sin_addr.S_un.S_addr }.to_ne_bytes().into()));
+                    } else if family == AF_INET6 && address.iSockaddrLength as usize >= std::mem::size_of::<SOCKADDR_IN6>() {
+                        let address = unsafe { std::ptr::read_unaligned(address.lpSockaddr.cast::<SOCKADDR_IN6>()) };
+                        dns_servers.push(IpAddr::V6(unsafe { address.sin6_addr.u.Byte }.into()));
+                    }
+                }
+                dns = row.Next;
+            }
+            return Ok((ipv4_index, adapter.Ipv6IfIndex, dns_servers));
         }
         current = adapter.Next;
     }
@@ -155,7 +177,10 @@ fn is_unusable_egress(iface: &netdev::Interface, tun_name: Option<&str>) -> bool
 
 /// Score a candidate so the best physical interface wins. Higher is better.
 fn egress_preference(iface: &netdev::Interface) -> (u8, u8, u8) {
+    #[cfg(not(target_os = "windows"))]
     let has_gateway = u8::from(iface.gateway.is_some());
+    #[cfg(target_os = "windows")]
+    let has_gateway = 0;
     let physical = u8::from(iface.is_physical());
     let usable_address = u8::from(
         iface
@@ -173,7 +198,7 @@ fn egress_preference(iface: &netdev::Interface) -> (u8, u8, u8) {
 /// `tun_name` names this session's TUN device so it can never be selected. Pass
 /// it even before the device exists: the address and type checks then still
 /// reject a leftover device from a previous session.
-pub(crate) fn detect(manual: Option<&str>, tun_name: Option<&str>) -> crate::Result<BindInterface> {
+pub fn detect(manual: Option<&str>, tun_name: Option<&str>) -> crate::Result<BindInterface> {
     match manual {
         Some(wanted) => {
             let iface = netdev::get_interfaces()
@@ -190,7 +215,13 @@ pub(crate) fn detect(manual: Option<&str>, tun_name: Option<&str>) -> crate::Res
         }
         None => {
             #[cfg(target_os = "windows")]
-            if let Some(index) = crate::windows_network_config::physical_default_interface(tun_name)
+            let candidates = netdev::get_interfaces()
+                .into_iter()
+                .filter(|iface| !is_unusable_egress(iface, tun_name))
+                .map(|iface| iface.index)
+                .collect::<Vec<_>>();
+            #[cfg(target_os = "windows")]
+            if let Some(index) = crate::windows_network_config::physical_default_interface(tun_name, &candidates)
                 && let Some(iface) = netdev::get_interfaces()
                     .into_iter()
                     .find(|iface| iface.index == index && !is_unusable_egress(iface, tun_name))
@@ -201,9 +232,11 @@ pub(crate) fn detect(manual: Option<&str>, tun_name: Option<&str>) -> crate::Res
             // address it would use for an arbitrary address, not by reading the
             // routing table. While TUN capture routes are installed that probe
             // resolves to the TUN itself, so the answer has to be filtered.
+            #[cfg(not(target_os = "windows"))]
             let candidate = netdev::get_default_interface()
                 .ok()
                 .filter(|iface| !is_unusable_egress(iface, tun_name));
+            #[cfg(not(target_os = "windows"))]
             if let Some(iface) = candidate {
                 return BindInterface::from_netdev(iface);
             }
@@ -343,7 +376,7 @@ fn apply_device_bind(socket: &Socket, peer: SocketAddr, iface: &BindInterface) -
 }
 
 /// Open a TCP connection to `peer` that egresses through `iface`.
-pub(crate) async fn connect_tcp_bound(peer: SocketAddr, iface: &BindInterface) -> std::io::Result<TcpStream> {
+pub async fn connect_tcp_bound(peer: SocketAddr, iface: &BindInterface) -> std::io::Result<TcpStream> {
     let domain = if peer.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     apply_device_bind(&socket, peer, iface)?;
@@ -367,7 +400,7 @@ pub(crate) async fn connect_tcp_bound(peer: SocketAddr, iface: &BindInterface) -
 }
 
 /// Open a connected UDP socket to `peer` that egresses through `iface`.
-pub(crate) fn bind_udp_bound(peer: SocketAddr, iface: &BindInterface) -> std::io::Result<tokio::net::UdpSocket> {
+pub fn bind_udp_bound(peer: SocketAddr, iface: &BindInterface) -> std::io::Result<tokio::net::UdpSocket> {
     let domain = if peer.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     apply_device_bind(&socket, peer, iface)?;
@@ -406,6 +439,27 @@ pub(crate) fn bind_udp_bound(peer: SocketAddr, iface: &BindInterface) -> std::io
     tokio::net::UdpSocket::from_std(std_socket)
 }
 
+/// Bind an unconnected UDP relay to a physical interface. Destination filtering
+/// and response ownership remain the caller's responsibility.
+pub fn bind_udp_unconnected(ipv6: bool, iface: &BindInterface) -> std::io::Result<tokio::net::UdpSocket> {
+    let address = if ipv6 {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    };
+    let socket = Socket::new(if ipv6 { Domain::IPV6 } else { Domain::IPV4 }, Type::DGRAM, Some(Protocol::UDP))?;
+    if ipv6 {
+        socket.set_only_v6(true)?;
+        socket.set_multicast_if_v6(iface.ipv6_index)?;
+    } else if let Some(address) = iface.ipv4_addr {
+        socket.set_multicast_if_v4(&address)?;
+    }
+    apply_device_bind(&socket, address, iface)?;
+    socket.bind(&SockAddr::from(address))?;
+    socket.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(socket.into())
+}
+
 /// Resolve a virtual-DNS name through a DNS socket pinned to the physical
 /// interface.
 ///
@@ -414,7 +468,7 @@ pub(crate) fn bind_udp_bound(peer: SocketAddr, iface: &BindInterface) -> std::io
 /// packet through `IP_UNICAST_IF`/`SO_BINDTODEVICE` guarantees that a process
 /// selected for bypass can recover from a fake address cached before the policy
 /// was changed.
-pub(crate) async fn resolve_domain_bound(
+pub async fn resolve_domain_bound(
     domain: &str,
     port: u16,
     dns_server: IpAddr,
@@ -466,11 +520,25 @@ async fn query_dns_bound(
     configured_dns: IpAddr,
     iface: &BindInterface,
 ) -> std::io::Result<hickory_proto::op::Message> {
-    let servers = direct_dns_servers(configured_dns, iface);
+    let servers = direct_dns_servers(configured_dns, iface)
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, 53))
+        .collect::<Vec<_>>();
+    query_dns_servers(request, request_id, expected_query, domain, &servers, iface).await
+}
+
+async fn query_dns_servers(
+    request: &[u8],
+    request_id: u16,
+    expected_query: &hickory_proto::op::Query,
+    domain: &str,
+    servers: &[SocketAddr],
+    iface: &BindInterface,
+) -> std::io::Result<hickory_proto::op::Message> {
     let mut last_error = None;
 
-    'servers: for dns_server in &servers {
-        let server = SocketAddr::new(*dns_server, 53);
+    'servers: for dns_server in servers {
+        let server = *dns_server;
         for _ in 0..DNS_UDP_ATTEMPTS {
             match tokio::time::timeout(DNS_UDP_TIMEOUT, query_dns_udp(request, request_id, expected_query, server, iface)).await {
                 Ok(Ok(response)) if response.truncation => break,
@@ -537,19 +605,45 @@ async fn query_dns_bound(
 
 fn direct_dns_servers(configured_dns: IpAddr, iface: &BindInterface) -> Vec<IpAddr> {
     let mut servers = Vec::new();
-    for address in iface.dns_servers.iter().copied().filter(is_usable_dns_server) {
+    // The shared Windows DNS service hides the requesting process. Resolve the
+    // portal locally as well as bypass names, so its cache cannot mix remote
+    // CDN answers into direct connections. Keep a custom resolver as fallback.
+    for address in PREFERRED_DNS_SERVERS
+        .into_iter()
+        .chain(iface.dns_servers.iter().copied())
+        .chain([configured_dns])
+        .filter(is_usable_dns_server)
+    {
         if !servers.contains(&address) {
             servers.push(address);
         }
     }
-    if is_usable_dns_server(&configured_dns) && !servers.contains(&configured_dns) {
-        servers.push(configured_dns);
-    }
     servers
 }
 
-pub(crate) fn preferred_dns_server(configured_dns: IpAddr, iface: &BindInterface) -> Option<IpAddr> {
-    direct_dns_servers(configured_dns, iface).into_iter().next()
+/// Ordered local resolvers, shared by portal and process-bypass lookups.
+pub const PREFERRED_DNS_SERVERS: [IpAddr; 3] = [
+    IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5)),
+    IpAddr::V4(Ipv4Addr::new(119, 29, 29, 29)),
+    IpAddr::V4(Ipv4Addr::new(223, 6, 6, 6)),
+];
+
+/// Forward one validated DNS message through the physical interface. A failed
+/// UDP query retries over TCP before moving to the next resolver; NXDOMAIN is
+/// authoritative and does not trigger fallback. No system resolver is involved.
+pub async fn query_bound(request: &[u8], configured_dns: IpAddr, iface: &BindInterface) -> std::io::Result<Vec<u8>> {
+    let message = hickory_proto::op::Message::from_vec(request).map_err(std::io::Error::other)?;
+    let query = crate::dns::validate_dns_query(&message).map_err(std::io::Error::other)?;
+    let name = query.name().to_ascii();
+    let started = std::time::Instant::now();
+    let response = query_dns_bound(request, message.id, query, &name, configured_dns, iface).await?;
+    log::debug!(
+        "Physical DNS {name} {:?} via {iface}: {:?}, elapsed={:?}",
+        query.query_type(),
+        response.response_code,
+        started.elapsed()
+    );
+    response.to_vec().map_err(std::io::Error::other)
 }
 
 fn is_usable_dns_server(address: &IpAddr) -> bool {
@@ -699,6 +793,7 @@ mod tests {
         assert_ne!(selected.ipv4_addr.map(IpAddr::V4), Some(tproxy_config::TUN_IPV4));
         assert!(selected.ipv4_index != 0 || selected.ipv6_index != 0);
 
+        #[cfg(not(target_os = "windows"))]
         if let Ok(os_default) = netdev::get_default_interface()
             && is_unusable_egress(&os_default, Some(tproxy_config::TUN_NAME))
         {
@@ -749,12 +844,15 @@ mod tests {
     }
 
     #[test]
-    fn direct_dns_prefers_physical_interface_resolvers() {
+    fn direct_dns_prefers_ali_and_tencent_then_adapter_and_custom_fallback() {
         let physical = "192.168.21.1".parse().unwrap();
         let configured = "8.8.8.8".parse().unwrap();
         let iface = test_interface(vec![physical]);
 
-        assert_eq!(direct_dns_servers(configured, &iface), vec![physical, configured]);
+        assert_eq!(
+            direct_dns_servers(configured, &iface),
+            PREFERRED_DNS_SERVERS.into_iter().chain([physical, configured]).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -762,7 +860,10 @@ mod tests {
         let configured = "1.1.1.1".parse().unwrap();
         let iface = test_interface(vec![configured]);
 
-        assert_eq!(direct_dns_servers(configured, &iface), vec![configured]);
+        assert_eq!(
+            direct_dns_servers(configured, &iface),
+            PREFERRED_DNS_SERVERS.into_iter().chain([configured]).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -774,15 +875,66 @@ mod tests {
             "224.0.0.251".parse().unwrap(),
         ]);
 
-        assert_eq!(direct_dns_servers(configured, &iface), vec![configured]);
+        assert_eq!(
+            direct_dns_servers(configured, &iface),
+            PREFERRED_DNS_SERVERS.into_iter().chain([configured]).collect::<Vec<_>>()
+        );
     }
 
-    #[test]
-    fn direct_dns_selects_the_physical_resolver_for_private_virtual_portals() {
-        let physical = "192.168.21.1".parse().unwrap();
-        let configured = "8.8.8.8".parse().unwrap();
-        let iface = test_interface(vec![physical]);
-
-        assert_eq!(preferred_dns_server(configured, &iface), Some(physical));
+    #[tokio::test]
+    async fn bound_dns_retries_truncated_udp_over_tcp_and_honors_resolver_order() {
+        use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+        use hickory_proto::rr::{Name, RecordType};
+        let iface = BindInterface::from_netdev(netdev::get_interfaces().into_iter().find(|iface| iface.is_loopback()).unwrap()).unwrap();
+        let first = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Windows TCP/UDP excluded-port ranges can differ. Ask each protocol
+        // for a free ephemeral port and keep the first pair both can bind.
+        let mut pair = None;
+        for _ in 0..32 {
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            match tokio::net::TcpListener::bind(udp.local_addr().unwrap()).await {
+                Ok(tcp) => {
+                    pair = Some((tcp, udp));
+                    break;
+                }
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied) => {}
+                Err(error) => panic!("cannot bind loopback DNS test peer: {error}"),
+            }
+        }
+        let (second, second_udp) = pair.expect("a shared TCP/UDP ephemeral test port");
+        let servers = [first.local_addr().unwrap(), second.local_addr().unwrap()];
+        let question = Query::query(Name::from_str("example.test.").unwrap(), RecordType::A);
+        let mut request = Message::new(42, MessageType::Query, OpCode::Query);
+        request.add_query(question.clone());
+        let request = request.to_vec().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let peers = async {
+                let mut buffer = [0; 4096];
+                let (len, client) = first.recv_from(&mut buffer).await.unwrap();
+                let mut response = Message::from_vec(&buffer[..len]).unwrap();
+                response.metadata.message_type = MessageType::Response;
+                response.metadata.response_code = ResponseCode::ServFail;
+                first.send_to(&response.to_vec().unwrap(), client).await.unwrap();
+                let (len, client) = second_udp.recv_from(&mut buffer).await.unwrap();
+                let mut response = Message::from_vec(&buffer[..len]).unwrap();
+                response.metadata.message_type = MessageType::Response;
+                response.metadata.truncation = true;
+                second_udp.send_to(&response.to_vec().unwrap(), client).await.unwrap();
+                let (mut tcp, _) = second.accept().await.unwrap();
+                let len = tcp.read_u16().await.unwrap() as usize;
+                tcp.read_exact(&mut buffer[..len]).await.unwrap();
+                let mut response = Message::from_vec(&buffer[..len]).unwrap();
+                response.metadata.message_type = MessageType::Response;
+                response.metadata.response_code = ResponseCode::NXDomain;
+                let response = response.to_vec().unwrap();
+                tcp.write_u16(response.len() as u16).await.unwrap();
+                tcp.write_all(&response).await.unwrap();
+            };
+            let lookup = query_dns_servers(&request, 42, &question, "example.test", &servers, &iface);
+            let (_, response) = tokio::join!(peers, lookup);
+            assert_eq!(response.unwrap().response_code, ResponseCode::NXDomain);
+        })
+        .await
+        .unwrap();
     }
 }

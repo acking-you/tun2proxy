@@ -45,12 +45,13 @@ pub(crate) struct ProcessMatcher {
     names: ProcessBypass,
     cache: Mutex<Cache>,
     lookup_slot: std::sync::Arc<tokio::sync::Semaphore>,
+    exclude_self: bool,
 }
 
 /// The socket owner's identity is pinned for the lifetime of one relay. An OS
 /// table refresh can lose an owner, recycle a UDP port, or see a different
 /// ancestor chain; none of those events is a change to this session's policy.
-pub(crate) struct SessionPolicy {
+pub struct SessionPolicy {
     names: ProcessBypass,
     identities: Vec<String>,
     changes: tokio::sync::watch::Receiver<u64>,
@@ -58,11 +59,11 @@ pub(crate) struct SessionPolicy {
 }
 
 impl SessionPolicy {
-    pub(crate) fn bypass(&self) -> bool {
+    pub fn bypass(&self) -> bool {
         self.bypass
     }
 
-    pub(crate) async fn wait_for_routing_change(mut self) {
+    pub async fn wait_for_routing_change(mut self) {
         loop {
             if self.changes.changed().await.is_err() {
                 std::future::pending::<()>().await;
@@ -92,6 +93,7 @@ impl ProcessMatcher {
             names,
             cache: Mutex::new(Cache::default()),
             lookup_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            exclude_self: false,
         })
     }
 
@@ -167,6 +169,12 @@ impl ProcessMatcher {
         }
         let mut identities = Vec::new();
         for pid in pids {
+            // Internal SOCKS connections carry already-classified TUN traffic.
+            // A selected ancestor (or the mandatory self rule) must never turn
+            // those connections into blanket direct forwarding.
+            if self.exclude_self && pid == std::process::id() {
+                continue;
+            }
             let names = cache.pid_names.entry(pid).or_insert_with(|| {
                 imp::process_names(pid)
                     .into_iter()
@@ -206,6 +214,30 @@ impl ProcessMatcher {
                 cache.fetched_at = Some(snapshot_started_at);
             }
         }
+    }
+}
+
+/// Applies user process rules to a local proxy's accepted loopback connections.
+/// Remote LAN peers are never looked up in the local OS socket table. The proxy
+/// process itself is excluded before ancestry matching to preserve TUN routing.
+pub struct LocalProcessMatcher(std::sync::Arc<ProcessMatcher>);
+
+impl LocalProcessMatcher {
+    pub fn new(names: ProcessBypass) -> Self {
+        Self(std::sync::Arc::new(ProcessMatcher {
+            names,
+            cache: Mutex::new(Cache::default()),
+            lookup_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            exclude_self: true,
+        }))
+    }
+
+    /// Match the caller's tuple (peer -> listener), never its reverse.
+    pub async fn match_tcp(&self, peer: SocketAddr, listener: SocketAddr) -> Option<SessionPolicy> {
+        if !self.0.names.is_configured() || !peer.ip().is_loopback() || !listener.ip().is_loopback() {
+            return None;
+        }
+        Some(self.0.match_session(IpProtocol::Tcp, peer, listener).await)
     }
 }
 

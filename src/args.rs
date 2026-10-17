@@ -420,6 +420,7 @@ impl std::fmt::Display for ArgVerbosity {
 /// - Virtual: Use a virtual DNS server to handle DNS queries, also known as Fake-IP mode
 /// - OverTcp: Use TCP to send DNS queries to the DNS server
 /// - Direct: Do not handle DNS by relying on DNS server bypassing
+/// - Physical: Resolve through ordered local resolvers on the physical interface (desktop only)
 #[repr(C)]
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum ArgDns {
@@ -427,6 +428,7 @@ pub enum ArgDns {
     OverTcp,
     #[default]
     Direct,
+    Physical,
 }
 
 #[cfg(target_os = "android")]

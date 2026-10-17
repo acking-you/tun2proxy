@@ -225,7 +225,13 @@ async fn general_run_async_with_process_bypass_inner(
 /// Returns either way. `direct::detect` rejects tunnels by name, type, and
 /// address regardless, so this only improves *which* physical interface is
 /// chosen; it is not what makes the selection correct.
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "windows")]
+async fn wait_for_physical_default_route(_tun_name: Option<&str>) {
+    // Windows reads the route table and filters tunnel interfaces directly;
+    // waiting for a source-address probe to stop choosing TUN is unnecessary.
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn wait_for_physical_default_route(tun_name: Option<&str>) {
     const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2000);
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);

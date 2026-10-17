@@ -39,6 +39,11 @@ pub struct VirtualDns {
 pub struct VirtualDnsState(Arc<Mutex<VirtualDns>>);
 
 impl VirtualDnsState {
+    /// Restore a cached fake address without allocating or rewriting mappings.
+    /// An unmapped pool address is rejected instead of sent to a physical NIC.
+    pub async fn resolve_ip(&self, address: IpAddr) -> std::io::Result<Option<Arc<str>>> {
+        crate::resolve_virtual_domain(Some(&self.0), address).await
+    }
     pub fn new(ip_pool: IpCidr) -> Self {
         Self(Arc::new(Mutex::new(VirtualDns::new(ip_pool))))
     }
@@ -435,6 +440,10 @@ mod tests {
         let mut resolver = resolver.lock().await;
         assert_eq!(resolver.find_or_allocate_ip("PLAY.GOOGLEAPIS.COM.".to_string()).unwrap(), address);
         assert_eq!(resolver.resolve_ip(&address).as_deref(), Some("play.googleapis.com"));
+        drop(resolver);
+        assert_eq!(recreated.resolve_ip(address).await.unwrap().as_deref(), Some("play.googleapis.com"));
+        assert!(recreated.resolve_ip("198.19.0.100".parse().unwrap()).await.is_err());
+        assert_eq!(recreated.resolve_ip("192.0.2.1".parse().unwrap()).await.unwrap(), None);
     }
 
     #[tokio::test]

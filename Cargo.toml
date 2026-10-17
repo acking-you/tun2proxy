@@ -74,11 +74,16 @@ bincode-next = "3.1.1"
 # these here avoids pulling them (and breaking the build) on iOS/Android, where
 # the platform VPN API owns per-application routing instead.
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
-netdev = "0.46.3"
 netstat2 = "0.11.2"
 socket2 = "0.6.5"
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+netdev = "0.46.3"
+
 [target.'cfg(target_os="windows")'.dependencies]
+# Gateway MAC discovery sends synchronous ARP probes, including to TUN portals.
+# Route selection and DNS only need passive IP Helper snapshots on Windows.
+netdev = { version = "0.46.3", default-features = false }
 windows-service = "0.8.1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
