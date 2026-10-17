@@ -25,6 +25,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: ./.github/actions/checkout-ipstack
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy, rustfmt
@@ -48,6 +49,9 @@ jobs:
         cargo clean
         cargo build --verbose
 
+    - name: Test
+      run: cargo test --all-features
+
     - name: Abort on error
       if: ${{ failure() }}
       run: echo "Some of jobs failed" && false
@@ -59,6 +63,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: ./.github/actions/checkout-ipstack
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy, rustfmt
@@ -85,6 +90,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: ./.github/actions/checkout-ipstack
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy, rustfmt
@@ -113,6 +119,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/checkout-ipstack
       - uses: dtolnay/rust-toolchain@stable
       - name: Check semver
         if: ${{ !cancelled() }}

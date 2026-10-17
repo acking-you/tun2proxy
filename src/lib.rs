@@ -66,7 +66,7 @@ pub const DEFAULT_MTU: u16 = 1500;
 mod android;
 mod args;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-mod direct;
+pub mod direct;
 mod directions;
 mod dns;
 mod dump_logger;
@@ -78,7 +78,11 @@ pub mod icmp;
 mod network_config;
 mod no_proxy;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+mod physical_dns;
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 mod process;
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+pub use process::{LocalProcessMatcher, SessionPolicy};
 mod process_bypass;
 mod proxy_handler;
 mod session_info;
@@ -610,7 +614,7 @@ pub async fn run_with_system_managed_network<D>(
 where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if args.setup || !args.bypass_process.is_empty() || args.bind_interface.is_some() {
+    if args.setup || !args.bypass_process.is_empty() || args.bind_interface.is_some() || args.dns == ArgDns::Physical {
         return Err("system-managed packet tunnels cannot configure routes, bind an interface or match processes".into());
     }
     run_with_preselected_egress(
@@ -644,6 +648,10 @@ where
 {
     log::info!("{} {} starting...", env!("CARGO_PKG_NAME"), version_info!());
     log::info!("Proxy {} server: {}", args.proxy.proxy_type, args.proxy.addr);
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    if args.dns == ArgDns::Physical {
+        return Err("physical DNS requires a desktop physical interface".into());
+    }
 
     let server_addr = args.proxy.addr;
     let key = args.proxy.credentials.clone();
@@ -930,6 +938,27 @@ where
                     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let bypass = false;
 
+                    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                    if info.dst.port() == DNS_PORT && (dns == ArgDns::Physical || bypass) {
+                        let result = run_until_process_policy_change(
+                            async {
+                                match direct_bind.as_deref() {
+                                    Some(iface) => physical_dns::tcp(&mut tcp, dns_addr, iface, ipv6_enabled).await,
+                                    None => Err(std::io::Error::other("physical DNS interface unavailable")),
+                                }
+                            },
+                            policy,
+                        )
+                        .await;
+                        if let Some(Err(error)) = result {
+                            let _ = tcp.abort();
+                            log::warn!("{info} physical DNS TCP failed: {error}");
+                        } else if result.is_none() {
+                            reset_tcp_after_policy_change(&mut tcp, info);
+                        }
+                        return;
+                    }
+
                     // Windows and platform VPNs advertise a private DNS portal.
                     // TCP fallback must use the same upstream resolver as UDP
                     // DNS; connecting the portal through SOCKS would loop/fail.
@@ -970,25 +999,10 @@ where
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let (handler_result, bind): (HandlerResult, Option<DirectBind>) = {
                         let mut info = info;
-                        let dns_destination = if bypass && info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
-                            direct_bind
-                                .as_deref()
-                                .and_then(|bind| direct::preferred_dns_server(dns_addr, bind))
-                                .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "no usable physical DNS resolver"))
-                                .map(Some)
+                        let bypass_destination = if bypass {
+                            restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await
                         } else {
-                            Ok(None)
-                        };
-                        let bypass_destination = match dns_destination {
-                            Ok(Some(resolver)) => {
-                                info.dst.set_ip(resolver);
-                                restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await
-                            }
-                            Ok(None) if bypass => {
-                                restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await
-                            }
-                            Ok(None) => Ok(()),
-                            Err(error) => Err(error),
+                            Ok(())
                         };
                         let domain_name = resolve_virtual_domain(virtual_dns.as_ref(), info.dst.ip()).await;
                         match (bypass_destination, domain_name, bypass) {
@@ -1093,14 +1107,12 @@ where
 
                     let relay = async {
                         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                        if info.dst.port() == DNS_PORT && (dns == ArgDns::Physical || bypass) {
+                            let iface = direct_bind.ok_or_else(|| std::io::Error::other("physical DNS interface unavailable"))?;
+                            return physical_dns::udp(udp, dns_addr, iface, ipv6_enabled).await.map_err(Into::into);
+                        }
+                        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                         if bypass {
-                            if info.dst.port() == DNS_PORT && is_private_ip(info.dst.ip()) {
-                                let resolver = direct_bind
-                                    .as_deref()
-                                    .and_then(|bind| direct::preferred_dns_server(dns_addr, bind))
-                                    .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "no usable physical DNS resolver"))?;
-                                info.dst.set_ip(resolver);
-                            }
                             restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await?;
                             let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
                             return handle_udp_associate_session(
@@ -1184,7 +1196,11 @@ where
                     let result = Some(relay.await);
 
                     if let Some(Err(err)) = result {
-                        log::debug!("Ending {info} with \"{err}\"");
+                        if matches!(&err, Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut) {
+                            log::debug!("Ending idle {info}: {err}");
+                        } else {
+                            log::warn!("Ending {info} with \"{err}\"");
+                        }
                     }
                 });
             }
@@ -1650,75 +1666,92 @@ async fn handle_udp_associate_session(
         let udp_server = create_udp_stream(&socket_queue, udp_addr, bind.as_ref()).await?;
         Ok::<_, Error>((server, udp_server))
     };
-    let (_server, mut udp_server) = tokio::time::timeout(setup_timeout, setup)
+    let (_server, udp_server) = tokio::time::timeout(setup_timeout, setup)
         .await
         .map_err(|_| Error::from(format!("{session_info} UDP association setup timed out after {setup_timeout:?}")))??;
 
-    let mut buf1 = [0_u8; 4096];
-    let mut buf2 = [0_u8; 4096];
-    loop {
-        tokio::select! {
-            len = udp_stack.read(&mut buf1) => {
-                let len = len?;
-                if len == 0 {
-                    break;
-                }
-                let buf1 = &buf1[..len];
+    log::info!(
+        "UDP relay {session_info}: route={proxy_type}, local={:?}, peer={:?}, interface={:?}",
+        udp_server.0.local_addr().ok(),
+        udp_server.0.peer_addr().ok(),
+        bind.as_ref()
+    );
+    let mut buf1 = vec![0_u8; u16::MAX as usize];
+    let mut buf2 = vec![0_u8; u16::MAX as usize];
+    let (mut sent, mut received) = (0u64, 0u64);
+    let result: crate::Result<()> = async {
+        loop {
+            tokio::select! {
+                len = udp_stack.recv(&mut buf1) => {
+                    let Some(len) = len? else { break; };
+                    let buf1 = &buf1[..len];
 
-                crate::traffic_status::traffic_status_update(len, 0)?;
+                    crate::traffic_status::traffic_status_update(len, 0)?;
 
-                if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
-                    let s5addr = if let Some(domain_name) = &domain_name {
-                        Address::DomainAddress(domain_name.to_string().into(), session_info.dst.port())
+                    if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
+                        let s5addr = if let Some(domain_name) = &domain_name {
+                            Address::DomainAddress(domain_name.to_string().into(), session_info.dst.port())
+                        } else {
+                            session_info.dst.into()
+                        };
+
+                        // Add SOCKS5 UDP header to the incoming data
+                        let mut s5_udp_data = Vec::<u8>::new();
+                        UdpHeader::new(0, s5addr).write_to_stream(&mut s5_udp_data)?;
+                        s5_udp_data.extend_from_slice(buf1);
+
+                        udp_server.0.send(&s5_udp_data).await?;
                     } else {
-                        session_info.dst.into()
-                    };
-
-                    // Add SOCKS5 UDP header to the incoming data
-                    let mut s5_udp_data = Vec::<u8>::new();
-                    UdpHeader::new(0, s5addr).write_to_stream(&mut s5_udp_data)?;
-                    s5_udp_data.extend_from_slice(buf1);
-
-                    udp_server.write_all(&s5_udp_data).await?;
-                } else {
-                    udp_server.write_all(buf1).await?;
+                        udp_server.0.send(buf1).await?;
+                    }
+                    sent += 1;
                 }
-            }
-            len = udp_server.read(&mut buf2) => {
-                let len = len?;
-                if len == 0 {
-                    break;
-                }
-                let buf2 = &buf2[..len];
+                len = udp_server.0.recv(&mut buf2) => {
+                    let len = len?;
+                    let buf2 = &buf2[..len];
 
-                crate::traffic_status::traffic_status_update(0, len)?;
+                    crate::traffic_status::traffic_status_update(0, len)?;
 
-                if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
-                    // Remove SOCKS5 UDP header from the server data
-                    let header = UdpHeader::retrieve_from_stream(&mut &buf2[..])?;
-                    let data = &buf2[header.len()..];
-
-                    let buf = if session_info.dst.port() == DNS_PORT {
-                        let mut message = dns::parse_data_to_dns_message(data, false)?;
-                        if !ipv6_enabled {
-                            dns::remove_ipv6_entries(&mut message);
+                    if let ProxyType::Socks4 | ProxyType::Socks5 = proxy_type {
+                        // RFC 1928 fragmentation is unsupported; a rejected packet
+                        // must not tear down an otherwise valid association.
+                        if buf2.len() < 4 || buf2[..3] != [0, 0, 0] {
+                            log::debug!("{session_info}: dropped malformed or fragmented SOCKS5 UDP response");
+                            continue;
                         }
-                        message.to_vec()?
-                    } else {
-                        data.to_vec()
-                    };
+                        // Remove SOCKS5 UDP header from the server data
+                        let header = match UdpHeader::retrieve_from_stream(&mut &buf2[..]) {
+                            Ok(header) => header,
+                            Err(error) => {
+                                log::debug!("{session_info}: dropped malformed SOCKS5 UDP response: {error}");
+                                continue;
+                            }
+                        };
+                        let data = &buf2[header.len()..];
 
-                    udp_stack.write_all(&buf).await?;
-                } else {
-                    udp_stack.write_all(buf2).await?;
+                        let buf = if session_info.dst.port() == DNS_PORT {
+                            let mut message = dns::parse_data_to_dns_message(data, false)?;
+                            if !ipv6_enabled {
+                                dns::remove_ipv6_entries(&mut message);
+                            }
+                            message.to_vec()?
+                        } else {
+                            data.to_vec()
+                        };
+
+                        udp_stack.send(&buf)?;
+                    } else {
+                        udp_stack.send(buf2)?;
+                    }
+                    received += 1;
                 }
             }
         }
+        Ok(())
     }
-
-    log::debug!("Ending {session_info}");
-
-    Ok(())
+    .await;
+    log::info!("Ending UDP relay {session_info}: sent_datagrams={sent}, received_datagrams={received}, result={result:?}");
+    result
 }
 
 async fn handle_dns_over_tcp_session(
@@ -1859,6 +1892,51 @@ async fn handle_proxy_session(server: &mut TcpStream, proxy_handler: Arc<Mutex<d
     }
     crate::traffic_status::traffic_status_update(tx, rx)?;
     Ok(proxy_handler.get_udp_associate())
+}
+
+#[cfg(test)]
+mod udp_datagram_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn direct_udp_preserves_empty_and_large_replies() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for payload in [Vec::new(), vec![42; 4096]] {
+                let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let destination = server.local_addr().unwrap();
+                let source = "127.0.0.1:12345".parse().unwrap();
+                let (sender, mut packets) = tokio::sync::mpsc::unbounded_channel();
+                let udp = IpStackUdpStream::new(source, destination, payload.clone(), sender, 1500, Duration::from_secs(30), None);
+                let handler = NoProxyManager::new()
+                    .new_proxy_handler(SessionInfo::new(source, destination, IpProtocol::Udp), None, true)
+                    .await
+                    .unwrap();
+                let relay = handle_udp_associate_session(udp, ProxyType::None, handler, None, false, None, Duration::from_secs(5));
+                let peer = async {
+                    let mut buffer = [0; 65535];
+                    let (length, client) = server.recv_from(&mut buffer).await.unwrap();
+                    assert_eq!(&buffer[..length], payload);
+                    server.send_to(&buffer[..length], client).await.unwrap();
+                    let mut datagram = Vec::new();
+                    while datagram.len() < payload.len() + 8 {
+                        let wire = packets.recv().await.unwrap().to_bytes().unwrap();
+                        assert!(wire.len() <= 1500);
+                        let offset = u16::from_be_bytes([wire[6], wire[7]]) & 0x1fff;
+                        assert_eq!(usize::from(offset) * 8, datagram.len());
+                        datagram.extend_from_slice(&wire[20..]);
+                    }
+                    assert_eq!(&datagram[8..], payload);
+                };
+                tokio::select! {
+                    result = relay => panic!("UDP relay closed before its reply: {result:?}"),
+                    _ = peer => {}
+                }
+                // Dropping the relay future closes its sockets and stack stream.
+            }
+        })
+        .await
+        .unwrap();
+    }
 }
 
 #[cfg(test)]

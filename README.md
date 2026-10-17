@@ -4,6 +4,18 @@
 # tun2proxy
 A tunnel interface for HTTP and SOCKS proxies on Linux, Android, macOS, iOS and Windows.
 
+This fork supports desktop `--dns physical`: query AliDNS `223.5.5.5`, Tencent
+DNSPod `119.29.29.29`, AliDNS `223.6.6.6`, then the physical adapter and configured
+resolver in order. DNS UDP and TCP sockets bind to that interface. Explicit
+process bypass uses this same resolver path, including cached Fake-IP recovery.
+Platform-managed VPN providers retain their existing DNS modes. On Windows,
+interface selection reads IP Helper snapshots without gateway MAC/ARP probing.
+
+Embedders can reuse `LocalProcessMatcher` for local HTTP/SOCKS connections. It
+matches only loopback callers and excludes the embedding process's own PID
+before ancestry matching, preserving TUN-to-proxy routing. UDP relays preserve
+empty and large datagrams and log route, socket endpoints and lifecycle counts.
+
 [![Crates.io](https://img.shields.io/crates/v/tun2proxy.svg)](https://crates.io/crates/tun2proxy)
 [![tun2proxy](https://docs.rs/tun2proxy/badge.svg)](https://docs.rs/tun2proxy)
 [![Documentation](https://img.shields.io/badge/docs-release-brightgreen.svg?style=flat)](https://docs.rs/tun2proxy)

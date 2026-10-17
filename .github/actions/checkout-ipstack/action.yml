@@ -1,0 +1,9 @@
+name: Checkout sibling IP stack
+description: Fetch the exact fork revision required by the path dependency
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        git clone --no-checkout https://github.com/acking-you/ipstack.git ../ipstack
+        git -C ../ipstack checkout 99ea5315aff12d632523f8e32d3fa1ea8cab5081
