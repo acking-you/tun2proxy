@@ -5,6 +5,7 @@ extern crate bincode_next as bincode;
 use crate::udpgw::UdpGwClient;
 use crate::{
     directions::{IncomingDataEvent, IncomingDirection, OutgoingDirection},
+    dns_routing::DnsOverride,
     http::HttpManager,
     no_proxy::NoProxyManager,
     session_info::{IpProtocol, SessionInfo},
@@ -70,6 +71,7 @@ mod args;
 pub mod direct;
 mod directions;
 mod dns;
+mod dns_routing;
 mod dns_transactions;
 mod dump_logger;
 mod error;
@@ -741,6 +743,18 @@ where
         });
         current
     });
+    #[cfg(windows)]
+    let dns_origins = if direct_bind.is_some() {
+        match dns_routing::QueryOrigins::start().await {
+            Ok(origins) => Some(origins),
+            Err(error) => {
+                log::warn!("Windows shared DNS caller attribution could not start: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let no_proxy_mgr: Arc<dyn ProxyHandlerManager> = Arc::new(NoProxyManager::new());
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     if process_bypass.is_configured() {
@@ -925,6 +939,18 @@ where
                 #[cfg(target_os = "windows")]
                 let direct_bind = egress_updates.as_ref().map(|updates| Arc::clone(&updates.borrow()));
                 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                let dns_override = dns_routing::ProcessDns {
+                    #[cfg(windows)]
+                    processes: process_bypass.clone(),
+                    #[cfg(windows)]
+                    origins: dns_origins.clone(),
+                    interface: direct_bind.clone(),
+                    configured_dns: dns_addr,
+                    ipv6: ipv6_enabled,
+                };
+                #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+                let dns_override = ();
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 // The source-process lookup may briefly touch the OS, so the
                 // bypass decision and handler creation run inside the per-session
@@ -939,6 +965,13 @@ where
                     };
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let bypass = policy.as_ref().is_some_and(process::SessionPolicy::bypass);
+                    #[cfg(windows)]
+                    let dns_override = dns_routing::ProcessDns {
+                        origins: dns_override
+                            .origins
+                            .filter(|_| policy.as_ref().is_none_or(process::SessionPolicy::may_delegate_dns)),
+                        ..dns_override
+                    };
                     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let bypass = false;
 
@@ -974,7 +1007,7 @@ where
                     if !bypass && dns == ArgDns::Virtual && info.dst.port() == DNS_PORT {
                         let relay = async {
                             match virtual_dns.clone() {
-                                Some(virtual_dns) => handle_virtual_dns_tcp_session(&mut tcp, virtual_dns).await,
+                                Some(virtual_dns) => handle_virtual_dns_tcp_session(&mut tcp, virtual_dns, dns_override.clone()).await,
                                 None => Err("virtual DNS manager is unavailable".into()),
                             }
                         };
@@ -987,6 +1020,28 @@ where
                         }
                         if let Some(Err(error)) = result {
                             log::debug!("{info} virtual DNS TCP session ended: {error}");
+                        }
+                        return;
+                    }
+
+                    // Ordinary DNS TCP keeps its existing streaming/pipelining
+                    // path. Only a shared Windows resolver needs per-question
+                    // routing through the caller-attribution service.
+                    if !bypass && dns == ArgDns::OverTcp && info.dst.port() == DNS_PORT && dns_override.active() {
+                        let relay = async {
+                            let handler = mgr.new_proxy_handler(info, None, false).await?;
+                            dns_routing::tcp(&mut tcp, handler, socket_queue, ipv6_enabled, dns_override).await
+                        };
+                        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                        let result = run_until_process_policy_change(relay, policy).await;
+                        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+                        let result = Some(relay.await);
+                        if result.is_none() {
+                            reset_tcp_after_policy_change(&mut tcp, info);
+                        }
+                        if let Some(Err(error)) = result {
+                            let _ = tcp.abort();
+                            log::warn!("{info} routed DNS TCP failed: {error}");
                         }
                         return;
                     }
@@ -1076,6 +1131,18 @@ where
                 let direct_bind = direct_bind.clone();
                 #[cfg(target_os = "windows")]
                 let direct_bind = egress_updates.as_ref().map(|updates| Arc::clone(&updates.borrow()));
+                #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+                let dns_override = dns_routing::ProcessDns {
+                    #[cfg(windows)]
+                    processes: process_bypass.clone(),
+                    #[cfg(windows)]
+                    origins: dns_origins.clone(),
+                    interface: direct_bind.clone(),
+                    configured_dns: dns_addr,
+                    ipv6: ipv6_enabled,
+                };
+                #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+                let dns_override = ();
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 #[cfg(feature = "udpgw")]
                 let udpgw_client = udpgw_client.clone();
@@ -1100,6 +1167,13 @@ where
                     };
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let bypass = local_multicast || policy.as_ref().is_some_and(process::SessionPolicy::bypass);
+                    #[cfg(windows)]
+                    let dns_override = dns_routing::ProcessDns {
+                        origins: dns_override
+                            .origins
+                            .filter(|_| policy.as_ref().is_none_or(process::SessionPolicy::may_delegate_dns)),
+                        ..dns_override
+                    };
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     if local_multicast {
                         log::debug!(
@@ -1138,11 +1212,11 @@ where
                             if dns == ArgDns::OverTcp {
                                 info.protocol = IpProtocol::Tcp;
                                 let proxy_handler = mgr.new_proxy_handler(info, None, false).await?;
-                                return handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled).await;
+                                return handle_dns_over_tcp_session(udp, proxy_handler, socket_queue, ipv6_enabled, dns_override).await;
                             }
                             if dns == ArgDns::Virtual {
                                 let virtual_dns = virtual_dns.ok_or("virtual DNS manager is unavailable")?;
-                                return handle_virtual_dns_session(udp, virtual_dns).await;
+                                return handle_virtual_dns_session(udp, virtual_dns, dns_override).await;
                             }
                             assert_eq!(dns, ArgDns::Direct);
                         }
@@ -1230,7 +1304,11 @@ where
     };
     let active_sessions = session_counts.snapshot().total;
     if !managed_tasks.is_empty() {
-        log::debug!("Stopping {} managed TUN child task(s) before network teardown", managed_tasks.len());
+        let shutdown_started = std::time::Instant::now();
+        log::info!(
+            "Stopping {} managed TUN child task(s), active sessions: {active_sessions}; network teardown follows",
+            managed_tasks.len()
+        );
         managed_tasks.abort_all();
         while let Some(result) = managed_tasks.join_next().await {
             if let Err(error) = result
@@ -1239,6 +1317,10 @@ where
                 log::error!("Managed TUN child task failed during shutdown: {error}");
             }
         }
+        log::info!(
+            "Managed TUN child tasks stopped in {:?}; restoring network state",
+            shutdown_started.elapsed()
+        );
     }
     forwarding_result?;
     Ok(active_sessions)
@@ -1323,7 +1405,11 @@ async fn system_managed_provider_rejects_os_setup_and_process_matching() {
     );
 }
 
-async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<VirtualDns>>) -> crate::Result<()> {
+async fn handle_virtual_dns_session(
+    mut udp: IpStackUdpStream,
+    dns: Arc<Mutex<VirtualDns>>,
+    dns_override: impl DnsOverride,
+) -> crate::Result<()> {
     let mut buf = [0_u8; 4096];
     loop {
         let len = match udp.read(&mut buf).await {
@@ -1337,6 +1423,11 @@ async fn handle_virtual_dns_session(mut udp: IpStackUdpStream, dns: Arc<Mutex<Vi
         if len == 0 {
             break;
         }
+        if dns_override.matches(&buf[..len]).await? {
+            let response = dns_override.answer(buf[..len].to_vec(), true).await?;
+            udp.send(&response)?;
+            continue;
+        }
         let (msg, qname, ip) = dns.lock().await.generate_query(&buf[..len])?;
         udp.write_all(&msg).await?;
         log::debug!("Virtual DNS query: {qname} -> {ip:?}");
@@ -1348,7 +1439,7 @@ fn is_virtual_dns_tls_probe(dns: ArgDns, portals: &[IpAddr], destination: Socket
     dns != ArgDns::Direct && destination.port() == DNS_OVER_TLS_PORT && portals.contains(&destination.ip())
 }
 
-async fn handle_virtual_dns_tcp_session<S>(mut tcp: S, dns: Arc<Mutex<VirtualDns>>) -> crate::Result<()>
+async fn handle_virtual_dns_tcp_session<S>(mut tcp: S, dns: Arc<Mutex<VirtualDns>>, dns_override: impl DnsOverride) -> crate::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1364,6 +1455,12 @@ where
 
         let mut query = vec![0_u8; query_len];
         tcp.read_exact(&mut query).await?;
+        if dns_override.matches(&query).await? {
+            let response = dns_override.answer(query, false).await?;
+            tcp.write_u16(u16::try_from(response.len())?).await?;
+            tcp.write_all(&response).await?;
+            continue;
+        }
         let (response, qname, ip) = dns.lock().await.generate_query(&query)?;
         let response_len = u16::try_from(response.len()).map_err(|_| "virtual DNS response exceeds TCP framing limit")?;
         tcp.write_u16(response_len).await?;
@@ -1759,32 +1856,27 @@ async fn handle_udp_associate_session(
 }
 
 async fn handle_dns_over_tcp_session(
-    mut udp_stack: IpStackUdpStream,
+    mut udp_stack: impl AsyncRead + AsyncWrite + Unpin,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
+    dns_override: impl DnsOverride,
 ) -> crate::Result<()> {
-    let (session_info, server_addr) = {
-        let handler = proxy_handler.lock().await;
-
-        (handler.get_session_info(), handler.get_server_addr())
-    };
-
-    let mut server = create_tcp_stream(&socket_queue, server_addr, None).await?;
-
+    let session_info = proxy_handler.lock().await.get_session_info();
+    let mut server = dns_routing::Upstream::new(proxy_handler, socket_queue);
     log::debug!("Beginning {session_info}");
-
-    let _ = handle_proxy_session(&mut server, proxy_handler).await?;
 
     let mut buf1 = [0_u8; 4096];
     let mut buf2 = [0_u8; 4096];
     let mut server_buffer = Vec::with_capacity(4096);
     let mut transactions = dns_transactions::Transactions::default();
+    let mut direct_queries = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             len = udp_stack.read(&mut buf1) => {
                 let len = len?;
                 if len == 0 {
+                    log::debug!("{session_info}: DNS datagram input ended");
                     break;
                 }
                 let buf1 = &buf1[..len];
@@ -1794,19 +1886,30 @@ async fn handle_dns_over_tcp_session(
                     continue;
                 };
 
-                // Insert the DNS message length in front of the payload
-                let len = u16::try_from(request.len())?;
-                let mut buf = Vec::with_capacity(std::mem::size_of::<u16>() + usize::from(len));
-                buf.extend_from_slice(&len.to_be_bytes());
-                buf.extend_from_slice(&request);
-
-                server.write_all(&buf).await?;
-
-                crate::traffic_status::traffic_status_update(buf.len(), 0)?;
+                if dns_override.matches(&request).await? {
+                    let resolver = dns_override.clone();
+                    // Transactions bounds and coalesces both routing paths.
+                    direct_queries.spawn(async move { resolver.answer(request, true).await });
+                } else {
+                    server.send(&request).await?;
+                }
+            }
+            response = direct_queries.join_next(), if !direct_queries.is_empty() => {
+                let response = response.expect("nonempty DNS task set").map_err(std::io::Error::other)??;
+                let mut message = dns::parse_data_to_dns_message(&response, false)?;
+                transactions.complete(&mut message)?;
+                udp_stack.write_all(&message.to_vec()?).await?;
             }
             len = server.read(&mut buf2) => {
                 let len = len?;
                 if len == 0 {
+                    log::debug!("{session_info}: DNS upstream closed");
+                    while let Some(response) = direct_queries.join_next().await {
+                        let response = response.map_err(std::io::Error::other)??;
+                        let mut message = dns::parse_data_to_dns_message(&response, false)?;
+                        transactions.complete(&mut message)?;
+                        udp_stack.write_all(&message.to_vec()?).await?;
+                    }
                     break;
                 }
                 server_buffer.extend_from_slice(&buf2[..len]);
@@ -2175,7 +2278,7 @@ mod virtual_dns_transport_tests {
     async fn virtual_dns_answers_length_prefixed_tcp_queries() {
         let (mut client, server) = tokio::io::duplex(4096);
         let resolver = VirtualDnsState::default().resolver();
-        let server_task = tokio::spawn(handle_virtual_dns_tcp_session(server, resolver));
+        let server_task = tokio::spawn(handle_virtual_dns_tcp_session(server, resolver, ()));
 
         let mut query = Message::new(7, MessageType::Query, OpCode::Query);
         query.add_query(Query::query(Name::from_ascii("example.com").unwrap(), RecordType::A));
