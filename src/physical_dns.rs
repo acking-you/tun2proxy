@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 static QUERIES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(crate::MAX_OUTSTANDING_DNS_QUERIES);
 
-async fn answer(request: &[u8], configured_dns: IpAddr, iface: &BindInterface, ipv6: bool, udp: bool) -> io::Result<Vec<u8>> {
+pub(crate) async fn answer(request: &[u8], configured_dns: IpAddr, iface: &BindInterface, ipv6: bool, udp: bool) -> io::Result<Vec<u8>> {
     let mut query = crate::dns::parse_data_to_dns_message(request, false).map_err(io::Error::other)?;
     crate::dns::validate_dns_query(&query).map_err(io::Error::other)?;
     let max_size = udp.then_some(usize::from(query.max_payload()));

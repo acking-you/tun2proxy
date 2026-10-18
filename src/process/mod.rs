@@ -63,6 +63,14 @@ impl SessionPolicy {
         self.bypass
     }
 
+    #[cfg(windows)]
+    pub(crate) fn may_delegate_dns(&self) -> bool {
+        // DNS Client runs inside svchost. A known independent DNS socket must
+        // retain its own policy, even if another caller recently asked the same
+        // question through the shared service.
+        self.identities.is_empty() || self.identities.iter().any(|name| name == "svchost")
+    }
+
     pub async fn wait_for_routing_change(mut self) {
         loop {
             if self.changes.changed().await.is_err() {
@@ -75,10 +83,18 @@ impl SessionPolicy {
     }
 }
 
-fn matches_policy(names: &ProcessBypass, identities: &[String]) -> bool {
+pub(crate) fn matches_policy(names: &ProcessBypass, identities: &[String]) -> bool {
     // Read a single policy snapshot, even if an update races this decision.
     let names = names.names();
     identities.iter().any(|name| names.contains(name))
+}
+
+#[cfg(windows)]
+pub(crate) fn dns_process_names(pid: u32) -> Vec<String> {
+    imp::process_names(pid)
+        .into_iter()
+        .map(|name| normalize_process_name(&name))
+        .collect()
 }
 
 impl ProcessMatcher {
