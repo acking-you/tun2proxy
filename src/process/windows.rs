@@ -47,9 +47,14 @@ pub(super) fn process_names(pid: u32) -> Vec<String> {
     // the path query as a narrow fallback for that race and older environments
     // where snapshot creation fails.
     if names.is_empty()
-        && let Some(name) = process_name_from_handle(pid)
+        && let Some(path) = process_path_from_handle(pid)
+        && let Some(name) = std::path::Path::new(&path).file_name().and_then(|name| name.to_str())
     {
-        names.push(name);
+        names.push(name.to_owned());
+    }
+    let profile = crate::ProcessProfile::WeGame;
+    if profile.matches_names(&names) || process_path_from_handle(pid).is_some_and(|path| profile.matches_path(&path)) {
+        names.push(profile.rule().to_owned());
     }
     names
 }
@@ -97,7 +102,7 @@ fn toolhelp_processes() -> HashMap<u32, SnapshotProcess> {
 /// Uses `PROCESS_QUERY_LIMITED_INFORMATION`, which the elevated context that TUN
 /// setup already requires can normally open for other processes. Protected
 /// processes may still reject it, which is why ToolHelp is the primary source.
-fn process_name_from_handle(pid: u32) -> Option<String> {
+fn process_path_from_handle(pid: u32) -> Option<String> {
     // Heap buffer large enough for the Windows extended path limit so we never
     // fail a real path with ERROR_INSUFFICIENT_BUFFER.
     let mut buf = vec![0u16; 32_768];
@@ -119,9 +124,5 @@ fn process_name_from_handle(pid: u32) -> Option<String> {
         String::from_utf16_lossy(&buf[..size as usize])
     };
 
-    std::path::Path::new(&name)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
+    Some(name)
 }
