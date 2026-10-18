@@ -18,7 +18,6 @@ pub use socks5_impl::protocol::UserKey;
 #[cfg(feature = "udpgw")]
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::{
-    collections::HashMap,
     io::ErrorKind,
     net::{IpAddr, SocketAddr},
     sync::{
@@ -71,6 +70,7 @@ mod args;
 pub mod direct;
 mod directions;
 mod dns;
+mod dns_transactions;
 mod dump_logger;
 mod error;
 mod general_api;
@@ -86,6 +86,8 @@ mod process;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub use process::{LocalProcessMatcher, SessionPolicy};
 mod process_bypass;
+mod process_profile;
+pub use process_profile::ProcessProfile;
 mod proxy_handler;
 mod session_info;
 pub mod socket_transfer;
@@ -1777,7 +1779,7 @@ async fn handle_dns_over_tcp_session(
     let mut buf1 = [0_u8; 4096];
     let mut buf2 = [0_u8; 4096];
     let mut server_buffer = Vec::with_capacity(4096);
-    let mut outstanding_queries = HashMap::new();
+    let mut transactions = dns_transactions::Transactions::default();
     loop {
         tokio::select! {
             len = udp_stack.read(&mut buf1) => {
@@ -1787,24 +1789,16 @@ async fn handle_dns_over_tcp_session(
                 }
                 let buf1 = &buf1[..len];
 
-                let query = dns::parse_data_to_dns_message(buf1, false)?;
-                let question = dns::validate_dns_query(&query)?.clone();
-                if outstanding_queries.contains_key(&query.id) {
-                    return Err(format!("duplicate in-flight DNS query ID {}", query.id).into());
-                }
-                if outstanding_queries.len() >= MAX_OUTSTANDING_DNS_QUERIES {
-                    return Err(format!(
-                        "DNS-over-TCP outstanding query limit reached ({MAX_OUTSTANDING_DNS_QUERIES})"
-                    )
-                    .into());
-                }
-                outstanding_queries.insert(query.id, question);
+                let Some(request) = transactions.prepare(buf1)? else {
+                    log::debug!("{session_info}: coalesced retransmitted DNS query");
+                    continue;
+                };
 
                 // Insert the DNS message length in front of the payload
-                let len = u16::try_from(buf1.len())?;
+                let len = u16::try_from(request.len())?;
                 let mut buf = Vec::with_capacity(std::mem::size_of::<u16>() + usize::from(len));
                 buf.extend_from_slice(&len.to_be_bytes());
-                buf.extend_from_slice(buf1);
+                buf.extend_from_slice(&request);
 
                 server.write_all(&buf).await?;
 
@@ -1820,10 +1814,7 @@ async fn handle_dns_over_tcp_session(
                 crate::traffic_status::traffic_status_update(0, len)?;
 
                 for mut message in dns::drain_tcp_messages(&mut server_buffer)? {
-                    let expected_query = outstanding_queries
-                        .remove(&message.id)
-                        .ok_or_else(|| format!("unsolicited DNS-over-TCP response ID {}", message.id))?;
-                    dns::validate_dns_response(&message, message.id, &expected_query)?;
+                    transactions.complete(&mut message)?;
 
                     let name = dns::extract_domain_from_dns_message(&message)?;
                     let ip = dns::extract_ipaddr_from_dns_message(&message);
