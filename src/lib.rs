@@ -1863,12 +1863,14 @@ async fn handle_dns_over_tcp_session(
     dns_override: impl DnsOverride,
 ) -> crate::Result<()> {
     let session_info = proxy_handler.lock().await.get_session_info();
-    let mut server = dns_routing::Upstream::new(proxy_handler, socket_queue);
+    let server = dns_routing::Upstream::new(proxy_handler, socket_queue);
+    let (requests, pending_requests) = tokio::sync::mpsc::channel(MAX_OUTSTANDING_DNS_QUERIES);
+    let (responses, mut pending_responses) = tokio::sync::mpsc::channel(MAX_OUTSTANDING_DNS_QUERIES);
+    let upstream = server.forward(pending_requests, responses);
+    tokio::pin!(upstream);
     log::debug!("Beginning {session_info}");
 
     let mut buf1 = [0_u8; 4096];
-    let mut buf2 = [0_u8; 4096];
-    let mut server_buffer = Vec::with_capacity(4096);
     let mut transactions = dns_transactions::Transactions::default();
     let mut direct_queries = tokio::task::JoinSet::new();
     loop {
@@ -1891,7 +1893,9 @@ async fn handle_dns_over_tcp_session(
                     // Transactions bounds and coalesces both routing paths.
                     direct_queries.spawn(async move { resolver.answer(request, true).await });
                 } else {
-                    server.send(&request).await?;
+                    // The transaction limit also bounds this queue. Never wait
+                    // for proxy negotiation before accepting the next datagram.
+                    requests.try_send(request).map_err(std::io::Error::other)?;
                 }
             }
             response = direct_queries.join_next(), if !direct_queries.is_empty() => {
@@ -1900,23 +1904,9 @@ async fn handle_dns_over_tcp_session(
                 transactions.complete(&mut message)?;
                 udp_stack.write_all(&message.to_vec()?).await?;
             }
-            len = server.read(&mut buf2) => {
-                let len = len?;
-                if len == 0 {
-                    log::debug!("{session_info}: DNS upstream closed");
-                    while let Some(response) = direct_queries.join_next().await {
-                        let response = response.map_err(std::io::Error::other)??;
-                        let mut message = dns::parse_data_to_dns_message(&response, false)?;
-                        transactions.complete(&mut message)?;
-                        udp_stack.write_all(&message.to_vec()?).await?;
-                    }
-                    break;
-                }
-                server_buffer.extend_from_slice(&buf2[..len]);
-
-                crate::traffic_status::traffic_status_update(0, len)?;
-
-                for mut message in dns::drain_tcp_messages(&mut server_buffer)? {
+            response = pending_responses.recv() => {
+                if let Some(response) = response {
+                    let mut message = dns::parse_data_to_dns_message(&response, false)?;
                     transactions.complete(&mut message)?;
 
                     let name = dns::extract_domain_from_dns_message(&message)?;
@@ -1930,6 +1920,26 @@ async fn handle_dns_over_tcp_session(
                     let packet = message.to_vec()?;
                     udp_stack.write_all(&packet).await?;
                 }
+            }
+            result = &mut upstream => {
+                // Flush answers already produced before EOF, along with any
+                // physical queries that were in flight when upstream ended.
+                while let Ok(response) = pending_responses.try_recv() {
+                    let mut message = dns::parse_data_to_dns_message(&response, false)?;
+                    transactions.complete(&mut message)?;
+                    if !ipv6_enabled {
+                        dns::remove_ipv6_entries(&mut message);
+                    }
+                    udp_stack.write_all(&message.to_vec()?).await?;
+                }
+                while let Some(response) = direct_queries.join_next().await {
+                    let response = response.map_err(std::io::Error::other)??;
+                    let mut message = dns::parse_data_to_dns_message(&response, false)?;
+                    transactions.complete(&mut message)?;
+                    udp_stack.write_all(&message.to_vec()?).await?;
+                }
+                result?;
+                break;
             }
         }
     }

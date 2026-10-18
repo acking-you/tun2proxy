@@ -231,6 +231,56 @@ async fn shared_udp_socket_splits_routes_and_coalesces_retries_with_colliding_id
 }
 
 #[tokio::test]
+async fn shared_dns_answers_direct_queries_during_stalled_proxy_negotiation() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let manager = crate::socks::SocksProxyManager::new(listener.local_addr().unwrap(), socks5_impl::protocol::Version::V5, None);
+        let handler = manager
+            .new_proxy_handler(
+                SessionInfo::new(
+                    "127.0.0.1:10001".parse().unwrap(),
+                    "192.0.2.53:53".parse().unwrap(),
+                    IpProtocol::Tcp,
+                ),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let (tx, input) = mpsc::unbounded_channel();
+        let (output, mut rx) = mpsc::unbounded_channel();
+        let relay = tokio::spawn(crate::handle_dns_over_tcp_session(
+            Packets { input, output },
+            handler,
+            None,
+            false,
+            TestResolver::new(),
+        ));
+        tx.send(request("google.com.")).unwrap();
+        let (mut upstream, _) = listener.accept().await.unwrap();
+        assert_eq!(upstream.read_u8().await.unwrap(), 5);
+        let methods = upstream.read_u8().await.unwrap();
+        upstream.read_exact(&mut vec![0; usize::from(methods)]).await.unwrap();
+        // The proxy has received the greeting but has not answered it. A later
+        // excluded caller on this same UDP socket must still receive its reply.
+        tx.send(request("lol.qq.com.")).unwrap();
+        assert_reply(&rx.recv().await.unwrap(), "lol.qq.com.", true);
+        upstream.write_all(&[5, 0]).await.unwrap();
+        let mut connect = [0; 10];
+        upstream.read_exact(&mut connect).await.unwrap();
+        assert_eq!(&connect[..4], &[5, 1, 0, 1]);
+        upstream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 53]).await.unwrap();
+        let forwarded = frame(&mut upstream).await;
+        send_frame(&mut upstream, &reply(&forwarded, false)).await;
+        upstream.shutdown().await.unwrap();
+        assert_reply(&rx.recv().await.unwrap(), "google.com.", false);
+        relay.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn tcp_and_fake_ip_queries_keep_game_answers_physical_and_other_routes_unchanged() {
     tokio::time::timeout(Duration::from_secs(3), async {
         for virtual_mode in [false, true] {

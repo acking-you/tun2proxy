@@ -359,7 +359,9 @@ impl QueryOrigins {
         Ok(Self(trace))
     }
     pub async fn bypass(&self, request: &[u8], processes: &crate::ProcessBypass) -> crate::Result<bool> {
-        if !self.0.healthy.load(Ordering::Relaxed) {
+        // Keep the trace alive for runtime rule changes, but avoid checkpoints
+        // and process snapshots while no caller can match the policy.
+        if !processes.is_configured() {
             return Ok(false);
         }
         let message = crate::dns::parse_data_to_dns_message(request, false)?;
@@ -375,7 +377,10 @@ impl QueryOrigins {
             }
             return Ok(false);
         }
-        let Some(pid) = self.0.state.pid(&question, Instant::now()).filter(|pid| *pid != std::process::id()) else {
+        if !self.0.healthy.swap(true, Ordering::Relaxed) {
+            log::info!("Windows DNS caller attribution recovered");
+        }
+        let Some(pid) = self.0.state.pid(&question, Instant::now()) else {
             return Ok(false);
         };
         let identities = tokio::task::spawn_blocking(move || crate::process::dns_process_names(pid))
@@ -463,6 +468,19 @@ mod tests {
         assert!(!origins.bypass(&request, &processes).await.unwrap());
         origins.0.state.record(question, std::process::id(), Instant::now());
         assert!(!origins.bypass(&request, &processes).await.unwrap());
+        let executable = std::env::current_exe().unwrap();
+        processes.set_names([executable.file_name().unwrap().to_string_lossy().into_owned()]);
+        assert!(origins.bypass(&request, &processes).await.unwrap());
+        // A busy consumer may miss one deadline without ending the ETW session.
+        let slot = origins.0.flush_slot.lock().await;
+        assert!(!origins.bypass(&request, &processes).await.unwrap());
+        assert!(!origins.0.healthy.load(Ordering::Relaxed));
+        processes.set_names([]);
+        assert!(!origins.bypass(&[], &processes).await.unwrap());
+        drop(slot);
+        processes.set_names([executable.file_name().unwrap().to_string_lossy().into_owned()]);
+        assert!(origins.bypass(&request, &processes).await.unwrap());
+        assert!(origins.0.healthy.load(Ordering::Relaxed));
         child.0.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
         child.0.wait().unwrap();
     }

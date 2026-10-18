@@ -123,10 +123,44 @@ impl Upstream {
         Ok(())
     }
 
-    pub async fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        match self.stream.as_mut() {
-            Some(stream) => stream.read(buffer).await,
-            None => std::future::pending().await,
+    /// Independently poll upstream negotiation and writes while the shared UDP
+    /// socket continues accepting questions for the physical resolver.
+    pub async fn forward(
+        mut self,
+        mut requests: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        responses: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) -> crate::Result<()> {
+        let Some(first) = requests.recv().await else { return Ok(()) };
+        self.send(&first).await?;
+        let (mut reader, mut writer) = self.stream.take().expect("send opened the upstream").into_split();
+        let send = async {
+            while let Some(request) = requests.recv().await {
+                writer.write_u16(u16::try_from(request.len())?).await?;
+                writer.write_all(&request).await?;
+                crate::traffic_status::traffic_status_update(request.len() + 2, 0)?;
+            }
+            Ok::<_, crate::Error>(())
+        };
+        let receive = async {
+            loop {
+                let mut prefix = [0; 2];
+                if reader.read(&mut prefix[..1]).await? == 0 {
+                    return Ok(());
+                }
+                reader.read_exact(&mut prefix[1..]).await?;
+                let mut response = vec![0; usize::from(u16::from_be_bytes(prefix))];
+                reader.read_exact(&mut response).await?;
+                crate::traffic_status::traffic_status_update(0, response.len() + 2)?;
+                if responses.send(response).await.is_err() {
+                    return Ok(());
+                }
+            }
+        };
+        // Dropping this owned future cancels both halves, including a stalled
+        // negotiation. No detached relay or extra task survives session cleanup.
+        tokio::select! {
+            result = send => result,
+            result = receive => result,
         }
     }
 
