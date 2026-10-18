@@ -98,6 +98,17 @@ pub(crate) struct Upstream {
     stream: Option<TcpStream>,
 }
 
+async fn write_request(stream: &mut (impl tokio::io::AsyncWrite + Unpin), request: &[u8]) -> crate::Result<()> {
+    // Keep the length and body in one write, preserving the existing framing
+    // path without adding a small prefix write that can trigger delayed ACKs.
+    let mut frame = Vec::with_capacity(request.len() + 2);
+    frame.extend_from_slice(&u16::try_from(request.len())?.to_be_bytes());
+    frame.extend_from_slice(request);
+    stream.write_all(&frame).await?;
+    crate::traffic_status::traffic_status_update(request.len() + 2, 0)?;
+    Ok(())
+}
+
 impl Upstream {
     pub fn new(handler: Arc<Mutex<dyn ProxyHandler>>, socket_queue: Option<Arc<SocketQueue>>) -> Self {
         Self {
@@ -114,13 +125,7 @@ impl Upstream {
             crate::handle_proxy_session(&mut stream, self.handler.clone()).await?;
             self.stream = Some(stream);
         }
-        let stream = self.stream.as_mut().expect("upstream was initialized");
-        let mut frame = Vec::with_capacity(request.len() + 2);
-        frame.extend_from_slice(&u16::try_from(request.len())?.to_be_bytes());
-        frame.extend_from_slice(request);
-        stream.write_all(&frame).await?;
-        crate::traffic_status::traffic_status_update(request.len() + 2, 0)?;
-        Ok(())
+        write_request(self.stream.as_mut().expect("upstream was initialized"), request).await
     }
 
     /// Independently poll upstream negotiation and writes while the shared UDP
@@ -132,12 +137,11 @@ impl Upstream {
     ) -> crate::Result<()> {
         let Some(first) = requests.recv().await else { return Ok(()) };
         self.send(&first).await?;
-        let (mut reader, mut writer) = self.stream.take().expect("send opened the upstream").into_split();
+        let mut stream = self.stream.take().expect("send opened the upstream");
+        let (mut reader, mut writer) = stream.split();
         let send = async {
             while let Some(request) = requests.recv().await {
-                writer.write_u16(u16::try_from(request.len())?).await?;
-                writer.write_all(&request).await?;
-                crate::traffic_status::traffic_status_update(request.len() + 2, 0)?;
+                write_request(&mut writer, &request).await?;
             }
             Ok::<_, crate::Error>(())
         };
