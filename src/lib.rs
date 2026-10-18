@@ -949,7 +949,7 @@ where
                     ipv6: ipv6_enabled,
                 };
                 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-                let dns_override = ();
+                let dns_override = dns_routing::NoDnsOverride;
                 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 // The source-process lookup may briefly touch the OS, so the
@@ -1142,7 +1142,7 @@ where
                     ipv6: ipv6_enabled,
                 };
                 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-                let dns_override = ();
+                let dns_override = dns_routing::NoDnsOverride;
                 let no_proxy_mgr = no_proxy_mgr.clone();
                 #[cfg(feature = "udpgw")]
                 let udpgw_client = udpgw_client.clone();
@@ -2278,7 +2278,7 @@ mod virtual_dns_transport_tests {
     async fn virtual_dns_answers_length_prefixed_tcp_queries() {
         let (mut client, server) = tokio::io::duplex(4096);
         let resolver = VirtualDnsState::default().resolver();
-        let server_task = tokio::spawn(handle_virtual_dns_tcp_session(server, resolver, ()));
+        let server_task = tokio::spawn(handle_virtual_dns_tcp_session(server, resolver, dns_routing::NoDnsOverride));
 
         let mut query = Message::new(7, MessageType::Query, OpCode::Query);
         query.add_query(Query::query(Name::from_ascii("example.com").unwrap(), RecordType::A));

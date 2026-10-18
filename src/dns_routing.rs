@@ -22,7 +22,12 @@ pub(crate) trait DnsOverride: Clone + Send + Sync + 'static {
     fn answer(&self, request: Vec<u8>, udp: bool) -> impl Future<Output = crate::Result<Vec<u8>>> + Send;
 }
 
-impl DnsOverride for () {
+#[cfg(any(test, not(any(target_os = "windows", target_os = "linux", target_os = "macos"))))]
+#[derive(Clone)]
+pub(crate) struct NoDnsOverride;
+
+#[cfg(any(test, not(any(target_os = "windows", target_os = "linux", target_os = "macos"))))]
+impl DnsOverride for NoDnsOverride {
     fn active(&self) -> bool {
         false
     }
