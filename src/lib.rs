@@ -393,6 +393,12 @@ async fn create_udp_stream(
     match &socket_queue {
         None => {
             let bind_addr = match peer {
+                // NetworkExtension's socket policy can accept connect() on a
+                // wildcard-bound loopback UDP socket, then reject its first
+                // send with EADDRNOTAVAIL. Bind the source to loopback before
+                // connecting to the local SOCKS relay.
+                SocketAddr::V4(addr) if addr.ip().is_loopback() => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+                SocketAddr::V6(addr) if addr.ip().is_loopback() => SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
                 SocketAddr::V4(_) => SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
                 SocketAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
             };
