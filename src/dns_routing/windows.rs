@@ -11,7 +11,16 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
-use windows_sys::{Win32::System::Diagnostics::Etw::*, core::GUID};
+use windows_sys::{
+    Win32::{
+        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, GetLastError, WAIT_OBJECT_0},
+        System::{
+            Diagnostics::Etw::*,
+            Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+        },
+    },
+    core::GUID,
+};
 
 const DNS_PROVIDER: GUID = GUID::from_u128(0x1c95126e_7eea_49a9_a3fe_a378b03ddb4d);
 const CHECKPOINT_PROVIDER: GUID = GUID::from_u128(0xf49c4833_7d74_4781_869c_bdb5e23601cb);
@@ -164,6 +173,93 @@ fn check(status: u32) -> io::Result<()> {
     }
 }
 
+fn check_start(status: u32, operation: &str) -> io::Result<()> {
+    check(status).map_err(|error| io::Error::other(format!("{operation} for Windows DNS attribution: {error}")))
+}
+
+fn trace_owner(name: &str) -> Option<u32> {
+    let suffix = name.strip_prefix("CipherRelay-DNS-")?;
+    let (pid, sequence) = suffix.split_once('-')?;
+    let pid = pid.parse::<u32>().ok().filter(|pid| *pid != 0)?;
+    sequence.parse::<u64>().ok()?;
+    Some(pid)
+}
+
+/// Real-time ETW sessions outlive an abruptly terminated controller. Repeated
+/// crashes/upgrades must not exhaust Windows' logger/provider slots. Only our
+/// exact session names with a provably absent owner are eligible for cleanup.
+fn reclaim_orphaned_traces() -> io::Result<usize> {
+    #[repr(C)]
+    struct QueryProperties {
+        value: EVENT_TRACE_PROPERTIES,
+        name: [u16; 1024],
+        file: [u16; 1024],
+    }
+    let mut count = 64;
+    let mut entries;
+    loop {
+        entries = (0..count)
+            .map(|_| {
+                let mut entry = Box::new(QueryProperties {
+                    value: EVENT_TRACE_PROPERTIES::default(),
+                    name: [0; 1024],
+                    file: [0; 1024],
+                });
+                entry.value.Wnode.BufferSize = std::mem::size_of::<QueryProperties>() as u32;
+                entry.value.LoggerNameOffset = std::mem::offset_of!(QueryProperties, name) as u32;
+                entry.value.LogFileNameOffset = std::mem::offset_of!(QueryProperties, file) as u32;
+                entry
+            })
+            .collect::<Vec<_>>();
+        let mut pointers = entries.iter_mut().map(|entry| &mut entry.value as *mut _).collect::<Vec<_>>();
+        let mut needed = 0;
+        // SAFETY: every pointer identifies a stable, writable allocation with
+        // enough space for both names; QueryAllTraces fills at most count rows.
+        let status = unsafe { QueryAllTracesW(pointers.as_mut_ptr(), count, &mut needed) };
+        if status == ERROR_MORE_DATA && needed > count && needed <= 1024 {
+            count = needed;
+            continue;
+        }
+        check(status)?;
+        entries.truncate(needed as usize);
+        break;
+    }
+    let mut reclaimed = 0;
+    for entry in entries {
+        let length = entry.name.iter().position(|unit| *unit == 0).unwrap_or(entry.name.len());
+        let name = String::from_utf16_lossy(&entry.name[..length]);
+        let Some(pid) = trace_owner(&name) else { continue };
+        // Access denied is not proof of death (protected processes and other
+        // users can be inaccessible). A reused, live PID is left alone too.
+        // SAFETY: the returned owned handle is closed immediately when valid.
+        let absent = unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                GetLastError() == ERROR_INVALID_PARAMETER
+            } else {
+                // Windows can retain an exited process object while another
+                // observer still holds a handle. Existence alone is not life.
+                let exited = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+                CloseHandle(handle);
+                exited
+            }
+        };
+        if !absent {
+            continue;
+        }
+        let mut properties = Properties::default();
+        // SAFETY: entry.name is NUL-terminated by the enumeration, and the
+        // queried logger handle addresses this exact session, not a replacement.
+        let handle = CONTROLTRACE_HANDLE {
+            Value: unsafe { entry.value.Wnode.Anonymous1.HistoricalContext },
+        };
+        check(unsafe { ControlTraceW(handle, entry.name.as_ptr(), &mut properties.value, EVENT_TRACE_CONTROL_STOP) })?;
+        reclaimed += 1;
+        log::info!("Reclaimed orphaned Windows DNS trace {name} after owner pid {pid} exited");
+    }
+    Ok(reclaimed)
+}
+
 struct Trace {
     control: CONTROLTRACE_HANDLE,
     reader: PROCESSTRACE_HANDLE,
@@ -177,6 +273,9 @@ struct Trace {
 
 impl Trace {
     fn start() -> io::Result<Self> {
+        if let Err(error) = reclaim_orphaned_traces() {
+            log::warn!("Could not inspect stale Windows DNS traces: {error}");
+        }
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let marker_id = NEXT.fetch_add(1, Ordering::Relaxed);
         let name = format!("CipherRelay-DNS-{}-{marker_id}\0", std::process::id());
@@ -185,7 +284,10 @@ impl Trace {
         let mut control = CONTROLTRACE_HANDLE::default();
         // SAFETY: name is NUL-terminated, properties includes the name buffer.
         // A collision is an error: never attach to or stop someone else's trace.
-        check(unsafe { StartTraceW(&mut control, name.as_ptr(), &mut properties.value) })?;
+        check_start(
+            unsafe { StartTraceW(&mut control, name.as_ptr(), &mut properties.value) },
+            "StartTraceW",
+        )?;
         let mut trace = Self {
             control,
             reader: PROCESSTRACE_HANDLE { Value: INVALID_TRACE },
@@ -226,33 +328,42 @@ impl Trace {
         // Timeout=0 would return before the providers are enabled. Wait for
         // activation so neither the first DNS event nor our checkpoint is lost.
         // SAFETY: EnableTraceEx2 copies the filter during this synchronous call.
-        check(unsafe {
-            EnableTraceEx2(
-                control,
-                &DNS_PROVIDER,
-                EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                5,
-                u64::MAX,
-                0,
-                1_000,
-                &parameters,
-            )
-        })?;
+        check_start(
+            unsafe {
+                EnableTraceEx2(
+                    control,
+                    &DNS_PROVIDER,
+                    EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                    5,
+                    u64::MAX,
+                    0,
+                    1_000,
+                    &parameters,
+                )
+            },
+            "EnableTraceEx2(DNS)",
+        )?;
         // A checkpoint in the same ordered event stream lets a query wait for
         // preceding DNS events without a polling thread or fixed per-query sleep.
-        check(unsafe { EventRegister(&CHECKPOINT_PROVIDER, None, std::ptr::null(), &mut trace.marker) })?;
-        check(unsafe {
-            EnableTraceEx2(
-                control,
-                &CHECKPOINT_PROVIDER,
-                EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                5,
-                u64::MAX,
-                0,
-                1_000,
-                std::ptr::null(),
-            )
-        })?;
+        check_start(
+            unsafe { EventRegister(&CHECKPOINT_PROVIDER, None, std::ptr::null(), &mut trace.marker) },
+            "EventRegister(checkpoint)",
+        )?;
+        check_start(
+            unsafe {
+                EnableTraceEx2(
+                    control,
+                    &CHECKPOINT_PROVIDER,
+                    EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                    5,
+                    u64::MAX,
+                    0,
+                    1_000,
+                    std::ptr::null(),
+                )
+            },
+            "EnableTraceEx2(checkpoint)",
+        )?;
         let mut logfile = EVENT_TRACE_LOGFILEW {
             LoggerName: name.as_ptr().cast_mut(),
             Context: Arc::as_ptr(&trace.state).cast_mut().cast(),
@@ -400,6 +511,90 @@ impl QueryOrigins {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orphan_cleanup_only_recognizes_exact_owned_session_names() {
+        assert_eq!(trace_owner("CipherRelay-DNS-1234-0"), Some(1234));
+        for name in [
+            "Other-DNS-1234-0",
+            "CipherRelay-DNS-0-1",
+            "CipherRelay-DNS-1234",
+            "CipherRelay-DNS-1234-0-extra",
+        ] {
+            assert_eq!(trace_owner(name), None, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Windows administrator ETW access; does not alter routes or DNS settings"]
+    async fn real_windows_dns_trace_can_start_and_stop_repeatedly() {
+        for _ in 0..3 {
+            let origins = QueryOrigins::start().await.expect("DNS attribution must start");
+            origins.0.synchronize().await.expect("DNS checkpoint must arrive");
+            drop(origins);
+        }
+    }
+
+    #[test]
+    #[ignore = "helper process for real_windows_dns_recovers_orphan_without_stopping_live_owner"]
+    fn dns_crash_fixture() {
+        let Some(marker) = std::env::var_os("CIPHERRELAY_DNS_CRASH_FIXTURE") else {
+            return;
+        };
+        let _trace = Trace::start().unwrap();
+        std::fs::write(marker, b"ready").unwrap();
+        // Deliberately bypass Drop, exactly as ExitProcess or a crash does.
+        std::process::exit(77);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Windows administrator ETW access; does not alter routes or DNS settings"]
+    async fn real_windows_dns_recovers_orphan_without_stopping_live_owner() {
+        let live = QueryOrigins::start().await.unwrap();
+        let marker = std::env::temp_dir().join(format!("dns-crash-fixture-{}.ready", std::process::id()));
+        struct Fixture {
+            child: std::process::Child,
+            marker: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_file(&self.marker);
+                let _ = reclaim_orphaned_traces();
+            }
+        }
+        let mut fixture = Fixture {
+            child: std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["dns_crash_fixture", "--ignored", "--nocapture"])
+                .env("CIPHERRELAY_DNS_CRASH_FIXTURE", &marker)
+                .spawn()
+                .unwrap(),
+            marker: marker.clone(),
+        };
+        let child_id = fixture.child.id();
+        assert_eq!(fixture.child.wait().unwrap().code(), Some(77));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"ready");
+        std::fs::remove_file(marker).unwrap();
+        let name = format!("CipherRelay-DNS-{child_id}-0\0").encode_utf16().collect::<Vec<_>>();
+        let query = || {
+            let mut properties = Properties::default();
+            unsafe {
+                ControlTraceW(
+                    CONTROLTRACE_HANDLE::default(),
+                    name.as_ptr(),
+                    &mut properties.value,
+                    EVENT_TRACE_CONTROL_QUERY,
+                )
+            }
+        };
+        assert_eq!(query(), 0, "The child left a real ETW session behind");
+        assert!(reclaim_orphaned_traces().unwrap() >= 1);
+        assert_ne!(query(), 0, "The orphan session was reclaimed");
+        live.0.synchronize().await.expect("The live owner's trace must be preserved");
+        drop(QueryOrigins::start().await.unwrap());
+    }
+
     #[tokio::test]
     #[ignore = "requires Windows administrator ETW access; makes external DNS queries, without changing networking"]
     async fn real_windows_dns_events_preserve_child_pid_and_runtime_policy() {
