@@ -555,6 +555,24 @@ async fn resolve_domain_over_proxy(
     ))
 }
 
+/// Destination policy supplied by an embedding application. DNS and explicit
+/// process bypass are handled before this policy; it governs ordinary UDP.
+#[derive(Clone, Debug)]
+pub enum UdpRoute {
+    Direct(SocketAddr),
+    Proxy,
+    Reject,
+}
+
+pub trait UdpRouter: std::fmt::Debug + Send + Sync {
+    fn route<'a>(
+        &'a self,
+        destination: SocketAddr,
+        domain: Option<&'a str>,
+        proxy_enabled: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = UdpRoute> + Send + 'a>>;
+}
+
 /// Run the proxy server
 /// # Arguments
 /// * `device` - The network device to use
@@ -1131,6 +1149,7 @@ where
                 let proxy_type = args.proxy.proxy_type;
                 let dns = args.dns;
                 let udp_strategy = args.udp_strategy;
+                let udp_router = args.udp_router.clone();
                 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 let process_matcher = process_matcher.clone();
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1227,11 +1246,43 @@ where
                             assert_eq!(dns, ArgDns::Direct);
                         }
 
-                        if udp_strategy == ArgUdpStrategy::Block {
-                            return Err(format!("non-DNS UDP blocked by policy for {}", info.dst).into());
+                        if udp_router.is_none() && udp_strategy == ArgUdpStrategy::Block {
+                            return udp.reject().map_err(Into::into);
                         }
 
-                        let domain_name = resolve_virtual_domain(virtual_dns.as_ref(), info.dst.ip()).await?;
+                        let domain_name = match resolve_virtual_domain(virtual_dns.as_ref(), info.dst.ip()).await {
+                            Ok(domain) => domain,
+                            Err(error) => {
+                                log::debug!("{info}: rejecting UDP destination: {error}");
+                                return udp.reject().map_err(Into::into);
+                            }
+                        };
+                        let route = match udp_router {
+                            Some(router) => Some(
+                                router
+                                    .route(info.dst, domain_name.as_deref(), udp_strategy == ArgUdpStrategy::Proxy)
+                                    .await,
+                            ),
+                            None => None,
+                        };
+                        if matches!(route, Some(UdpRoute::Reject)) {
+                            log::debug!("{info}: UDP rejected by destination policy");
+                            return udp.reject().map_err(Into::into);
+                        }
+                        if let Some(UdpRoute::Direct(destination)) = route {
+                            info.dst = destination;
+                            let handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
+                            return handle_udp_associate_session(
+                                udp,
+                                ProxyType::None,
+                                handler,
+                                socket_queue,
+                                ipv6_enabled,
+                                direct_bind,
+                                udp_setup_timeout,
+                            )
+                            .await;
+                        }
 
                         if udp_strategy == ArgUdpStrategy::Direct {
                             let dns_bind = if proxy_type == ProxyType::None {

@@ -170,6 +170,11 @@ pub struct Args {
     #[serde(default)]
     pub udp_strategy: ArgUdpStrategy,
 
+    /// Optional in-process destination policy. Not serialized or exposed by the CLI.
+    #[arg(skip)]
+    #[serde(skip)]
+    pub udp_router: Option<std::sync::Arc<dyn crate::UdpRouter>>,
+
     /// Relay ICMP Echo through proxy-everything's loopback SOCKS5 extension.
     /// This is not supported by ordinary SOCKS5 servers.
     #[arg(long)]
@@ -263,6 +268,7 @@ impl Default for Args {
             tcp_timeout: 600,
             udp_timeout: 10,
             udp_strategy: ArgUdpStrategy::default(),
+            udp_router: None,
             icmp_echo: false,
             verbosity: ArgVerbosity::Info,
             virtual_dns_pool: IpCidr::from_str("198.18.0.0/15").unwrap(),
