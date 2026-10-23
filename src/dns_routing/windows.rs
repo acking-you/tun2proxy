@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     io,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -13,7 +13,7 @@ use std::{
 use tokio::sync::Notify;
 use windows_sys::{
     Win32::{
-        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, GetLastError, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_TIMEOUT, GetLastError, WAIT_OBJECT_0},
         System::{
             Diagnostics::Etw::*,
             Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject},
@@ -27,6 +27,7 @@ const CHECKPOINT_PROVIDER: GUID = GUID::from_u128(0xf49c4833_7d74_4781_869c_bdb5
 const ORIGIN_TTL: Duration = Duration::from_secs(30);
 const MAX_ORIGINS: usize = 4096;
 const INVALID_TRACE: u64 = usize::MAX as u64;
+const START_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Hash, Eq, PartialEq, Clone)]
 struct Question {
@@ -175,6 +176,19 @@ fn check(status: u32) -> io::Result<()> {
 
 fn check_start(status: u32, operation: &str) -> io::Result<()> {
     check(status).map_err(|error| io::Error::other(format!("{operation} for Windows DNS attribution: {error}")))
+}
+
+fn check_enable(status: u32, operation: &str) -> io::Result<()> {
+    // EnableTraceEx2 has already requested activation. ERROR_TIMEOUT only says
+    // not all provider callbacks completed before the synchronous deadline;
+    // destroying this session would turn a slow callback into a permanent loss
+    // of caller attribution for the entire TUN lifetime.
+    if status == ERROR_TIMEOUT {
+        log::warn!("{operation} callback is still pending; retaining the Windows DNS trace for event delivery");
+        Ok(())
+    } else {
+        check_start(status, operation)
+    }
 }
 
 fn trace_owner(name: &str) -> Option<u32> {
@@ -328,7 +342,7 @@ impl Trace {
         // Timeout=0 would return before the providers are enabled. Wait for
         // activation so neither the first DNS event nor our checkpoint is lost.
         // SAFETY: EnableTraceEx2 copies the filter during this synchronous call.
-        check_start(
+        check_enable(
             unsafe {
                 EnableTraceEx2(
                     control,
@@ -349,7 +363,7 @@ impl Trace {
             unsafe { EventRegister(&CHECKPOINT_PROVIDER, None, std::ptr::null(), &mut trace.marker) },
             "EventRegister(checkpoint)",
         )?;
-        check_start(
+        check_enable(
             unsafe {
                 EnableTraceEx2(
                     control,
@@ -458,40 +472,86 @@ impl Drop for Trace {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct QueryOrigins(Arc<Trace>);
+async fn start_trace() -> io::Result<Arc<Trace>> {
+    let trace = Arc::new(tokio::task::spawn_blocking(Trace::start).await.map_err(io::Error::other)??);
+    tokio::time::timeout(Duration::from_secs(1), trace.synchronize())
+        .await
+        .map_err(io::Error::other)??;
+    Ok(trace)
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct QueryOrigins(Arc<OnceLock<Arc<Trace>>>);
 impl QueryOrigins {
-    pub async fn start() -> io::Result<Self> {
-        let trace = Arc::new(tokio::task::spawn_blocking(Trace::start).await.map_err(io::Error::other)??);
-        tokio::time::timeout(Duration::from_secs(1), trace.synchronize())
-            .await
-            .map_err(io::Error::other)??;
-        log::info!("Windows DNS caller attribution enabled for all process bypass rules");
-        Ok(Self(trace))
+    pub async fn start_recovering(tasks: &mut tokio::task::JoinSet<()>) -> Self {
+        Self::from_start(start_trace().await, tasks)
     }
+
+    fn from_start(result: io::Result<Arc<Trace>>, tasks: &mut tokio::task::JoinSet<()>) -> Self {
+        let origins = Self::default();
+        match result {
+            Ok(trace) => {
+                let _ = origins.0.set(trace);
+                log::info!("Windows DNS caller attribution ready for all process bypass rules");
+            }
+            Err(error) => {
+                log::warn!("Windows DNS caller attribution could not start; retrying in the background: {error}");
+                let pending = origins.clone();
+                // The TUN owns this task. Its shutdown drain cancels retries;
+                // DNS requests never wait for a retry or start their own trace.
+                tasks.spawn(async move {
+                    loop {
+                        tokio::time::sleep(START_RETRY_INTERVAL).await;
+                        match start_trace().await {
+                            Ok(trace) => {
+                                let _ = pending.0.set(trace);
+                                log::info!("Windows DNS caller attribution recovered after startup failure");
+                                break;
+                            }
+                            Err(error) => log::warn!("Windows DNS caller attribution retry failed: {error}"),
+                        }
+                    }
+                });
+            }
+        }
+        origins
+    }
+
+    #[cfg(test)]
+    async fn start() -> io::Result<Self> {
+        Ok(Self(Arc::new(OnceLock::from(start_trace().await?))))
+    }
+
+    fn trace(&self) -> Option<&Arc<Trace>> {
+        self.0.get()
+    }
+
     pub async fn bypass(&self, request: &[u8], processes: &crate::ProcessBypass) -> crate::Result<bool> {
         // Keep the trace alive for runtime rule changes, but avoid checkpoints
         // and process snapshots while no caller can match the policy.
         if !processes.is_configured() {
             return Ok(false);
         }
+        let Some(trace) = self.trace() else {
+            return Ok(false);
+        };
         let message = crate::dns::parse_data_to_dns_message(request, false)?;
         let query = crate::dns::validate_dns_query(&message)?;
         let question = Question::new(&query.name().to_ascii(), query.query_type().into());
-        if let Err(error) = tokio::time::timeout(Duration::from_secs(1), self.0.synchronize())
+        if let Err(error) = tokio::time::timeout(Duration::from_secs(1), trace.synchronize())
             .await
             .map_err(io::Error::other)
             .and_then(|r| r)
         {
-            if self.0.healthy.swap(false, Ordering::Relaxed) {
+            if trace.healthy.swap(false, Ordering::Relaxed) {
                 log::warn!("Windows DNS caller attribution unavailable; socket ownership still applies: {error}");
             }
             return Ok(false);
         }
-        if !self.0.healthy.swap(true, Ordering::Relaxed) {
+        if !trace.healthy.swap(true, Ordering::Relaxed) {
             log::info!("Windows DNS caller attribution recovered");
         }
-        let Some(pid) = self.0.state.pid(&question, Instant::now()) else {
+        let Some(pid) = trace.state.pid(&question, Instant::now()) else {
             return Ok(false);
         };
         let identities = tokio::task::spawn_blocking(move || crate::process::dns_process_names(pid))
@@ -512,6 +572,18 @@ impl QueryOrigins {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn provider_timeout_is_pending_and_shutdown_cancels_startup_retry() {
+        assert!(check_enable(ERROR_TIMEOUT, "test provider").is_ok());
+        assert!(check_enable(5, "test provider").is_err());
+        let mut tasks = tokio::task::JoinSet::new();
+        let origins = QueryOrigins::from_start(Err(io::Error::other("injected startup failure")), &mut tasks);
+        let processes = crate::ProcessBypass::new(["game.exe".into()]);
+        assert!(!origins.bypass(&[], &processes).await.unwrap());
+        tasks.shutdown().await;
+        assert!(origins.trace().is_none());
+    }
+
     #[test]
     fn orphan_cleanup_only_recognizes_exact_owned_session_names() {
         assert_eq!(trace_owner("CipherRelay-DNS-1234-0"), Some(1234));
@@ -530,7 +602,7 @@ mod tests {
     async fn real_windows_dns_trace_can_start_and_stop_repeatedly() {
         for _ in 0..3 {
             let origins = QueryOrigins::start().await.expect("DNS attribution must start");
-            origins.0.synchronize().await.expect("DNS checkpoint must arrive");
+            origins.trace().unwrap().synchronize().await.expect("DNS checkpoint must arrive");
             drop(origins);
         }
     }
@@ -591,7 +663,11 @@ mod tests {
         assert_eq!(query(), 0, "The child left a real ETW session behind");
         assert!(reclaim_orphaned_traces().unwrap() >= 1);
         assert_ne!(query(), 0, "The orphan session was reclaimed");
-        live.0.synchronize().await.expect("The live owner's trace must be preserved");
+        live.trace()
+            .unwrap()
+            .synchronize()
+            .await
+            .expect("The live owner's trace must be preserved");
         drop(QueryOrigins::start().await.unwrap());
     }
 
@@ -607,7 +683,18 @@ mod tests {
             drop(QueryOrigins::start().await.unwrap());
         }
         println!("Ten cold starts and cleanups completed in {:?}", started.elapsed());
-        let origins = QueryOrigins::start().await.unwrap();
+        // A transient startup failure must not strand existing DNS relays with
+        // a permanent None. The retry opens a real, independently owned trace.
+        let mut recovery = tokio::task::JoinSet::new();
+        let pending = QueryOrigins::from_start(Err(io::Error::other("injected startup failure")), &mut recovery);
+        let origins = pending.clone();
+        assert!(origins.trace().is_none());
+        tokio::time::timeout(START_RETRY_INTERVAL + Duration::from_secs(5), recovery.join_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(origins.trace().is_some());
         let host = format!("codex-dns-{}.example.com", std::process::id());
         let script =
             format!("$t = [System.Net.Dns]::GetHostAddressesAsync('{host}'); Write-Output 'started'; [Console]::ReadLine() | Out-Null");
@@ -634,8 +721,8 @@ mod tests {
         let question = Question::new(&host, 1);
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                origins.0.synchronize().await.unwrap();
-                if origins.0.state.pid(&question, Instant::now()) == Some(child.0.id()) {
+                origins.trace().unwrap().synchronize().await.unwrap();
+                if origins.trace().unwrap().state.pid(&question, Instant::now()) == Some(child.0.id()) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -661,21 +748,21 @@ mod tests {
         super::super::tests::verify_real_process_dns_routing(&host, processes.clone(), origins.clone()).await;
         processes.set_names(["unrelated.exe".into()]);
         assert!(!origins.bypass(&request, &processes).await.unwrap());
-        origins.0.state.record(question, std::process::id(), Instant::now());
+        origins.trace().unwrap().state.record(question, std::process::id(), Instant::now());
         assert!(!origins.bypass(&request, &processes).await.unwrap());
         let executable = std::env::current_exe().unwrap();
         processes.set_names([executable.file_name().unwrap().to_string_lossy().into_owned()]);
         assert!(origins.bypass(&request, &processes).await.unwrap());
         // A busy consumer may miss one deadline without ending the ETW session.
-        let slot = origins.0.flush_slot.lock().await;
+        let slot = origins.trace().unwrap().flush_slot.lock().await;
         assert!(!origins.bypass(&request, &processes).await.unwrap());
-        assert!(!origins.0.healthy.load(Ordering::Relaxed));
+        assert!(!origins.trace().unwrap().healthy.load(Ordering::Relaxed));
         processes.set_names([]);
         assert!(!origins.bypass(&[], &processes).await.unwrap());
         drop(slot);
         processes.set_names([executable.file_name().unwrap().to_string_lossy().into_owned()]);
         assert!(origins.bypass(&request, &processes).await.unwrap());
-        assert!(origins.0.healthy.load(Ordering::Relaxed));
+        assert!(origins.trace().unwrap().healthy.load(Ordering::Relaxed));
         child.0.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
         child.0.wait().unwrap();
     }

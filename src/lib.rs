@@ -769,13 +769,7 @@ where
     });
     #[cfg(windows)]
     let dns_origins = if direct_bind.is_some() {
-        match dns_routing::QueryOrigins::start().await {
-            Ok(origins) => Some(origins),
-            Err(error) => {
-                log::warn!("Windows shared DNS caller attribution could not start: {error}");
-                None
-            }
-        }
+        Some(dns_routing::QueryOrigins::start_recovering(&mut managed_tasks).await)
     } else {
         None
     };
