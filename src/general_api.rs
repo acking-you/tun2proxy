@@ -45,7 +45,7 @@ pub(crate) fn tun2proxy_stop_internal() -> c_int {
 }
 
 pub fn general_run_for_api(args: Args, tun_mtu: u16, packet_information: bool) -> c_int {
-    log::set_max_level(args.verbosity.into());
+    log::set_max_level(args.verbosity);
     if let Err(err) = log::set_boxed_logger(Box::<crate::dump_logger::DumpLogger>::default()) {
         log::debug!("set logger error: {err}");
     }
@@ -67,19 +67,26 @@ pub fn general_run_for_api(args: Args, tun_mtu: u16, packet_information: bool) -
         return -3;
     };
     let args_clone = args.clone();
-    let res = rt.block_on(async move {
+    let (timer_cancel_tx, timer_cancel_rx) = std::sync::mpsc::channel();
+    let (res, timer_handle) = rt.block_on(async move {
         let ret = general_run_async(args_clone, tun_mtu, packet_information, shutdown_token).await;
         // Spawn a std thread to force exit after timeout so it isn't cancelled
         // when the tokio runtime is dropped.
-        let _h = std::thread::spawn(move || {
-            // Delay some seconds then try to exit current process if not exited yet, normally this case should not happen
-            std::thread::sleep(crate::FORCE_EXIT_TIMEOUT);
-            log::info!("Forcing exit now.");
-            std::process::exit(-1);
+        let timer_handle = std::thread::spawn(move || {
+            if timer_cancel_rx.recv_timeout(crate::FORCE_EXIT_TIMEOUT).is_err() {
+                // Delay some seconds then try to exit current process if not exited yet, normally this case should not happen
+                log::info!("Forcing exit now.");
+                std::process::exit(-1);
+            }
+            log::info!("Exit timer cancelled. Exiting normally without forcing exit.");
         });
         tokio::time::sleep(std::time::Duration::from_micros(100)).await;
-        ret
+        (ret, timer_handle)
     });
+    drop(rt);
+    let _ = timer_cancel_tx.send(());
+    let _ = timer_handle.join();
+    log::info!("General run for API exiting normally.");
 
     let res = match res {
         Ok(sessions) => {
@@ -341,8 +348,16 @@ async fn general_run_async_with_process_bypass_setup(
     ready: &mut Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 ) -> std::io::Result<usize> {
     crate::icmp::validate_options(&args)?;
-    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
     let mut args = args;
+    // Resolve a proxy host name once, before any capture route exists, and
+    // hand the forwarding loop the same address the bypass route is built for.
+    let proxy_addr = match args.proxy.addr.as_ref() {
+        Some(addr) => addr.resolve_using_tokio().await?.next(),
+        None => None,
+    };
+    if let Some(addr) = proxy_addr {
+        args.proxy.addr = Some(addr.into());
+    }
     // Capture this before creating our adapter. If setup later fails, the
     // diagnostic can identify tunnel software that was already active rather
     // than mistakenly reporting the adapter created by this invocation.
@@ -445,7 +460,7 @@ async fn general_run_async_with_process_bypass_setup(
     #[allow(unused_variables)]
     let mut tproxy_args = tproxy_config::TproxyArgs::new()
         .tun_dns(args.dns_addr)
-        .proxy_addr(args.proxy.addr)
+        .proxy_addr(proxy_addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0))))
         .bypass_ips(&args.bypass)
         .ipv6_default_route(args.ipv6_enabled);
 
@@ -517,7 +532,7 @@ async fn general_run_async_with_process_bypass_setup(
         let _ = ready.send(Ok(()));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "unshare"))]
     {
         let mut admin_command_args = args.admin_command.iter();
         if let Some(command) = admin_command_args.next() {

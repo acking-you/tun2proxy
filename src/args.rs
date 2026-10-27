@@ -1,12 +1,8 @@
-use crate::{Error, Result};
-use socks5_impl::protocol::UserKey;
-use tproxy_config::IpCidr;
-
-#[cfg(target_os = "linux")]
-use std::ffi::OsString;
-
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use crate::Result;
+use socks5_impl::ProxyParameters;
+use std::net::IpAddr;
 use std::str::FromStr;
+use tproxy_config::IpCidr;
 
 #[macro_export]
 macro_rules! version_info {
@@ -26,8 +22,8 @@ pub struct Args {
     /// where proto is one of socks4, socks5, http.
     /// Username and password are encoded in percent encoding. For example:
     /// socks5://myname:pass%40word@127.0.0.1:1080
-    #[arg(short, long, value_parser = |s: &str| ArgProxy::try_from(s), value_name = "URL")]
-    pub proxy: ArgProxy,
+    #[arg(short, long, value_parser = |s: &str| ProxyParameters::try_from(s), value_name = "URL")]
+    pub proxy: ProxyParameters,
 
     /// Name of the tun interface, such as tun0, utun4, etc.
     /// If this option is not provided, the OS will generate a random one.
@@ -42,29 +38,28 @@ pub struct Args {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tun_fd: Option<i32>,
 
-    /// Set whether to close the received raw file descriptor on drop or not.
-    /// This setting is dependent on [tun_fd].
+    /// Close the received file descriptor on drop (requires --tun-fd).
     #[cfg(unix)]
-    #[arg(long, value_name = "true or false", conflicts_with = "tun", requires = "tun_fd")]
+    #[arg(long, value_name = "BOOL", conflicts_with = "tun", requires = "tun_fd")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close_fd_on_drop: Option<bool>,
 
     /// Create a tun interface in a newly created unprivileged namespace
     /// while maintaining proxy connectivity via the global network namespace.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "unshare"))]
     #[arg(long)]
     pub unshare: bool,
 
     /// Create a pidfile of `unshare` process when using `--unshare`.
-    #[cfg(target_os = "linux")]
-    #[arg(long)]
+    #[cfg(all(target_os = "linux", feature = "unshare"))]
+    #[arg(long, value_name = "path")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unshare_pidfile: Option<String>,
 
     /// File descriptor for UNIX datagram socket meant to transfer
     /// network sockets from global namespace to the new one.
     /// See `unshare(1)`, `namespaces(7)`, `sendmsg(2)`, `unix(7)`.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "unshare"))]
     #[arg(long, value_name = "fd", hide(true))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket_transfer_fd: Option<i32>,
@@ -72,9 +67,9 @@ pub struct Args {
     /// Specify a command to run with root-like capabilities in the new namespace
     /// when using `--unshare`.
     /// This could be useful to start additional daemons, e.g. `openvpn` instance.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "unshare"))]
     #[arg(requires = "unshare")]
-    pub admin_command: Vec<OsString>,
+    pub admin_command: Vec<std::ffi::OsString>,
 
     /// IPv6 enabled
     #[arg(short = '6', long)]
@@ -159,6 +154,14 @@ pub struct Args {
     #[arg(long, value_name = "seconds", default_value = "600")]
     pub tcp_timeout: u64,
 
+    /// MSS advertised in the SYN-ACK to the kernel side. By default the userspace
+    /// stack sends no MSS option, so the peer OS falls back to its own default
+    /// (e.g. 512 on macOS), fragmenting large first segments such as a TLS
+    /// ClientHello. Set this to the tunnel's (MTU - 40) to let the peer send big
+    /// segments. `None` keeps the previous behaviour (no option advertised).
+    #[arg(long, value_name = "bytes")]
+    pub tcp_mss: Option<u16>,
+
     /// UDP timeout in seconds
     #[arg(long, value_name = "seconds", default_value = "10")]
     pub udp_timeout: u64,
@@ -180,10 +183,6 @@ pub struct Args {
     #[arg(long)]
     #[serde(default)]
     pub icmp_echo: bool,
-
-    /// Verbosity level
-    #[arg(short, long, value_name = "level", value_enum, default_value = "info")]
-    pub verbosity: ArgVerbosity,
 
     /// Daemonize for unix family or run as Windows service
     #[arg(long)]
@@ -209,7 +208,7 @@ pub struct Args {
     #[cfg(feature = "udpgw")]
     #[arg(long, value_name = "IP:PORT")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub udpgw_server: Option<SocketAddr>,
+    pub udpgw_server: Option<std::net::SocketAddr>,
 
     /// Max connections for the UDP gateway, default value is 5
     #[cfg(feature = "udpgw")]
@@ -222,12 +221,16 @@ pub struct Args {
     #[arg(long, value_name = "seconds", requires = "udpgw_server")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udpgw_keepalive: Option<u64>,
+
+    /// Verbosity level, possible values [off, error, warn, info, debug, trace]
+    #[arg(short, long, value_name = "level", default_value = "info")]
+    pub verbosity: log::LevelFilter,
 }
 
 fn validate_tun(p: &str) -> Result<String> {
     #[cfg(target_os = "macos")]
     if p.len() <= 4 || &p[..4] != "utun" {
-        return Err(Error::from("Invalid tun interface name, please use utunX"));
+        return Err(crate::Error::from("Invalid tun interface name, please use utunX"));
     }
     Ok(p.to_string())
 }
@@ -239,19 +242,19 @@ impl Default for Args {
         #[cfg(not(target_os = "linux"))]
         let setup = true;
         Args {
-            proxy: ArgProxy::default(),
+            proxy: ProxyParameters::default(),
             tun: None,
             #[cfg(unix)]
             tun_fd: None,
             #[cfg(unix)]
             close_fd_on_drop: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "unshare"))]
             unshare: false,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "unshare"))]
             unshare_pidfile: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "unshare"))]
             socket_transfer_fd: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "unshare"))]
             admin_command: Vec::new(),
             ipv6_enabled: false,
             setup,
@@ -266,11 +269,12 @@ impl Default for Args {
             bind_interface: None,
             mtu: crate::DEFAULT_MTU,
             tcp_timeout: 600,
+            tcp_mss: None,
             udp_timeout: 10,
             udp_strategy: ArgUdpStrategy::default(),
             udp_router: None,
             icmp_echo: false,
-            verbosity: ArgVerbosity::Info,
+            verbosity: log::LevelFilter::Info,
             virtual_dns_pool: IpCidr::from_str("198.18.0.0/15").unwrap(),
             virtual_dns_portals: vec![],
             daemonize: false,
@@ -299,7 +303,7 @@ impl Args {
         args
     }
 
-    pub fn proxy(&mut self, proxy: ArgProxy) -> &mut Self {
+    pub fn proxy(&mut self, proxy: ProxyParameters) -> &mut Self {
         self.proxy = proxy;
         self
     }
@@ -310,7 +314,7 @@ impl Args {
     }
 
     #[cfg(feature = "udpgw")]
-    pub fn udpgw_server(&mut self, udpgw: SocketAddr) -> &mut Self {
+    pub fn udpgw_server(&mut self, udpgw: std::net::SocketAddr) -> &mut Self {
         self.udpgw_server = Some(udpgw);
         self
     }
@@ -333,7 +337,7 @@ impl Args {
         self
     }
 
-    pub fn verbosity(&mut self, verbosity: ArgVerbosity) -> &mut Self {
+    pub fn verbosity(&mut self, verbosity: log::LevelFilter) -> &mut Self {
         self.verbosity = verbosity;
         self
     }
@@ -364,72 +368,6 @@ impl Args {
     }
 }
 
-#[repr(C)]
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
-pub enum ArgVerbosity {
-    Off = 0,
-    Error,
-    Warn,
-    #[default]
-    Info,
-    Debug,
-    Trace,
-}
-
-#[cfg(target_os = "android")]
-impl TryFrom<jni::sys::jint> for ArgVerbosity {
-    type Error = Error;
-    fn try_from(value: jni::sys::jint) -> Result<Self> {
-        match value {
-            0 => Ok(ArgVerbosity::Off),
-            1 => Ok(ArgVerbosity::Error),
-            2 => Ok(ArgVerbosity::Warn),
-            3 => Ok(ArgVerbosity::Info),
-            4 => Ok(ArgVerbosity::Debug),
-            5 => Ok(ArgVerbosity::Trace),
-            _ => Err(Error::from("Invalid verbosity level")),
-        }
-    }
-}
-
-impl From<ArgVerbosity> for log::LevelFilter {
-    fn from(verbosity: ArgVerbosity) -> Self {
-        match verbosity {
-            ArgVerbosity::Off => log::LevelFilter::Off,
-            ArgVerbosity::Error => log::LevelFilter::Error,
-            ArgVerbosity::Warn => log::LevelFilter::Warn,
-            ArgVerbosity::Info => log::LevelFilter::Info,
-            ArgVerbosity::Debug => log::LevelFilter::Debug,
-            ArgVerbosity::Trace => log::LevelFilter::Trace,
-        }
-    }
-}
-
-impl From<log::Level> for ArgVerbosity {
-    fn from(level: log::Level) -> Self {
-        match level {
-            log::Level::Error => ArgVerbosity::Error,
-            log::Level::Warn => ArgVerbosity::Warn,
-            log::Level::Info => ArgVerbosity::Info,
-            log::Level::Debug => ArgVerbosity::Debug,
-            log::Level::Trace => ArgVerbosity::Trace,
-        }
-    }
-}
-
-impl std::fmt::Display for ArgVerbosity {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            ArgVerbosity::Off => write!(f, "off"),
-            ArgVerbosity::Error => write!(f, "error"),
-            ArgVerbosity::Warn => write!(f, "warn"),
-            ArgVerbosity::Info => write!(f, "info"),
-            ArgVerbosity::Debug => write!(f, "debug"),
-            ArgVerbosity::Trace => write!(f, "trace"),
-        }
-    }
-}
-
 /// DNS query handling strategy
 /// - Virtual: Use a virtual DNS server to handle DNS queries, also known as Fake-IP mode
 /// - OverTcp: Use TCP to send DNS queries to the DNS server
@@ -447,120 +385,13 @@ pub enum ArgDns {
 
 #[cfg(target_os = "android")]
 impl TryFrom<jni::sys::jint> for ArgDns {
-    type Error = Error;
+    type Error = crate::Error;
     fn try_from(value: jni::sys::jint) -> Result<Self> {
         match value {
             0 => Ok(ArgDns::Virtual),
             1 => Ok(ArgDns::OverTcp),
             2 => Ok(ArgDns::Direct),
-            _ => Err(Error::from("Invalid DNS strategy")),
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ArgProxy {
-    pub proxy_type: ProxyType,
-    pub addr: SocketAddr,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub credentials: Option<UserKey>,
-}
-
-impl Default for ArgProxy {
-    fn default() -> Self {
-        ArgProxy {
-            proxy_type: ProxyType::Socks5,
-            addr: "127.0.0.1:1080".parse().unwrap(),
-            credentials: None,
-        }
-    }
-}
-
-impl std::fmt::Display for ArgProxy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let auth = match &self.credentials {
-            Some(creds) => format!("{creds}"),
-            None => "".to_owned(),
-        };
-        if auth.is_empty() {
-            write!(f, "{}://{}", &self.proxy_type, &self.addr)
-        } else {
-            write!(f, "{}://{}@{}", &self.proxy_type, auth, &self.addr)
-        }
-    }
-}
-
-impl TryFrom<&str> for ArgProxy {
-    type Error = Error;
-    fn try_from(s: &str) -> Result<Self> {
-        if s == "none" {
-            return Ok(ArgProxy {
-                proxy_type: ProxyType::None,
-                addr: "0.0.0.0:0".parse().unwrap(),
-                credentials: None,
-            });
-        }
-
-        let e = format!("`{s}` is not a valid proxy URL");
-        let url = url::Url::parse(s).map_err(|_| Error::from(&e))?;
-        let e = format!("`{s}` does not contain a host");
-        let host = url.host_str().ok_or(Error::from(e))?;
-
-        let e = format!("`{s}` does not contain a port");
-        let port = url.port_or_known_default().ok_or(Error::from(&e))?;
-
-        let e2 = format!("`{host}` does not resolve to a usable IP address");
-        let addr = (host, port).to_socket_addrs()?.next().ok_or(Error::from(&e2))?;
-
-        let credentials = if url.username() == "" && url.password().is_none() {
-            None
-        } else {
-            use percent_encoding::percent_decode;
-            let username = percent_decode(url.username().as_bytes()).decode_utf8()?;
-            let password = percent_decode(url.password().unwrap_or("").as_bytes()).decode_utf8()?;
-            Some(UserKey::new(username, password))
-        };
-
-        let proxy_type = url.scheme().to_ascii_lowercase().as_str().try_into()?;
-
-        Ok(ArgProxy {
-            proxy_type,
-            addr,
-            credentials,
-        })
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub enum ProxyType {
-    Http = 0,
-    Socks4,
-    #[default]
-    Socks5,
-    None,
-}
-
-impl TryFrom<&str> for ProxyType {
-    type Error = Error;
-    fn try_from(value: &str) -> Result<Self> {
-        match value {
-            "http" => Ok(ProxyType::Http),
-            "socks4" => Ok(ProxyType::Socks4),
-            "socks5" => Ok(ProxyType::Socks5),
-            "none" => Ok(ProxyType::None),
-            scheme => Err(Error::from(&format!("`{scheme}` is an invalid proxy type"))),
-        }
-    }
-}
-
-impl std::fmt::Display for ProxyType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ProxyType::Socks4 => write!(f, "socks4"),
-            ProxyType::Socks5 => write!(f, "socks5"),
-            ProxyType::Http => write!(f, "http"),
-            ProxyType::None => write!(f, "none"),
+            _ => Err(crate::Error::from("Invalid DNS strategy")),
         }
     }
 }

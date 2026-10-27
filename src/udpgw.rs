@@ -1,5 +1,5 @@
 use crate::error::Result;
-use socks5_impl::protocol::{Address, AsyncStreamOperation, BufMut, StreamOperation};
+use socks5_impl::{Address, AsyncStreamOperation, StreamOperation, protocol::BufMut};
 use std::{collections::VecDeque, hash::Hash, net::SocketAddr, sync::atomic::Ordering::Relaxed};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -21,8 +21,9 @@ pub struct UdpFlag(pub u8);
 impl UdpFlag {
     pub const ZERO: UdpFlag = UdpFlag(0x00);
     pub const KEEPALIVE: UdpFlag = UdpFlag(0x01);
-    pub const ERR: UdpFlag = UdpFlag(0x20);
     pub const DATA: UdpFlag = UdpFlag(0x02);
+    pub const CLOSE: UdpFlag = UdpFlag(0x04);
+    pub const ERR: UdpFlag = UdpFlag(0x20);
 }
 
 impl std::fmt::Display for UdpFlag {
@@ -30,8 +31,9 @@ impl std::fmt::Display for UdpFlag {
         let flag = match self.0 {
             0x00 => "ZERO",
             0x01 => "KEEPALIVE",
-            0x20 => "ERR",
             0x02 => "DATA",
+            0x04 => "CLOSE",
+            0x20 => "ERR",
             n => return write!(f, "Unknown UdpFlag(0x{n:02X})"),
         };
         write!(f, "{flag}")
@@ -60,8 +62,9 @@ impl std::ops::BitOr for UdpFlag {
 ///
 /// `FLAGS`: This field is used to indicate the packet type. The flags are defined as follows:
 /// - `0x01`: Keepalive packet without address and data
-/// - `0x20`: Error packet without address and data
 /// - `0x02`: Data packet with address and data
+/// - `0x04`: Close packet without address and data
+/// - `0x20`: Error packet without address and data
 ///
 /// `CONN_ID`: This field is used to indicate the unique connection ID for the packet.
 ///
@@ -119,21 +122,27 @@ impl TryFrom<&[u8]> for Packet {
     type Error = std::io::Error;
 
     fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
+        use std::io::{Error, ErrorKind::InvalidData};
         if value.len() < UDPGW_LENGTH_FIELD_SIZE {
-            return Err(std::io::ErrorKind::InvalidData.into());
+            return Err(Error::new(InvalidData, "frame too short"));
         }
-        let mut iter = std::io::Cursor::new(value);
-        use tokio_util::bytes::Buf;
-        let length = iter.get_u16();
-        if value.len() < length as usize + UDPGW_LENGTH_FIELD_SIZE {
-            return Err(std::io::ErrorKind::InvalidData.into());
+        let length = u16::from_be_bytes([value[0], value[1]]) as usize;
+        let total = length + UDPGW_LENGTH_FIELD_SIZE;
+        if value.len() < total {
+            return Err(Error::new(InvalidData, "incomplete frame"));
         }
+        let mut iter = std::io::Cursor::new(&value[UDPGW_LENGTH_FIELD_SIZE..total]);
         let header = UdpgwHeader::retrieve_from_stream(&mut iter)?;
-        let address = if header.flags & UdpFlag::DATA != UdpFlag::ZERO {
+        let address = if header.flags & UdpFlag::DATA == UdpFlag::DATA {
             Some(Address::retrieve_from_stream(&mut iter)?)
         } else {
             None
         };
+        let read_len = header.len() + address.as_ref().map_or(0, |addr| addr.len());
+        if length < read_len {
+            return Err(Error::new(InvalidData, "length field smaller than header and address length"));
+        }
+        use tokio_util::bytes::Buf;
         Ok(Packet::new(header, address, iter.chunk()))
     }
 }
@@ -148,16 +157,23 @@ impl Packet {
         Packet::new(UdpgwHeader::new(UdpFlag::KEEPALIVE, conn_id), None, &[])
     }
 
+    pub fn build_close_packet(conn_id: u16) -> Self {
+        Packet::new(UdpgwHeader::new(UdpFlag::CLOSE, conn_id), None, &[])
+    }
+
     pub fn build_error_packet(conn_id: u16) -> Self {
         Packet::new(UdpgwHeader::new(UdpFlag::ERR, conn_id), None, &[])
     }
 
     pub fn build_packet_from_address(conn_id: u16, remote_addr: &Address, data: &[u8]) -> std::io::Result<Self> {
-        use socks5_impl::protocol::Address::{DomainAddress, SocketAddress};
         let packet = match remote_addr {
-            SocketAddress(addr) => Packet::build_ip_packet(conn_id, *addr, data),
-            DomainAddress(domain, port) => Packet::build_domain_packet(conn_id, *port, domain, data)?,
+            Address::SocketAddress(addr) => Packet::build_ip_packet(conn_id, *addr, data),
+            Address::DomainAddress(domain, port) => Packet::build_domain_packet(conn_id, *port, domain, data)?,
         };
+        if packet.len().saturating_sub(UDPGW_LENGTH_FIELD_SIZE) > u16::MAX as usize {
+            use std::io::{Error, ErrorKind::InvalidInput};
+            return Err(Error::new(InvalidInput, "udpgw packet exceeds maximum frame length"));
+        }
         Ok(packet)
     }
 
@@ -167,11 +183,16 @@ impl Packet {
     }
 
     pub fn build_domain_packet(conn_id: u16, port: u16, domain: &str, data: &[u8]) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind::InvalidInput};
         if domain.len() > 255 {
-            return Err(std::io::ErrorKind::InvalidInput.into());
+            return Err(Error::new(InvalidInput, "domain name exceeds 255 characters"));
         }
         let addr = Address::from((domain, port));
-        Ok(Packet::new(UdpgwHeader::new(UdpFlag::DATA, conn_id), Some(addr), data))
+        let packet = Packet::new(UdpgwHeader::new(UdpFlag::DATA, conn_id), Some(addr), data);
+        if packet.len().saturating_sub(UDPGW_LENGTH_FIELD_SIZE) > u16::MAX as usize {
+            return Err(Error::new(InvalidInput, "udpgw packet exceeds maximum frame length"));
+        }
+        Ok(packet)
     }
 }
 
@@ -386,6 +407,11 @@ impl UdpGwClientStream {
         self.serial_number
     }
 
+    pub fn rotate_serial_number(&mut self) -> u16 {
+        self.serial_number = SERIAL_NUMBER.fetch_add(1, Relaxed);
+        self.serial_number
+    }
+
     pub fn new(tcp_server_stream: TcpStream) -> Self {
         let default = "0.0.0.0:0".parse::<SocketAddr>().unwrap();
         let local_addr = tcp_server_stream.local_addr().unwrap_or(default);
@@ -438,16 +464,18 @@ impl UdpGwClient {
     }
 
     pub(crate) async fn store_server_connection(&self, stream: UdpGwClientStream) {
-        if self.server_connections.lock().await.len() < self.max_connections {
-            self.server_connections.lock().await.push_back(stream);
+        let mut conns = self.server_connections.lock().await;
+        if conns.len() < self.max_connections {
+            conns.push_back(stream);
         }
     }
 
     pub(crate) async fn store_server_connection_full(&self, mut stream: UdpGwClientStream, reader: OwnedReadHalf, writer: OwnedWriteHalf) {
-        if self.server_connections.lock().await.len() < self.max_connections {
+        let mut conns = self.server_connections.lock().await;
+        if conns.len() < self.max_connections {
             stream.set_reader(Some(reader));
             stream.set_writer(Some(writer));
-            self.server_connections.lock().await.push_back(stream);
+            conns.push_back(stream);
         }
     }
 
@@ -495,18 +523,34 @@ impl UdpGwClient {
                     log::warn!("stream {sn} {local_addr:?} send keepalive failed: {e}");
                     continue;
                 }
-                match UdpGwClient::recv_udpgw_packet(self.udp_mtu, self.udp_timeout, &mut stream_reader).await {
-                    Ok((len, UdpGwResponse::KeepAlive)) => {
-                        stream.update_activity();
-                        self.store_server_connection_full(stream, stream_reader, stream_writer).await;
-                        log::trace!("stream {sn} {local_addr:?} send keepalive and recieve it successfully");
-                        rx += len;
+                loop {
+                    match UdpGwClient::recv_udpgw_packet(self.udp_mtu, self.udp_timeout, &mut stream_reader).await {
+                        Ok((len, UdpGwResponse::KeepAlive)) => {
+                            stream.update_activity();
+                            self.store_server_connection_full(stream, stream_reader, stream_writer).await;
+                            log::trace!("stream {sn} {local_addr:?} send keepalive and recieve it successfully");
+                            rx += len;
+                            break;
+                        }
+                        Ok((len, UdpGwResponse::Data(data))) => {
+                            let conn_id = data.header.conn_id;
+                            log::trace!("stream {sn} {local_addr:?} keepalive ignored late data for conn_id {conn_id}");
+                            rx += len;
+                        }
+                        Ok((len, UdpGwResponse::Error)) => {
+                            log::trace!("stream {sn} {local_addr:?} keepalive ignored late error packet");
+                            rx += len;
+                        }
+                        Ok((len, v)) => {
+                            log::debug!("stream {sn} {local_addr:?} keepalive unexpected response: {v}");
+                            rx += len;
+                            break;
+                        }
+                        Err(e) => {
+                            log::debug!("stream {sn} {local_addr:?} keepalive no response, error \"{e}\"");
+                            break;
+                        }
                     }
-                    Ok((len, v)) => {
-                        log::debug!("stream {sn} {local_addr:?} keepalive unexpected response: {v}");
-                        rx += len;
-                    }
-                    Err(e) => log::debug!("stream {sn} {local_addr:?} keepalive no response, error \"{e}\""),
                 }
             }
             crate::traffic_status::traffic_status_update(tx, rx)?;
@@ -523,6 +567,9 @@ impl UdpGwClient {
         }
         if flags & UdpFlag::KEEPALIVE == UdpFlag::KEEPALIVE {
             return Ok(UdpGwResponse::KeepAlive);
+        }
+        if flags & UdpFlag::CLOSE == UdpFlag::CLOSE {
+            return Ok(UdpGwResponse::TcpClose);
         }
         if packet.data.len() > udp_mtu as usize {
             return Err("too much data".into());
@@ -551,6 +598,68 @@ impl UdpGwClient {
         Ok((packet.len(), UdpGwClient::parse_udp_response(udp_mtu, packet)?))
     }
 
+    /// Cancellation-safe frame reader.
+    ///
+    /// `recv_udpgw_packet` above is NOT cancellation safe: `read_exact` inside
+    /// `Packet::retrieve_from_async_stream` may have already consumed socket
+    /// bytes into the future's local buffer when the future is dropped by
+    /// `tokio::select!` (the local-read branch wins whenever the app sends a
+    /// datagram). Those bytes are lost and the next read starts mid-frame,
+    /// which desynchronizes the parser ("Unsupported address type", "too much
+    /// data").
+    ///
+    /// This variant keeps the partial frame in `acc`, a buffer owned by the
+    /// caller (outside any future), and only ever awaits a plain `read()`,
+    /// which is cancellation safe. Intended to be called in a `select!` loop
+    /// with the same `acc` across iterations.
+    pub(crate) async fn recv_udpgw_packet_csafe(
+        udp_mtu: u16,
+        udp_timeout: u64,
+        stream: &mut OwnedReadHalf,
+        acc: &mut Vec<u8>,
+    ) -> Result<(usize, UdpGwResponse)> {
+        use tokio_util::bytes::Buf;
+        let mut chunk = [0u8; 8192];
+        loop {
+            if acc.len() >= UDPGW_LENGTH_FIELD_SIZE {
+                let length = u16::from_be_bytes([acc[0], acc[1]]) as usize;
+                if length >= 3 && acc.len() >= length + UDPGW_LENGTH_FIELD_SIZE {
+                    let total = length + UDPGW_LENGTH_FIELD_SIZE;
+                    let mut cur = std::io::Cursor::new(&acc[..total]);
+                    let _ = cur.get_u16();
+                    let header = UdpgwHeader::retrieve_from_stream(&mut cur)?;
+                    let address = if header.flags & UdpFlag::DATA == UdpFlag::DATA {
+                        Some(Address::retrieve_from_stream(&mut cur)?)
+                    } else {
+                        None
+                    };
+                    let read_len = header.len() + address.as_ref().map_or(0, |a| a.len());
+                    if length < read_len {
+                        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData).into());
+                    }
+                    // `cur` spans the whole frame (length field included), so its
+                    // position is already the absolute offset of the payload.
+                    let data_start = cur.position() as usize;
+                    let data = acc[data_start..total].to_vec();
+                    acc.drain(..total);
+                    let full = UDPGW_LENGTH_FIELD_SIZE + read_len + data.len();
+                    let packet = Packet::new(header, address, &data);
+                    return Ok((full, UdpGwClient::parse_udp_response(udp_mtu, packet)?));
+                }
+                if length < 3 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData).into());
+                }
+            }
+            let n = tokio::time::timeout(tokio::time::Duration::from_secs(udp_timeout + 2), stream.read(&mut chunk))
+                .await
+                .map_err(std::io::Error::from)??;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            acc.extend_from_slice(&chunk[..n]);
+        }
+    }
+
     /// Sends a UDP gateway packet.
     ///
     /// This function constructs and sends a UDP gateway packet based on the IPv6 enabled status, data length,
@@ -570,16 +679,134 @@ impl UdpGwClient {
     pub(crate) async fn send_udpgw_packet(
         ipv6_enabled: bool,
         data: &[u8],
-        remote_addr: &socks5_impl::protocol::Address,
+        remote_addr: &socks5_impl::Address,
         conn_id: u16,
         stream: &mut OwnedWriteHalf,
     ) -> Result<()> {
-        if !ipv6_enabled && remote_addr.get_type() == socks5_impl::protocol::AddressType::IPv6 {
+        if !ipv6_enabled && remote_addr.get_type() == socks5_impl::AddressType::IPv6 {
             return Err("ipv6 not support".into());
         }
         let out_data: Vec<u8> = Packet::build_packet_from_address(conn_id, remote_addr, data)?.into();
         stream.write_all(&out_data).await?;
 
         Ok(())
+    }
+
+    /// Sends a UDP gateway close packet to notify the server to stop receiving data for `conn_id`.
+    pub(crate) async fn send_udpgw_close_packet(conn_id: u16, stream: &mut OwnedWriteHalf) -> Result<usize> {
+        let out_data: Vec<u8> = Packet::build_close_packet(conn_id).into();
+        let len = out_data.len();
+        stream.write_all(&out_data).await?;
+        Ok(len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// The exact frame the udpgw server sends for a WireGuard handshake response:
+    /// LEN=102, FLAGS=DATA, IPv4 address, 92-byte payload starting with type 0x02.
+    fn handshake_response_frame(conn_id: u16, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        let body_len = 3 + 7 + payload.len();
+        frame.extend_from_slice(&(body_len as u16).to_be_bytes());
+        frame.push(UdpFlag::DATA.0);
+        frame.extend_from_slice(&conn_id.to_be_bytes());
+        frame.push(0x01);
+        frame.extend_from_slice(&[203, 0, 113, 9]);
+        frame.extend_from_slice(&51820u16.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    async fn read_one_frame(frame: &[u8], split_at: Option<usize>) -> (usize, UdpGwResponse, Vec<u8>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut server_side, _) = listener.accept().await.unwrap();
+        let (mut reader, _writer) = client.into_split();
+
+        match split_at {
+            Some(n) => {
+                server_side.write_all(&frame[..n]).await.unwrap();
+                server_side.flush().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                server_side.write_all(&frame[n..]).await.unwrap();
+            }
+            None => server_side.write_all(frame).await.unwrap(),
+        }
+
+        let mut acc = Vec::new();
+        let (len, resp) = UdpGwClient::recv_udpgw_packet_csafe(10240, 10, &mut reader, &mut acc)
+            .await
+            .unwrap();
+        (len, resp, acc)
+    }
+
+    #[tokio::test]
+    async fn csafe_reader_returns_byte_exact_payload() {
+        let mut payload: Vec<u8> = (0..92u8).collect();
+        payload[0] = 0x02; // wg MESSAGE_HANDSHAKE_RESPONSE type byte
+        let frame = handshake_response_frame(8, &payload);
+        assert_eq!(frame.len(), 104);
+        assert_eq!(payload[0], 0x02, "wg message type must stay at payload[0]");
+
+        let (len, resp, acc) = read_one_frame(&frame, Some(40)).await;
+        match resp {
+            UdpGwResponse::Data(p) => {
+                assert_eq!(p.header.conn_id, 8);
+                assert_eq!(p.header.flags, UdpFlag::DATA);
+                assert_eq!(p.data, payload, "payload must be delivered byte-exact");
+            }
+            other => panic!("unexpected response: {other}"),
+        }
+        assert_eq!(len, 104);
+        assert!(acc.is_empty(), "frame fully consumed");
+    }
+
+    #[tokio::test]
+    async fn csafe_reader_handles_addressless_frame() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&3u16.to_be_bytes());
+        frame.push(UdpFlag::KEEPALIVE.0);
+        frame.extend_from_slice(&8u16.to_be_bytes());
+
+        let (len, resp, acc) = read_one_frame(&frame, None).await;
+        assert!(matches!(resp, UdpGwResponse::KeepAlive));
+        assert_eq!(len, 5);
+        assert!(acc.is_empty());
+
+        let close_pkt = Packet::build_close_packet(9);
+        let close_frame: Vec<u8> = (&close_pkt).into();
+        assert_eq!(close_frame, vec![0x00, 0x03, UdpFlag::CLOSE.0, 0x00, 0x09]);
+        assert_eq!(Packet::try_from(close_frame.as_slice()).unwrap(), close_pkt);
+        let (len, resp, acc) = read_one_frame(&close_frame, None).await;
+        assert!(matches!(resp, UdpGwResponse::TcpClose));
+        assert_eq!(len, 5);
+        assert!(acc.is_empty());
+    }
+
+    #[test]
+    fn try_from_slice_ignores_trailing_bytes_and_rejects_truncated_header() {
+        let addr: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+        let expected = Packet::build_ip_packet(8, addr, b"hello");
+        let mut bytes: Vec<u8> = (&expected).into();
+        bytes.extend_from_slice(b"trailing-next-frame-bytes");
+
+        let parsed = Packet::try_from(bytes.as_slice()).unwrap();
+        assert_eq!(parsed, expected);
+
+        let malformed = [0x00, 0x01, UdpFlag::KEEPALIVE.0, 0x00, 0x08];
+        assert!(Packet::try_from(&malformed[..]).is_err());
+    }
+
+    #[test]
+    fn build_packet_from_address_rejects_frames_exceeding_u16_max() {
+        let addr = Address::from("203.0.113.9:51820".parse::<SocketAddr>().unwrap());
+        let max_payload = (u16::MAX as usize) - UdpgwHeader::static_len() - addr.len();
+        assert!(Packet::build_packet_from_address(1, &addr, &vec![0u8; max_payload]).is_ok());
+        assert!(Packet::build_packet_from_address(1, &addr, &vec![0u8; max_payload + 1]).is_err());
     }
 }

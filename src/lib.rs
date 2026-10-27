@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "unshare"))]
 extern crate bincode_next as bincode;
 
 #[cfg(feature = "udpgw")]
@@ -15,7 +15,7 @@ pub use clap::ValueEnum;
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
 use proxy_handler::{ProxyHandler, ProxyHandlerManager};
 use socks::SocksProxyManager;
-pub use socks5_impl::protocol::UserKey;
+pub use socks5_impl::UserKey;
 #[cfg(feature = "udpgw")]
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::{
@@ -37,8 +37,10 @@ use tproxy_config::is_private_ip;
 #[cfg(feature = "udpgw")]
 use udpgw::{UDPGW_KEEPALIVE_TIME, UDPGW_MAX_CONNECTIONS, UdpGwClientStream, UdpGwResponse};
 
+pub use log::LevelFilter;
+pub use socks5_impl::{ProxyParameters, ProxyType};
 pub use {
-    args::{ArgDns, ArgProxy, ArgUdpStrategy, ArgVerbosity, Args, ProxyType},
+    args::{ArgDns, ArgUdpStrategy, Args},
     error::{BoxError, Error, Result},
     process_bypass::{ProcessBypass, normalize_process_name},
     traffic_status::{TrafficStatus, tun2proxy_set_traffic_status_callback},
@@ -263,10 +265,9 @@ where
     }
 }
 
-#[allow(unused)]
 #[derive(Hash, Copy, Clone, Eq, PartialEq, Debug)]
 #[cfg_attr(
-    target_os = "linux",
+    all(target_os = "linux", feature = "unshare"),
     derive(bincode::Encode, bincode::Decode, serde::Serialize, serde::Deserialize)
 )]
 pub enum SocketProtocol {
@@ -274,10 +275,9 @@ pub enum SocketProtocol {
     Udp,
 }
 
-#[allow(unused)]
 #[derive(Hash, Copy, Clone, Eq, PartialEq, Debug)]
 #[cfg_attr(
-    target_os = "linux",
+    all(target_os = "linux", feature = "unshare"),
     derive(bincode::Encode, bincode::Decode, serde::Serialize, serde::Deserialize)
 )]
 pub enum SocketDomain {
@@ -296,33 +296,68 @@ impl From<IpAddr> for SocketDomain {
 
 struct SocketQueue {
     tcp_v4: Mutex<Receiver<TcpSocket>>,
-    tcp_v6: Mutex<Receiver<TcpSocket>>,
+    tcp_v6: Option<Mutex<Receiver<TcpSocket>>>,
     udp_v4: Mutex<Receiver<UdpSocket>>,
-    udp_v6: Mutex<Receiver<UdpSocket>>,
+    udp_v6: Option<Mutex<Receiver<UdpSocket>>>,
 }
 
 impl SocketQueue {
     async fn recv_tcp(&self, domain: SocketDomain) -> Result<TcpSocket, std::io::Error> {
-        match domain {
+        let receiver = match domain {
             SocketDomain::IpV4 => &self.tcp_v4,
-            SocketDomain::IpV6 => &self.tcp_v6,
-        }
-        .lock()
-        .await
-        .recv()
-        .await
-        .ok_or(ErrorKind::Other.into())
+            SocketDomain::IpV6 => self.tcp_v6.as_ref().ok_or_else(|| std::io::Error::from(ErrorKind::Unsupported))?,
+        };
+        receiver.lock().await.recv().await.ok_or(ErrorKind::Other.into())
     }
     async fn recv_udp(&self, domain: SocketDomain) -> Result<UdpSocket, std::io::Error> {
-        match domain {
+        let receiver = match domain {
             SocketDomain::IpV4 => &self.udp_v4,
-            SocketDomain::IpV6 => &self.udp_v6,
-        }
-        .lock()
-        .await
-        .recv()
-        .await
-        .ok_or(ErrorKind::Other.into())
+            SocketDomain::IpV6 => self.udp_v6.as_ref().ok_or_else(|| std::io::Error::from(ErrorKind::Unsupported))?,
+        };
+        receiver.lock().await.recv().await.ok_or(ErrorKind::Other.into())
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "unshare"))]
+fn create_socket_queue(
+    socket: Arc<Mutex<tokio::net::UnixDatagram>>,
+    ipv6_enabled: bool,
+    tasks: &mut tokio::task::JoinSet<()>,
+) -> SocketQueue {
+    use crate::socket_transfer::request_sockets;
+    use tokio::sync::mpsc::channel;
+
+    macro_rules! create_receiver {
+        ($domain:ident) => {{
+            const SOCKETS_PER_REQUEST: usize = 64;
+
+            let socket = socket.clone();
+            let (tx, rx) = channel(SOCKETS_PER_REQUEST);
+            tasks.spawn(async move {
+                loop {
+                    let sockets = match request_sockets(socket.lock().await, SocketDomain::$domain, SOCKETS_PER_REQUEST as u32).await {
+                        Ok(sockets) => sockets,
+                        Err(err) => {
+                            log::warn!("Socket allocation request failed: {err}");
+                            continue;
+                        }
+                    };
+                    for socket in sockets {
+                        if tx.send(socket).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            Mutex::new(rx)
+        }};
+    }
+
+    SocketQueue {
+        tcp_v4: create_receiver!(IpV4),
+        tcp_v6: ipv6_enabled.then(|| create_receiver!(IpV6)),
+        udp_v4: create_receiver!(IpV4),
+        udp_v6: ipv6_enabled.then(|| create_receiver!(IpV6)),
     }
 }
 
@@ -677,13 +712,21 @@ where
     D: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     log::info!("{} {} starting...", env!("CARGO_PKG_NAME"), version_info!());
-    log::info!("Proxy {} server: {}", args.proxy.proxy_type, args.proxy.addr);
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     if args.dns == ArgDns::Physical {
         return Err("physical DNS requires a desktop physical interface".into());
     }
 
-    let server_addr = args.proxy.addr;
+    let server_addr = if let Some(addr) = args.proxy.addr.as_ref() {
+        addr.resolve_using_tokio().await?.next()
+    } else {
+        None
+    };
+
+    if let Some(addr) = server_addr {
+        log::info!("Proxy {} server: {addr}", args.proxy.proxy_type);
+    }
+
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
     let ipv6_enabled = args.ipv6_enabled;
@@ -703,11 +746,13 @@ where
         .or_else(|| (args.dns == ArgDns::Virtual).then(|| Arc::new(Mutex::new(VirtualDns::new(args.virtual_dns_pool)))));
 
     use socks5_impl::protocol::Version::{V4, V5};
-    let mgr: Arc<dyn ProxyHandlerManager> = match args.proxy.proxy_type {
-        ProxyType::Socks5 => Arc::new(SocksProxyManager::new(server_addr, V5, key)),
-        ProxyType::Socks4 => Arc::new(SocksProxyManager::new(server_addr, V4, key)),
-        ProxyType::Http => Arc::new(HttpManager::new(server_addr, key)),
-        ProxyType::None => Arc::new(NoProxyManager::new()),
+    let mgr: Arc<dyn ProxyHandlerManager> = match (args.proxy.proxy_type, server_addr) {
+        (ProxyType::None, _) => Arc::new(NoProxyManager::new()),
+        (ProxyType::Socks5, Some(addr)) => Arc::new(SocksProxyManager::new(addr, V5, key)),
+        (ProxyType::Socks4, Some(addr)) => Arc::new(SocksProxyManager::new(addr, V4, key)),
+        (ProxyType::Http, Some(addr)) => Arc::new(HttpManager::new(addr, key)),
+        (ProxyType::Mixed, _) => return Err("a mixed proxy type describes a listener, not an upstream proxy".into()),
+        (proxy_type, None) => return Err(format!("the {proxy_type} proxy address resolved to nothing").into()),
     };
 
     // Process-based bypass: sessions whose originating local process matches
@@ -795,6 +840,9 @@ where
     if args.tcp_read_buffer_size > 0 {
         tcp_cfg.read_buffer_size = args.tcp_read_buffer_size;
     }
+    if let Some(mss) = args.tcp_mss {
+        tcp_cfg.options = Some(vec![ipstack::TcpOptions::MaximumSegmentSize(mss)]);
+    }
     ipstack_config.with_tcp_config(tcp_cfg);
     ipstack_config.udp_timeout(std::time::Duration::from_secs(args.udp_timeout));
 
@@ -804,54 +852,20 @@ where
     // Delay spawning socket-transfer producers until all fallible forwarding
     // initialization above has succeeded. From this point onward every return
     // path goes through the common JoinSet drain below.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "unshare"))]
     let socket_queue = match args.socket_transfer_fd {
         None => None,
         Some(fd) => {
-            use crate::socket_transfer::{reconstruct_socket, reconstruct_transfer_socket, request_sockets};
-            use tokio::sync::mpsc::channel;
+            use crate::socket_transfer::{reconstruct_socket, reconstruct_transfer_socket};
 
             let fd = reconstruct_socket(fd)?;
             let socket = reconstruct_transfer_socket(fd)?;
             let socket = Arc::new(Mutex::new(socket));
-
-            macro_rules! create_socket_queue {
-                ($domain:ident) => {{
-                    const SOCKETS_PER_REQUEST: usize = 64;
-
-                    let socket = socket.clone();
-                    let (tx, rx) = channel(SOCKETS_PER_REQUEST);
-                    managed_tasks.spawn(async move {
-                        loop {
-                            let sockets =
-                                match request_sockets(socket.lock().await, SocketDomain::$domain, SOCKETS_PER_REQUEST as u32).await {
-                                    Ok(sockets) => sockets,
-                                    Err(err) => {
-                                        log::warn!("Socket allocation request failed: {err}");
-                                        continue;
-                                    }
-                                };
-                            for s in sockets {
-                                if tx.send(s).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    });
-                    Mutex::new(rx)
-                }};
-            }
-
-            Some(Arc::new(SocketQueue {
-                tcp_v4: create_socket_queue!(IpV4),
-                tcp_v6: create_socket_queue!(IpV6),
-                udp_v4: create_socket_queue!(IpV4),
-                udp_v6: create_socket_queue!(IpV6),
-            }))
+            Some(Arc::new(create_socket_queue(socket, ipv6_enabled, &mut managed_tasks)))
         }
     };
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", feature = "unshare")))]
     let socket_queue = None;
 
     #[cfg(feature = "udpgw")]
@@ -1308,7 +1322,7 @@ where
                             let tcpinfo = SessionInfo::new(tcp_src, udpgw.get_udpgw_server_addr(), IpProtocol::Tcp);
                             let proxy_handler = mgr.new_proxy_handler(tcpinfo, None, false).await?;
                             let dst_addr = match domain_name {
-                                Some(ref domain) => socks5_impl::protocol::Address::from((domain.to_string(), info.dst.port())),
+                                Some(ref domain) => socks5_impl::Address::from((domain.to_string(), info.dst.port())),
                                 None => info.dst.into(),
                             };
                             return handle_udp_gateway_session(udp, udpgw, &dst_addr, proxy_handler, socket_queue, ipv6_enabled).await;
@@ -1454,6 +1468,24 @@ async fn system_managed_provider_rejects_os_setup_and_process_matching() {
         .unwrap(),
         0
     );
+}
+
+#[cfg(all(test, target_os = "linux", feature = "unshare"))]
+mod socket_queue_tests {
+    use super::create_socket_queue;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[tokio::test]
+    async fn ipv4_only_mode_does_not_start_ipv6_queues() {
+        let (local, _peer) = tokio::net::UnixDatagram::pair().unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        let queue = create_socket_queue(Arc::new(Mutex::new(local)), false, &mut tasks);
+
+        assert!(queue.tcp_v6.is_none());
+        assert!(queue.udp_v6.is_none());
+        assert_eq!(tasks.len(), 2);
+    }
 }
 
 async fn handle_virtual_dns_session(
@@ -1660,7 +1692,7 @@ async fn copy_ipv4_dns_responses(
 async fn handle_udp_gateway_session(
     mut udp_stack: IpStackUdpStream,
     udpgw_client: Arc<UdpGwClient>,
-    udp_dst: &socks5_impl::protocol::Address,
+    udp_dst: &socks5_impl::Address,
     proxy_handler: Arc<Mutex<dyn ProxyHandler>>,
     socket_queue: Option<Arc<SocketQueue>>,
     ipv6_enabled: bool,
@@ -1671,10 +1703,11 @@ async fn handle_udp_gateway_session(
 
     let mut stream = loop {
         match udpgw_client.pop_server_connection_from_queue().await {
-            Some(stream) => {
+            Some(mut stream) => {
                 if stream.is_closed() {
                     continue;
                 } else {
+                    stream.rotate_serial_number();
                     break stream;
                 }
             }
@@ -1691,7 +1724,7 @@ async fn handle_udp_gateway_session(
     let tcp_local_addr = stream.local_addr();
     let sn = stream.serial_number();
 
-    log::debug!("[UdpGw] Beginning stream {} {} -> {}", sn, &tcp_local_addr, udp_dst);
+    log::debug!("[UdpGw] Beginning stream {} {} -> {}", sn, tcp_local_addr, udp_dst);
 
     let Some(mut reader) = stream.get_reader() else {
         return Err("get reader failed".into());
@@ -1702,65 +1735,85 @@ async fn handle_udp_gateway_session(
     };
 
     let mut tmp_buf = vec![0; udp_mtu.into()];
+    // Partial inbound frame kept outside any future: makes the recv branch
+    // cancellation-safe under tokio::select! (see recv_udpgw_packet_csafe).
+    let mut recv_acc: Vec<u8> = Vec::with_capacity(4096);
+    // The connection may only go back to the pool when the flow ends without
+    // leaving a partially read frame behind (see recv_udpgw_packet_csafe).
+    let mut reusable = false;
 
     loop {
         tokio::select! {
             len = udp_stack.read(&mut tmp_buf) => {
                 let read_len = match len {
                     Ok(0) => {
-                        log::debug!("[UdpGw] Ending stream {} {} <> {}", sn, &tcp_local_addr, udp_dst);
+                        log::debug!("[UdpGw] Ending stream {} {} <> {}", sn, tcp_local_addr, udp_dst);
+                        reusable = true;
                         break;
                     }
                     Ok(n) => n,
                     Err(e) => {
-                        log::debug!("[UdpGw] Ending stream {} {} <> {} with udp stack \"{}\"", sn, &tcp_local_addr, udp_dst, e);
+                        log::debug!("[UdpGw] Ending stream {} {} <> {} with udp stack \"{}\"", sn, tcp_local_addr, udp_dst, e);
+                        reusable = true;
                         break;
                     }
                 };
                 crate::traffic_status::traffic_status_update(read_len, 0)?;
                 let sn = stream.serial_number();
                 if let Err(e) = UdpGwClient::send_udpgw_packet(ipv6_enabled, &tmp_buf[0..read_len], udp_dst, sn, &mut writer).await {
-                    log::debug!("[UdpGw] Ending stream {} {} <> {} with send_udpgw_packet {}", sn, &tcp_local_addr, udp_dst, e);
+                    log::debug!("[UdpGw] Ending stream {} {} <> {} with send_udpgw_packet {}", sn, tcp_local_addr, udp_dst, e);
                     break;
                 }
-                log::debug!("[UdpGw] stream {} {} -> {} send len {}", sn, &tcp_local_addr, udp_dst, read_len);
+                log::debug!("[UdpGw] stream {} {} -> {} send len {}", sn, tcp_local_addr, udp_dst, read_len);
                 stream.update_activity();
             }
-            ret = UdpGwClient::recv_udpgw_packet(udp_mtu, udp_timeout, &mut reader) => {
+            // Cancellation-safe reader (plain read() + caller-owned buffer):
+            // a select! cancellation mid-frame must never lose socket bytes.
+            // The per-read timeout is refreshed on every loop iteration, i.e.
+            // whenever the application sends a datagram, so active flows keep
+            // the stream alive while idle ones are still closed after udp_timeout.
+            ret = UdpGwClient::recv_udpgw_packet_csafe(udp_mtu, udp_timeout, &mut reader, &mut recv_acc) => {
                 if let Ok((len, _)) = ret {
                     crate::traffic_status::traffic_status_update(0, len)?;
                 }
                 match ret {
                     Err(e) => {
-                        log::warn!("[UdpGw] Ending stream {} {} <> {} with recv_udpgw_packet {}", sn, &tcp_local_addr, udp_dst, e);
+                        log::warn!("[UdpGw] Ending stream {} {} <> {} with recv_udpgw_packet {}", sn, tcp_local_addr, udp_dst, e);
                         stream.close();
                         break;
                     }
                     Ok((_, packet)) => match packet {
                         //should not received keepalive
                         UdpGwResponse::KeepAlive => {
-                            log::error!("[UdpGw] Ending stream {} {} <> {} with recv keepalive", sn, &tcp_local_addr, udp_dst);
+                            log::error!("[UdpGw] Ending stream {} {} <> {} with recv keepalive", sn, tcp_local_addr, udp_dst);
                             stream.close();
                             break;
                         }
                         //server udp may be timeout,can continue to receive udp data?
                         UdpGwResponse::Error => {
-                            log::debug!("[UdpGw] Ending stream {} {} <> {} with recv udp error", sn, &tcp_local_addr, udp_dst);
+                            log::debug!("[UdpGw] Ending stream {} {} <> {} with recv udp error", sn, tcp_local_addr, udp_dst);
                             stream.update_activity();
                             continue;
                         }
                         UdpGwResponse::TcpClose => {
-                            log::error!("[UdpGw] Ending stream {} {} <> {} with tcp closed", sn, &tcp_local_addr, udp_dst);
+                            log::error!("[UdpGw] Ending stream {} {} <> {} with tcp closed", sn, tcp_local_addr, udp_dst);
                             stream.close();
                             break;
                         }
                         UdpGwResponse::Data(data) => {
-                            use socks5_impl::protocol::StreamOperation;
+                            let conn_id = data.header.conn_id;
+                            if conn_id != sn {
+                                log::debug!("[UdpGw] stream {sn} {tcp_local_addr} <- {udp_dst} ignoring late packet for retired conn_id {conn_id}");
+                                stream.update_activity();
+                                continue;
+                            }
+                            use socks5_impl::StreamOperation;
                             let len = data.len();
                             let f = data.header.flags;
-                            log::debug!("[UdpGw] stream {sn} {} <- {} receive {f} len {len}", &tcp_local_addr, udp_dst);
+                            log::debug!("[UdpGw] stream {sn} {} <- {} receive {f} len {len}", tcp_local_addr, udp_dst);
                             if let Err(e) = udp_stack.write_all(&data.data).await {
-                                log::error!("[UdpGw] Ending stream {} {} <> {} with send_udp_packet {}", sn, &tcp_local_addr, udp_dst, e);
+                                log::error!("[UdpGw] Ending stream {} {} <> {} with send_udp_packet {}", sn, tcp_local_addr, udp_dst, e);
+                                reusable = true;
                                 break;
                             }
                         }
@@ -1771,10 +1824,24 @@ async fn handle_udp_gateway_session(
         }
     }
 
-    if !stream.is_closed() {
-        udpgw_client.store_server_connection_full(stream, reader, writer).await;
+    // A connection may only return to the pool when no partial inbound frame is
+    // buffered: `recv_acc` can still hold bytes read from the socket before the
+    // recv branch was cancelled, and the next reader would start mid-stream.
+    if reusable && recv_acc.is_empty() {
+        match UdpGwClient::send_udpgw_close_packet(sn, &mut writer).await {
+            Ok(len) => {
+                crate::traffic_status::traffic_status_update(len, 0)?;
+                stream.update_activity();
+                udpgw_client.store_server_connection_full(stream, reader, writer).await;
+            }
+            Err(e) => {
+                log::debug!("[UdpGw] stream {sn} {tcp_local_addr} -> {udp_dst} send close packet failed: {e}");
+                stream.close();
+            }
+        }
+    } else {
+        stream.close();
     }
-
     Ok(())
 }
 
@@ -1787,7 +1854,7 @@ async fn handle_udp_associate_session(
     bind: Option<DirectBind>,
     setup_timeout: Duration,
 ) -> crate::Result<()> {
-    use socks5_impl::protocol::{Address, StreamOperation, UdpHeader};
+    use socks5_impl::{Address, StreamOperation, protocol::UdpHeader};
 
     let (session_info, server_addr, domain_name, udp_addr) = {
         let handler = proxy_handler.lock().await;

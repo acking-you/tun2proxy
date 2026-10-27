@@ -1,4 +1,4 @@
-use tun2proxy::{ArgVerbosity, Args, BoxError};
+use tun2proxy::{Args, BoxError};
 
 fn main() -> Result<(), BoxError> {
     dotenvy::dotenv().ok();
@@ -36,28 +36,36 @@ fn main() -> Result<(), BoxError> {
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    rt.block_on(async move {
+    let (timer_cancel_tx, timer_cancel_rx) = std::sync::mpsc::channel();
+    let (res, timer_handle) = rt.block_on(async move {
         let res = main_async(args).await;
         // Start a timer to force exit after FORCE_EXIT_TIMEOUT seconds. Use a std thread
         // so the timer is not cancelled when the tokio runtime is being shut down.
         let _h = std::thread::spawn(move || {
             log::info!("Starting {:?} exit timer", tun2proxy::FORCE_EXIT_TIMEOUT);
-            // Delay some seconds then try to exit current process if not exited yet, normally this case should not happen
-            std::thread::sleep(tun2proxy::FORCE_EXIT_TIMEOUT);
-            log::info!("Forcing exit now.");
-            std::process::exit(-1);
+            if timer_cancel_rx.recv_timeout(tun2proxy::FORCE_EXIT_TIMEOUT).is_err() {
+                // Delay some seconds then try to exit current process if not exited yet, normally this case should not happen
+                log::info!("Forcing exit now.");
+                std::process::exit(-1);
+            }
+            log::info!("Exit timer cancelled. Exiting normally without forcing exit.");
         });
 
         log::info!("Runtime.block_on exiting...");
         tokio::time::sleep(std::time::Duration::from_micros(100)).await;
 
-        res
-    })
+        (res, _h)
+    });
+    drop(rt);
+    let _ = timer_cancel_tx.send(());
+    let _ = timer_handle.join();
+    log::info!("Main function exiting normally.");
+    res
 }
 
 fn setup_logging(args: &Args) {
     let avoid_trace = match args.verbosity {
-        ArgVerbosity::Trace => ArgVerbosity::Debug,
+        log::LevelFilter::Trace => log::LevelFilter::Debug,
         _ => args.verbosity,
     };
     let default = format!(
@@ -75,7 +83,7 @@ async fn main_async(args: Args) -> Result<(), BoxError> {
         let args = args.clone();
         let shutdown_token = shutdown_token.clone();
         async move {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "unshare"))]
             if args.unshare && args.socket_transfer_fd.is_none() {
                 if let Err(err) = namespace_proxy_main(args, shutdown_token).await {
                     log::error!("namespace proxy error: {err}");
@@ -121,7 +129,7 @@ async fn main_async(args: Args) -> Result<(), BoxError> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "unshare"))]
 async fn namespace_proxy_main(
     _args: Args,
     shutdown_token: tokio_util::sync::CancellationToken,

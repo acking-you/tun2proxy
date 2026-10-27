@@ -1,12 +1,12 @@
 //! Bounded ICMP Echo forwarding through proxy-everything's local SOCKS5 extension.
 //! No reply is injected until the remote endpoint reports an actual echo reply.
 
-use crate::{ArgProxy, Args};
+use crate::{Args, ProxyParameters, ProxyType};
 use ipstack::IpStackUnknownTransport;
 use std::{
     collections::HashMap,
     io::{self, IoSlice},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -55,18 +55,32 @@ pub async fn write_packet<W: AsyncWrite + Unpin>(writer: &mut W, packet: &[u8]) 
     writer.flush().await
 }
 
-pub(crate) fn validate_options(args: &Args) -> io::Result<()> {
-    if args.icmp_echo
-        && (args.proxy.proxy_type != crate::args::ProxyType::Socks5
-            || !args.proxy.addr.ip().is_loopback()
-            || args.proxy.credentials.is_some())
-    {
-        return Err(io::Error::new(
+/// The unauthenticated loopback SOCKS5 endpoint that carries the extension, if
+/// `proxy` names one by IP literal. Host names are not resolved here.
+fn echo_endpoint(proxy: &ProxyParameters) -> Option<SocketAddr> {
+    if proxy.proxy_type != ProxyType::Socks5 || proxy.credentials.is_some() {
+        return None;
+    }
+    let endpoint = match proxy.addr.as_ref()? {
+        socks5_impl::Address::SocketAddress(address) => *address,
+        socks5_impl::Address::DomainAddress(host, port) => {
+            let host = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
+            SocketAddr::new(host.parse().ok()?, *port)
+        }
+    };
+    endpoint.ip().is_loopback().then_some(endpoint)
+}
+
+pub(crate) fn validate_options(args: &Args) -> io::Result<Option<SocketAddr>> {
+    if !args.icmp_echo {
+        return Ok(None);
+    }
+    echo_endpoint(&args.proxy).map(Some).ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
             "ICMP Echo requires proxy-everything's loopback SOCKS5 endpoint without authentication",
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -83,16 +97,15 @@ struct EchoRequest {
 
 pub(crate) struct EchoFlows {
     flows: HashMap<FlowKey, mpsc::Sender<EchoRequest>>,
-    proxy: ArgProxy,
+    proxy: SocketAddr,
     mtu: usize,
 }
 
 impl EchoFlows {
     pub(crate) fn new(args: &Args, mtu: u16) -> io::Result<Option<Self>> {
-        validate_options(args)?;
-        Ok(args.icmp_echo.then(|| Self {
+        Ok(validate_options(args)?.map(|proxy| Self {
             flows: HashMap::new(),
-            proxy: args.proxy.clone(),
+            proxy,
             mtu: mtu as usize,
         }))
     }
@@ -129,7 +142,7 @@ impl EchoFlows {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 // JoinSet also owns the worker; no detached flow can outlive TUN.
                 let (sender, receiver) = mpsc::channel(QUEUE_DEPTH);
-                let proxy = self.proxy.clone();
+                let proxy = self.proxy;
                 let target = domain.unwrap_or_else(|| Arc::from(packet.dst_addr().to_string()));
                 let ipv6 = packet.dst_addr().is_ipv6();
                 tasks.spawn(async move {
@@ -148,8 +161,8 @@ impl EchoFlows {
     }
 }
 
-async fn connect(proxy: &ArgProxy, target: &str, ipv6: bool) -> io::Result<TcpStream> {
-    let mut stream = TcpStream::connect(proxy.addr).await?;
+async fn connect(proxy: SocketAddr, target: &str, ipv6: bool) -> io::Result<TcpStream> {
+    let mut stream = TcpStream::connect(proxy).await?;
     stream.set_nodelay(true)?;
     let mut request = vec![5, 1, 0, 5, SOCKS5_ECHO, 0];
     match target.parse::<IpAddr>() {
@@ -181,8 +194,8 @@ async fn connect(proxy: &ArgProxy, target: &str, ipv6: bool) -> io::Result<TcpSt
     Ok(stream)
 }
 
-async fn run_flow(proxy: ArgProxy, target: Arc<str>, ipv6: bool, mut requests: mpsc::Receiver<EchoRequest>) -> io::Result<()> {
-    let mut stream = tokio::time::timeout(ECHO_TIMEOUT, connect(&proxy, &target, ipv6)).await??;
+async fn run_flow(proxy: SocketAddr, target: Arc<str>, ipv6: bool, mut requests: mpsc::Receiver<EchoRequest>) -> io::Result<()> {
+    let mut stream = tokio::time::timeout(ECHO_TIMEOUT, connect(proxy, &target, ipv6)).await??;
     let mut response = Vec::new();
     while let Ok(Some(EchoRequest { packet, deadline })) = tokio::time::timeout(IDLE_TIMEOUT, requests.recv()).await {
         if deadline <= tokio::time::Instant::now() {
@@ -251,14 +264,16 @@ mod tests {
         let mut args = Args::default();
         assert!(!args.icmp_echo);
         args.icmp_echo = true;
-        args.proxy = ArgProxy::try_from("socks5://127.0.0.1:1080").unwrap();
-        validate_options(&args).unwrap();
+        args.proxy = ProxyParameters::try_from("socks5://127.0.0.1:1080").unwrap();
+        assert_eq!(validate_options(&args).unwrap(), Some("127.0.0.1:1080".parse().unwrap()));
+        args.proxy = ProxyParameters::try_from("socks5://[::1]:1080").unwrap();
+        assert_eq!(validate_options(&args).unwrap(), Some("[::1]:1080".parse().unwrap()));
         for proxy in [
             "http://127.0.0.1:1080",
             "socks5://192.0.2.1:1080",
             "socks5://user:pass@127.0.0.1:1080",
         ] {
-            args.proxy = ArgProxy::try_from(proxy).unwrap();
+            args.proxy = ProxyParameters::try_from(proxy).unwrap();
             assert!(validate_options(&args).is_err());
         }
     }
