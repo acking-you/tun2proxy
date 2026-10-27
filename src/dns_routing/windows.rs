@@ -87,11 +87,9 @@ impl State {
 // ETW payload fields are packed, not naturally aligned. Decode from byte slices
 // and accept only the manifest versions whose layouts we understand.
 fn wide(data: &mut &[u8]) -> Option<String> {
-    let end = data.chunks_exact(2).position(|c| c == [0, 0])?;
-    let units = data[..end * 2]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect::<Vec<_>>();
+    let (pairs, _) = data.as_chunks::<2>();
+    let end = pairs.iter().position(|pair| *pair == [0, 0])?;
+    let units = pairs[..end].iter().map(|pair| u16::from_le_bytes(*pair)).collect::<Vec<_>>();
     *data = &data[(end + 1) * 2..];
     String::from_utf16(&units).ok()
 }

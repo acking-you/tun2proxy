@@ -264,17 +264,11 @@ pub fn detect(manual: Option<&str>, tun_name: Option<&str>) -> crate::Result<Bin
 /// Whether a non-blocking `connect` returned the "in progress" status rather
 /// than a real error.
 fn connect_in_progress(err: &std::io::Error) -> bool {
-    if err.kind() == std::io::ErrorKind::WouldBlock {
-        return true;
-    }
     #[cfg(unix)]
-    {
-        err.raw_os_error() == Some(nix::libc::EINPROGRESS)
-    }
+    let in_progress = err.raw_os_error() == Some(nix::libc::EINPROGRESS);
     #[cfg(not(unix))]
-    {
-        false
-    }
+    let in_progress = false;
+    err.kind() == std::io::ErrorKind::WouldBlock || in_progress
 }
 
 /// Bind `socket` to the configured physical interface for the given peer family.

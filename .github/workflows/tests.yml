@@ -19,7 +19,7 @@ jobs:
       - uses: ./.github/actions/checkout-ipstack
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-01-26
+          toolchain: nightly-2026-10-26
       - name: Populate .env
         env:
           DOTENV: ${{ secrets.DOTENV }}

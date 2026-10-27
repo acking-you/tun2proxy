@@ -51,9 +51,9 @@ Echo from blocking TCP/UDP. Only matching real remote Echo replies are returned;
 arbitrary IP protocols and fragmented Echo are outside its scope. The parent
 repository documents the [wire format and exit requirements](https://github.com/acking-you/proxy-everything/blob/fix/tun-resilience-20261003/docs/tun-icmp-echo.md).
 
-DNS encoding uses Hickory 0.26.1, including the name-compression CPU exhaustion
-fix for [GHSA-q2qq-hmj6-3wpp](https://github.com/hickory-dns/hickory-dns/security/advisories/GHSA-q2qq-hmj6-3wpp).
-This requires Rust 1.88 or later. DNS validation, Fake-IP behavior and IPv6
+DNS encoding requires Hickory 0.26.3 or later, which includes the name-compression
+CPU exhaustion fix for [GHSA-q2qq-hmj6-3wpp](https://github.com/hickory-dns/hickory-dns/security/advisories/GHSA-q2qq-hmj6-3wpp).
+The fork requires Rust 1.95 or later. DNS validation, Fake-IP behavior and IPv6
 filtering retain their existing wire behavior with the stable message API.
 
 ## Session Info for Per-App Routing (Android)

@@ -28,7 +28,7 @@ jobs:
       - uses: ./.github/actions/checkout-ipstack
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-01-26
+          toolchain: nightly-2026-10-26
           components: clippy, rustfmt
 
       - name: rustfmt
@@ -63,7 +63,7 @@ jobs:
       - uses: ./.github/actions/checkout-ipstack
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-01-26
+          toolchain: nightly-2026-10-26
           components: clippy, rustfmt
       - name: Install cargo ndk and rust compiler for android target
         if: ${{ !cancelled() }}
@@ -88,7 +88,7 @@ jobs:
       - uses: ./.github/actions/checkout-ipstack
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2026-01-26
+          toolchain: nightly-2026-10-26
           components: clippy, rustfmt
       - name: Install rust compiler for iOS targets
         if: ${{ !cancelled() }}

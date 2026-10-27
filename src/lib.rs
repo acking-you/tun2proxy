@@ -181,7 +181,7 @@ struct SessionCountSnapshot {
 impl SessionCounts {
     fn try_acquire(self: &Arc<Self>, protocol: IpProtocol, max_sessions: usize) -> Option<SessionPermit> {
         self.total
-            .fetch_update(Relaxed, Relaxed, |count| (count < max_sessions).then_some(count + 1))
+            .try_update(Relaxed, Relaxed, |count| (count < max_sessions).then_some(count + 1))
             .ok()?;
         self.protocol_count(protocol).fetch_add(1, Relaxed);
         let snapshot = self.snapshot();

@@ -6,4 +6,4 @@ runs:
     - shell: bash
       run: |
         git clone --no-checkout https://github.com/acking-you/ipstack.git ../ipstack
-        git -C ../ipstack checkout 5d5450cad1d3a01085afd425bdb5b4839ec6708e
+        git -C ../ipstack checkout 418ed41ed9358b5f4030c5fea1a5edc4b492ab54

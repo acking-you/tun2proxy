@@ -4,11 +4,10 @@ version = "0.9.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/tun2proxy/tun2proxy"
-homepage = "https://github.com/tun2proxy/tun2proxy"
 authors = ["B. Blechschmidt", "ssrlive"]
 description = "Tunnel interface to proxy"
 readme = "README.md"
-rust-version = "1.90"
+rust-version = "1.95"
 default-run = "tun2proxy-bin"
 
 [lib]
@@ -57,8 +56,9 @@ env_logger = { version = "0.11.11", default-features = false, features = [
 ] }
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher", "inline-more"] }
 hashlink = "0.12.2"
-# Includes the bounded name-compression fix for GHSA-q2qq-hmj6-3wpp.
-hickory-proto = "=0.26.3"
+# 0.26.1 fixed the name-compression CPU exhaustion GHSA-q2qq-hmj6-3wpp; keep the
+# floor above it.
+hickory-proto = "0.26.3"
 httparse = "1.10.1"
 internet-checksum = "0.2.1"
 # The sibling fork, which carries TCP and UDP fixes not yet upstream. No version
@@ -68,7 +68,6 @@ log = { version = "0.4.34", default-features = false, features = [
     "std",
     "serde",
 ] }
-percent-encoding = "2.3.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 shlex = "2.0.1"
@@ -78,7 +77,7 @@ socks5-impl = { version = "0.10.3", default-features = false, features = [
     "serde",
 ] }
 thiserror = "2.0.21"
-tokio = { version = "1.54.0", default-features = false, features = [
+tokio = { version = "1.54.1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
     "net",
@@ -90,7 +89,6 @@ tokio-util = { version = "0.7.20", features = ["rt"] }
 tproxy-config = { version = "^7.0.9", default-features = false }
 tun = { version = "0.8.14", features = ["async"] }
 unicase = "2.10.0"
-url = "2.5.8"
 
 [target.'cfg(target_os="android")'.dependencies]
 android_logger = "0.15.1"
@@ -98,7 +96,7 @@ jni = { version = "0.22.4", default-features = false }
 
 [target.'cfg(target_os="linux")'.dependencies]
 bincode-next = { version = "3.1.1", optional = true }
-tokio = { version = "1.54.0", default-features = false, optional = true, features = [
+tokio = { version = "1.54.1", default-features = false, optional = true, features = [
     "process",
 ] }
 
@@ -111,12 +109,12 @@ netstat2 = "0.11.2"
 socket2 = "0.6.5"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-netdev = "0.46.3"
+netdev = "0.47.0"
 
 [target.'cfg(target_os="windows")'.dependencies]
 # Gateway MAC discovery sends synchronous ARP probes, including to TUN portals.
 # Route selection and DNS only need passive IP Helper snapshots on Windows.
-netdev = { version = "0.46.3", default-features = false }
+netdev = { version = "0.47.0", default-features = false }
 windows-service = "0.8.1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -152,7 +150,7 @@ chrono = { version = "0.4.45", default-features = false, features = [
 serde_json = "1.0.154"
 
 [dev-dependencies]
-tokio = { version = "1.54.0", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 
 # [profile.release]
 # strip = "symbols"
