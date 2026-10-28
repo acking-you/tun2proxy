@@ -97,6 +97,8 @@ mod session_info;
 pub mod socket_transfer;
 mod socks;
 mod traffic_status;
+#[cfg(windows)]
+mod udp_bypass;
 #[cfg(feature = "udpgw")]
 pub mod udpgw;
 mod virtual_dns;
@@ -891,6 +893,26 @@ where
 
     let session_counts = Arc::new(SessionCounts::default());
 
+    #[cfg(windows)]
+    let udp_bypass = Arc::new(udp_bypass::Pool::new(args.max_sessions, egress_updates.clone()));
+    #[cfg(windows)]
+    managed_tasks.spawn({
+        let pool = udp_bypass.clone();
+        let shutdown = shutdown_token.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        if pool.is_empty() { continue; }
+                        pool.maintain().await;
+                    }
+                }
+            }
+        }
+    });
+
     // Concurrent sessions are the term that multiplies every per-session buffer,
     // and `tcp_timeout` keeps idle ones alive for minutes. Without a periodic
     // reading there is no way to tell a busy device from a memory problem, since
@@ -1144,6 +1166,8 @@ where
                 });
             }
             IpStackStream::Udp(udp) => {
+                #[cfg(windows)]
+                let udp_bypass = udp_bypass.clone();
                 let Some(session_permit) = session_counts.try_acquire(IpProtocol::Udp, max_sessions) else {
                     if args.exit_on_fatal_error {
                         log::info!("Too many sessions that over {max_sessions}, exiting...");
@@ -1201,6 +1225,8 @@ where
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let bypass = local_multicast || policy.as_ref().is_some_and(process::SessionPolicy::bypass);
                     #[cfg(windows)]
+                    let udp_policy = policy.as_ref().filter(|policy| policy.udp_owner.is_some()).cloned();
+                    #[cfg(windows)]
                     let dns_override = dns_routing::ProcessDns {
                         origins: dns_override
                             .origins
@@ -1225,6 +1251,18 @@ where
                         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                         if bypass {
                             restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await?;
+                            #[cfg(windows)]
+                            if !local_multicast && let Some(policy) = udp_policy {
+                                let flow = tokio::time::timeout(udp_setup_timeout, udp_bypass.open(info.src, info.dst, policy))
+                                    .await
+                                    .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "UDP bypass setup timed out"))??;
+                                if let Some(flow) = flow {
+                                    return flow.relay(udp).await;
+                                }
+                                log::debug!("Using isolated UDP bypass for {info}: shared mapping unavailable");
+                            }
+                            #[cfg(windows)]
+                            let direct_bind = udp_bypass.interface().or(direct_bind);
                             let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
                             return handle_udp_associate_session(
                                 udp,
@@ -1387,6 +1425,8 @@ where
             shutdown_started.elapsed()
         );
     }
+    #[cfg(windows)]
+    udp_bypass.shutdown().await;
     forwarding_result?;
     Ok(active_sessions)
 }
