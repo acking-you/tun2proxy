@@ -894,11 +894,10 @@ where
     let session_counts = Arc::new(SessionCounts::default());
 
     #[cfg(windows)]
-    let udp_bypass = Arc::new(udp_bypass::Pool::new(args.max_sessions));
+    let udp_bypass = Arc::new(udp_bypass::Pool::new(args.max_sessions, egress_updates.clone()));
     #[cfg(windows)]
     managed_tasks.spawn({
         let pool = udp_bypass.clone();
-        let egress = egress_updates.clone();
         let shutdown = shutdown_token.clone();
         async move {
             let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -907,15 +906,7 @@ where
                     _ = shutdown.cancelled() => break,
                     _ = tick.tick() => {
                         if pool.is_empty() { continue; }
-                        let owners = tokio::task::spawn_blocking(process::UdpOwners::snapshot).await;
-                        let interface = egress.as_ref().map(|egress| Arc::clone(&egress.borrow()));
-                        match owners {
-                            Ok(Ok(owners)) => pool.maintain(Some(&owners), interface.as_deref()),
-                            error => {
-                                log::debug!("Cannot validate UDP bypass owners; closing shared endpoints: {error:?}");
-                                pool.maintain(None, interface.as_deref());
-                            }
-                        }
+                        pool.maintain().await;
                     }
                 }
             }
@@ -1234,7 +1225,7 @@ where
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let bypass = local_multicast || policy.as_ref().is_some_and(process::SessionPolicy::bypass);
                     #[cfg(windows)]
-                    let udp_owner = policy.as_ref().and_then(|policy| policy.udp_owner);
+                    let udp_policy = policy.as_ref().filter(|policy| policy.udp_owner.is_some()).cloned();
                     #[cfg(windows)]
                     let dns_override = dns_routing::ProcessDns {
                         origins: dns_override
@@ -1261,14 +1252,17 @@ where
                         if bypass {
                             restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await?;
                             #[cfg(windows)]
-                            if !local_multicast && let Some(owner) = udp_owner {
-                                let interface =
-                                    direct_bind.ok_or_else(|| std::io::Error::other("UDP bypass physical interface unavailable"))?;
-                                let flow = tokio::time::timeout(udp_setup_timeout, udp_bypass.open(info.src, info.dst, owner, interface))
+                            if !local_multicast && let Some(policy) = udp_policy {
+                                let flow = tokio::time::timeout(udp_setup_timeout, udp_bypass.open(info.src, info.dst, policy))
                                     .await
                                     .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "UDP bypass setup timed out"))??;
-                                return flow.relay(udp).await;
+                                if let Some(flow) = flow {
+                                    return flow.relay(udp).await;
+                                }
+                                log::debug!("Using isolated UDP bypass for {info}: shared mapping unavailable");
                             }
+                            #[cfg(windows)]
+                            let direct_bind = udp_bypass.interface().or(direct_bind);
                             let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
                             return handle_udp_associate_session(
                                 udp,
@@ -1382,13 +1376,6 @@ where
                     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let result = Some(relay.await);
 
-                    #[cfg(windows)]
-                    if result.is_none()
-                        && bypass
-                        && let Some(owner) = udp_owner
-                    {
-                        udp_bypass.invalidate(info.src, owner);
-                    }
                     if let Some(Err(err)) = result {
                         if matches!(&err, Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut) {
                             log::debug!("Ending idle {info}: {err}");

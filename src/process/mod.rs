@@ -45,29 +45,40 @@ struct SessionIdentity {
 }
 
 #[cfg(windows)]
-#[derive(Debug)]
-pub(crate) struct UdpOwners(Vec<SocketEntry>);
+#[derive(Debug, Default)]
+pub(crate) struct UdpOwners(HashMap<u16, Vec<SocketEntry>>);
 
 #[cfg(windows)]
 impl UdpOwners {
     pub(crate) fn snapshot() -> std::io::Result<Self> {
-        windows_udp::snapshot().map(Self)
+        let mut by_port = HashMap::<_, Vec<_>>::new();
+        for entry in windows_udp::snapshot()? {
+            by_port.entry(entry.local.port()).or_default().push(entry);
+        }
+        Ok(Self(by_port))
     }
 
     pub(crate) fn get(&self, source: SocketAddr) -> Option<SocketOwner> {
-        udp_owner(&self.0, source)
+        // Maintenance validates every pooled endpoint; avoid scanning the full
+        // machine-wide socket table once for each endpoint.
+        udp_owner(self.0.get(&source.port())?, source)
     }
 }
 
 #[cfg(windows)]
 fn udp_owner(entries: &[SocketEntry], source: SocketAddr) -> Option<SocketOwner> {
-    let candidates = candidate_entries(entries, IpProtocol::Udp, source, source);
-    // Shared-address/port binds are ambiguous even if both belong to one PID.
-    // Never merge them or guess which original socket should receive a reply.
-    match candidates.as_slice() {
-        [entry] if entry.local.is_ipv4() == source.is_ipv4() => entry.udp_owner,
-        _ => None,
-    }
+    // Unlike process classification, sharing cannot prefer a wildcard over
+    // another concrete bind on the same port. The table does not expose V6ONLY,
+    // so an IPv6 wildcard is also a possible owner of IPv4 traffic.
+    let mut candidates = entries.iter().filter(|entry| {
+        entry.protocol == IpProtocol::Udp
+            && entry.local.port() == source.port()
+            && (entry.local.is_ipv4() == source.is_ipv4() || (source.is_ipv4() && entry.local.ip().is_unspecified()))
+    });
+    let entry = candidates.next()?;
+    (candidates.next().is_none() && entry.local.is_ipv4() == source.is_ipv4())
+        .then_some(entry.udp_owner)
+        .flatten()
 }
 
 #[derive(Default)]
@@ -91,6 +102,7 @@ pub(crate) struct ProcessMatcher {
 /// The socket owner's identity is pinned for the lifetime of one relay. An OS
 /// table refresh can lose an owner, recycle a UDP port, or see a different
 /// ancestor chain; none of those events is a change to this session's policy.
+#[derive(Clone)]
 pub struct SessionPolicy {
     names: ProcessBypass,
     identities: Vec<String>,
@@ -103,6 +115,11 @@ pub struct SessionPolicy {
 impl SessionPolicy {
     pub fn bypass(&self) -> bool {
         self.bypass
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn is_current(&self) -> bool {
+        matches_policy(&self.names, &self.identities) == self.bypass
     }
 
     #[cfg(windows)]

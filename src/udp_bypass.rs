@@ -4,28 +4,60 @@
 
 use crate::{
     direct::{self, BindInterface},
-    process::{SocketOwner, UdpOwners},
+    process::{SessionPolicy, SocketOwner, UdpOwners},
 };
 use ipstack::IpStackUdpStream;
 use std::{
     collections::HashMap,
+    future::Future,
     io,
     net::SocketAddr,
+    os::windows::io::AsRawSocket,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
     net::UdpSocket,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch},
     task::JoinSet,
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
+use windows_sys::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SOCKET_ERROR, WSAGetLastError, WSAIoctl};
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_PEERS: usize = 256;
+const OWNER_FAILURE_GRACE: Duration = Duration::from_secs(6);
 const QUEUED_BYTES: usize = 8 * 1024 * 1024;
 const PEER_QUEUE: usize = 16;
+
+fn bind_shared_udp(ipv6: bool, interface: &BindInterface) -> io::Result<UdpSocket> {
+    let socket = direct::bind_udp_unconnected(ipv6, interface)?;
+    // ICMP errors cannot be attributed to one peer on a shared socket. Suppress
+    // both port-unreachable and TTL-expired notifications, per Winsock IOCTLs.
+    for control in [SIO_UDP_CONNRESET, SIO_UDP_NETRESET] {
+        let disabled = 0u32;
+        let mut returned = 0;
+        // SAFETY: the socket is live; both buffers are correctly sized and the
+        // call is synchronous, with no overlapped operation or retained pointers.
+        let result = unsafe {
+            WSAIoctl(
+                socket.as_raw_socket() as _,
+                control,
+                (&disabled as *const u32).cast(),
+                size_of::<u32>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if result == SOCKET_ERROR {
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+    }
+    Ok(socket)
+}
 
 struct Datagram {
     bytes: Vec<u8>,
@@ -46,6 +78,15 @@ struct Endpoint {
 }
 
 impl Endpoint {
+    fn uses_interface(&self, source: SocketAddr, interface: &BindInterface) -> bool {
+        // A unicast binding uses only the interface index of its address family.
+        if source.is_ipv6() {
+            self.interface.ipv6_index == interface.ipv6_index
+        } else {
+            self.interface.ipv4_index == interface.ipv4_index
+        }
+    }
+
     fn close(&self) {
         let mut state = self.state.lock().unwrap();
         self.closed.cancel();
@@ -57,13 +98,15 @@ impl Endpoint {
         self.closed.is_cancelled() || (state.routes.is_empty() && state.last_activity.elapsed() >= IDLE_TIMEOUT)
     }
 
-    async fn receive(self: Arc<Self>, budget: Arc<Semaphore>) {
+    async fn receive(self: Arc<Self>, budget: Arc<Semaphore>, policy_changed: impl Future<Output = ()>) {
         let _cancel_on_exit = self.closed.clone().drop_guard();
+        tokio::pin!(policy_changed);
         let mut buffer = vec![0; u16::MAX as usize];
         loop {
             let result = tokio::select! {
                 biased;
                 _ = self.closed.cancelled() => break,
+                _ = &mut policy_changed => break,
                 result = self.socket.recv_from(&mut buffer) => result,
             };
             let (length, peer) = match result {
@@ -98,6 +141,7 @@ impl Endpoint {
 struct PoolState {
     endpoints: HashMap<SocketAddr, Arc<Endpoint>>,
     tasks: JoinSet<()>,
+    owner_failure_since: Option<Instant>,
 }
 
 impl PoolState {
@@ -116,18 +160,21 @@ pub(crate) struct Pool {
     state: Mutex<PoolState>,
     budget: Arc<Semaphore>,
     owner_lookup: Arc<Semaphore>,
+    egress: Option<watch::Receiver<Arc<BindInterface>>>,
     limit: usize,
 }
 
 impl Pool {
-    pub(crate) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize, egress: Option<watch::Receiver<Arc<BindInterface>>>) -> Self {
         Self {
             state: Mutex::new(PoolState {
                 endpoints: HashMap::new(),
                 tasks: JoinSet::new(),
+                owner_failure_since: None,
             }),
             budget: Arc::new(Semaphore::new(QUEUED_BYTES)),
             owner_lookup: Arc::new(Semaphore::new(1)),
+            egress,
             limit: limit.min(1024),
         }
     }
@@ -136,30 +183,50 @@ impl Pool {
         self.state.lock().unwrap().endpoints.is_empty()
     }
 
-    pub(crate) async fn open(
-        &self,
-        source: SocketAddr,
-        peer: SocketAddr,
-        owner: SocketOwner,
-        interface: Arc<BindInterface>,
-    ) -> io::Result<Flow> {
-        // Fake-IP recovery can await DNS after classification. Revalidate the
-        // binding before attaching it, including when the old pool entry expired.
-        // Keep the permit in the OS job if the calling flow is cancelled.
-        let permit = self.owner_lookup.clone().acquire_owned().await.map_err(io::Error::other)?;
-        let current = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            UdpOwners::snapshot().map(|owners| owners.get(source))
+    async fn snapshot(&self) -> (Arc<OwnedSemaphorePermit>, io::Result<UdpOwners>) {
+        // Serialize the OS read AND its application across opens and maintenance.
+        // Retain the permit in a cancelled caller's blocking job too.
+        let permit = Arc::new(
+            self.owner_lookup
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("owner lookup is never closed"),
+        );
+        let worker_permit = permit.clone();
+        let owners = tokio::task::spawn_blocking(move || {
+            let _permit = worker_permit;
+            UdpOwners::snapshot()
         })
         .await
-        .map_err(io::Error::other)??;
-        if current != Some(owner) {
+        .map_err(io::Error::other)
+        .and_then(std::convert::identity);
+        (permit, owners)
+    }
+
+    pub(crate) fn interface(&self) -> Option<Arc<BindInterface>> {
+        self.egress.as_ref().map(|egress| Arc::clone(&egress.borrow()))
+    }
+
+    pub(crate) async fn open(&self, source: SocketAddr, peer: SocketAddr, policy: SessionPolicy) -> io::Result<Option<Flow>> {
+        let (_permit, owners) = self.snapshot().await;
+        // Read the current interface after DNS/OS lookup, and keep the watch
+        // borrow through registration so a delayed flow cannot restore an old bind.
+        let interface = self.egress.as_ref().map(watch::Receiver::borrow);
+        self.maintain_with(owners.as_ref().ok(), interface.as_deref().map(Arc::as_ref));
+        let owners = owners?;
+        let owner = policy.udp_owner.ok_or(io::ErrorKind::PermissionDenied)?;
+        if owners.get(source) != Some(owner) || !policy.bypass() || !policy.is_current() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "UDP bypass socket owner changed during setup",
+                "UDP bypass owner or policy changed during setup",
             ));
         }
-        self.open_with(source, peer, owner, interface, direct::bind_udp_unconnected)
+        let interface = interface
+            .as_deref()
+            .cloned()
+            .ok_or_else(|| io::Error::other("UDP bypass physical interface unavailable"))?;
+        self.open_with(source, peer, owner, interface, policy.wait_for_routing_change(), bind_shared_udp)
     }
 
     fn open_with(
@@ -168,8 +235,9 @@ impl Pool {
         peer: SocketAddr,
         owner: SocketOwner,
         interface: Arc<BindInterface>,
+        policy_changed: impl Future<Output = ()> + Send + 'static,
         bind: impl FnOnce(bool, &BindInterface) -> io::Result<UdpSocket>,
-    ) -> io::Result<Flow> {
+    ) -> io::Result<Option<Flow>> {
         if source.is_ipv4() != peer.is_ipv4() || peer.ip().is_multicast() || peer.ip().is_unspecified() {
             return Err(io::ErrorKind::InvalidInput.into());
         }
@@ -184,14 +252,8 @@ impl Pool {
             }
         });
         if let Some(endpoint) = pool.endpoints.get(&source)
-            && (endpoint.owner != owner || *endpoint.interface != *interface)
+            && (endpoint.owner != owner || !endpoint.uses_interface(source, &interface))
         {
-            if endpoint.owner != owner && owner.bound_at <= endpoint.owner.bound_at {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "stale UDP bypass socket generation",
-                ));
-            }
             endpoint.close();
             pool.endpoints.remove(&source);
         }
@@ -210,7 +272,7 @@ impl Pool {
                 if let Some((source, _)) = oldest {
                     pool.endpoints.remove(&source).unwrap().close();
                 } else {
-                    return Err(io::Error::other("UDP bypass endpoint limit reached"));
+                    return Ok(None);
                 }
             }
             let socket = Arc::new(bind(source.is_ipv6(), &interface)?);
@@ -229,36 +291,54 @@ impl Pool {
                 }),
                 closed: CancellationToken::new(),
             });
-            pool.tasks.spawn(endpoint.clone().receive(self.budget.clone()));
+            pool.tasks.spawn(endpoint.clone().receive(self.budget.clone(), policy_changed));
             pool.endpoints.insert(source, endpoint);
         }
         let endpoint = pool.endpoints[&source].clone();
         let mut state = endpoint.state.lock().unwrap();
+        if endpoint.closed.is_cancelled() {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
         // Two virtual destinations can resolve to the same real peer. Their
         // replies cannot be disambiguated, so never steal an existing route.
         if state.routes.contains_key(&peer) {
-            return Err(io::Error::new(io::ErrorKind::AddrInUse, "ambiguous UDP bypass reply route"));
+            return Ok(None);
         }
-        if state.routes.len() >= MAX_PEERS {
-            return Err(io::Error::other("UDP bypass peer limit reached"));
-        }
+        // Each route already owns a global session permit. A second arbitrary
+        // per-source limit would break high-fanout DHT and game traffic.
         let (sender, receiver) = mpsc::channel(PEER_QUEUE);
-        state.routes.insert(peer, sender.clone());
+        state.routes.insert(peer, sender);
         state.last_activity = Instant::now();
         drop(state);
-        Ok(Flow {
-            endpoint,
-            peer,
-            sender,
-            receiver,
-        })
+        Ok(Some(Flow { endpoint, peer, receiver }))
     }
 
-    pub(crate) fn maintain(&self, owners: Option<&UdpOwners>, interface: Option<&BindInterface>) {
+    pub(crate) async fn maintain(&self) {
+        let (_permit, owners) = self.snapshot().await;
+        if let Err(error) = &owners {
+            log::debug!("Cannot validate UDP bypass owners: {error}");
+        }
+        let interface = self.egress.as_ref().map(watch::Receiver::borrow);
+        self.maintain_with(owners.as_ref().ok(), interface.as_deref().map(Arc::as_ref));
+    }
+
+    fn maintain_with(&self, owners: Option<&UdpOwners>, interface: Option<&BindInterface>) {
         let mut pool = self.state.lock().unwrap();
+        let ownership_unknown = if owners.is_some() {
+            pool.owner_failure_since = None;
+            false
+        } else {
+            pool.owner_failure_since.get_or_insert_with(Instant::now).elapsed() < OWNER_FAILURE_GRACE
+        };
+        if owners.is_none() && !ownership_unknown && !pool.endpoints.is_empty() {
+            log::warn!(
+                "UDP ownership verification unavailable for {OWNER_FAILURE_GRACE:?}; retiring {} endpoints",
+                pool.endpoints.len()
+            );
+        }
         pool.endpoints.retain(|source, endpoint| {
-            let keep = owners.and_then(|owners| owners.get(*source)) == Some(endpoint.owner)
-                && interface == Some(endpoint.interface.as_ref())
+            let keep = (ownership_unknown || owners.and_then(|owners| owners.get(*source)) == Some(endpoint.owner))
+                && interface.is_some_and(|interface| endpoint.uses_interface(*source, interface))
                 && !endpoint.expired();
             if !keep {
                 endpoint.close();
@@ -266,13 +346,6 @@ impl Pool {
             keep
         });
         pool.reap();
-    }
-
-    pub(crate) fn invalidate(&self, source: SocketAddr, owner: SocketOwner) {
-        let mut pool = self.state.lock().unwrap();
-        if pool.endpoints.get(&source).is_some_and(|endpoint| endpoint.owner == owner) {
-            pool.endpoints.remove(&source).unwrap().close();
-        }
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -291,19 +364,32 @@ impl Pool {
 pub(crate) struct Flow {
     endpoint: Arc<Endpoint>,
     peer: SocketAddr,
-    sender: mpsc::Sender<Datagram>,
     receiver: mpsc::Receiver<Datagram>,
 }
 
 impl Flow {
     async fn send(&self, payload: &[u8]) -> io::Result<()> {
-        tokio::select! {
-            biased;
-            _ = self.endpoint.closed.cancelled() => return Err(io::ErrorKind::BrokenPipe.into()),
-            sent = self.endpoint.socket.send_to(payload, self.peer) => { sent?; }
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.endpoint.closed.cancelled() => return Err(io::ErrorKind::BrokenPipe.into()),
+                ready = self.endpoint.socket.writable() => { ready?; }
+            }
+            let mut state = self.endpoint.state.lock().unwrap();
+            if self.endpoint.closed.is_cancelled() {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            // No await under the retirement lock: a completed close forbids
+            // both outbound sends and queued reply injection.
+            match self.endpoint.socket.try_send_to(payload, self.peer) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => {
+                    result?;
+                }
+            }
+            state.last_activity = Instant::now();
+            return Ok(());
         }
-        self.endpoint.state.lock().unwrap().last_activity = Instant::now();
-        Ok(())
     }
 
     pub(crate) async fn relay(mut self, mut stack: IpStackUdpStream) -> crate::Result<()> {
@@ -347,9 +433,9 @@ impl Flow {
 impl Drop for Flow {
     fn drop(&mut self) {
         let mut state = self.endpoint.state.lock().unwrap();
-        if state.routes.get(&self.peer).is_some_and(|route| route.same_channel(&self.sender)) {
-            state.routes.remove(&self.peer);
-        }
+        // Registration is exclusive for this Flow's lifetime, and a retired
+        // endpoint never accepts a replacement route.
+        state.routes.remove(&self.peer);
     }
 }
 

@@ -1,5 +1,6 @@
-//! Windows exposes the bind timestamp, unlike a PID-only UDP snapshot. It
-//! distinguishes a reopened socket even when its process and port are reused.
+//! Windows exposes a PID and bind timestamp, not a unique socket identifier.
+//! Fast rebinds can share a timestamp. Treat this as a best-effort ownership
+//! fingerprint; neither timestamp uniqueness nor chronological order is promised.
 
 use super::{IpProtocol, SocketEntry};
 use std::{
@@ -22,6 +23,7 @@ pub(crate) struct SocketOwner {
 }
 
 fn table(family: u32) -> io::Result<(Vec<u64>, usize)> {
+    const MAX_BYTES: usize = 32 * 1024 * 1024;
     // u64 storage supplies the alignment required by the OWNER_MODULE rows.
     let mut buffer = Vec::<u64>::new();
     let mut size = 0;
@@ -40,10 +42,12 @@ fn table(family: u32) -> io::Result<(Vec<u64>, usize)> {
         if result != ERROR_INSUFFICIENT_BUFFER {
             return Err(io::Error::from_raw_os_error(result as i32));
         }
-        if size > 32 * 1024 * 1024 {
+        if size as usize > MAX_BYTES {
             return Err(io::Error::other("UDP owner table exceeds size limit"));
         }
-        buffer.resize((size as usize).div_ceil(mem::size_of::<u64>()), 0);
+        // Leave room for concurrent binds rather than chasing exact table sizes.
+        let capacity = (size as usize + (size as usize / 2).max(4096)).min(MAX_BYTES);
+        buffer.resize(capacity.div_ceil(mem::size_of::<u64>()), 0);
         size = (buffer.len() * mem::size_of::<u64>()) as u32;
     }
     Err(io::Error::other("UDP owner table kept changing"))
@@ -120,7 +124,7 @@ mod tests {
     use crate::process::udp_owner;
 
     #[test]
-    fn bound_socket_identity_is_stable_and_changes_on_rebind() {
+    fn udp_snapshot_reports_live_bindings_and_removal() {
         for address in ["127.0.0.1:0", "[::1]:0"] {
             let socket = std::net::UdpSocket::bind(address).unwrap();
             let source = socket.local_addr().unwrap();
@@ -130,7 +134,11 @@ mod tests {
             drop(socket);
             assert_eq!(udp_owner(&snapshot().unwrap(), source), None);
             let _replacement = std::net::UdpSocket::bind(source).unwrap();
-            assert_ne!(udp_owner(&snapshot().unwrap(), source), Some(owner));
+            // Windows can reuse the timestamp within a clock tick. The table
+            // still reports the replacement, but cannot prove a new generation.
+            let replacement = udp_owner(&snapshot().unwrap(), source).unwrap();
+            assert_eq!(replacement.pid, std::process::id());
+            assert_eq!(udp_owner(&snapshot().unwrap(), source), Some(replacement));
         }
     }
 
@@ -143,6 +151,11 @@ mod tests {
         assert_eq!(udp_owner(std::slice::from_ref(&ipv6), source), None);
         assert_eq!(udp_owner(std::slice::from_ref(&first), source), first.udp_owner);
         assert_eq!(udp_owner(&[first.clone(), ipv6], source), None);
+        let concrete = entry(source, 9, 13);
+        assert_eq!(udp_owner(&[first.clone(), concrete], source), None);
         assert_eq!(udp_owner(&[first, second], source), None);
+        let v4 = entry("0.0.0.0:12345".parse().unwrap(), 7, 10);
+        let v6 = entry("[::]:12345".parse().unwrap(), 8, 12);
+        assert_eq!(udp_owner(&[v4, v6.clone()], "[fd00::2]:12345".parse().unwrap()), v6.udp_owner);
     }
 }
