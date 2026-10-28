@@ -19,6 +19,11 @@ use std::{collections::HashMap, net::SocketAddr, sync::Mutex, time::Instant};
 #[cfg_attr(target_os = "windows", path = "windows.rs")]
 mod imp;
 
+#[cfg(windows)]
+mod windows_udp;
+#[cfg(windows)]
+pub(crate) use windows_udp::SocketOwner;
+
 /// One row of the OS socket table relevant to bypass matching.
 #[derive(Debug, Clone)]
 struct SocketEntry {
@@ -28,6 +33,41 @@ struct SocketEntry {
     /// port. `netstat2` does not expose a remote endpoint for UDP.
     remote: Option<SocketAddr>,
     pids: Vec<u32>,
+    #[cfg(windows)]
+    udp_owner: Option<SocketOwner>,
+}
+
+#[derive(Default)]
+struct SessionIdentity {
+    names: Vec<String>,
+    #[cfg(windows)]
+    udp_owner: Option<SocketOwner>,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) struct UdpOwners(Vec<SocketEntry>);
+
+#[cfg(windows)]
+impl UdpOwners {
+    pub(crate) fn snapshot() -> std::io::Result<Self> {
+        windows_udp::snapshot().map(Self)
+    }
+
+    pub(crate) fn get(&self, source: SocketAddr) -> Option<SocketOwner> {
+        udp_owner(&self.0, source)
+    }
+}
+
+#[cfg(windows)]
+fn udp_owner(entries: &[SocketEntry], source: SocketAddr) -> Option<SocketOwner> {
+    let candidates = candidate_entries(entries, IpProtocol::Udp, source, source);
+    // Shared-address/port binds are ambiguous even if both belong to one PID.
+    // Never merge them or guess which original socket should receive a reply.
+    match candidates.as_slice() {
+        [entry] if entry.local.is_ipv4() == source.is_ipv4() => entry.udp_owner,
+        _ => None,
+    }
 }
 
 #[derive(Default)]
@@ -56,6 +96,8 @@ pub struct SessionPolicy {
     identities: Vec<String>,
     changes: tokio::sync::watch::Receiver<u64>,
     bypass: bool,
+    #[cfg(windows)]
+    pub(crate) udp_owner: Option<SocketOwner>,
 }
 
 impl SessionPolicy {
@@ -138,7 +180,7 @@ impl ProcessMatcher {
             .acquire_owned()
             .await
             .expect("lookup semaphore is never closed");
-        let identities = match tokio::task::spawn_blocking(move || {
+        let identity = match tokio::task::spawn_blocking(move || {
             let _permit = permit;
             this.identities_blocking(protocol, src, dst, requested_at)
         })
@@ -147,9 +189,10 @@ impl ProcessMatcher {
             Ok(result) => result,
             Err(err) => {
                 log::warn!("process bypass lookup task failed: {err}");
-                Vec::new()
+                SessionIdentity::default()
             }
         };
+        let identities = identity.names;
         let bypass = matches_policy(&self.names, &identities);
         if bypass {
             log::info!("bypassing {protocol} session {src} -> {dst}: process identities {identities:?}");
@@ -159,10 +202,12 @@ impl ProcessMatcher {
             identities,
             changes,
             bypass,
+            #[cfg(windows)]
+            udp_owner: identity.udp_owner,
         }
     }
 
-    fn identities_blocking(&self, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr, requested_at: Instant) -> Vec<String> {
+    fn identities_blocking(&self, protocol: IpProtocol, src: SocketAddr, dst: SocketAddr, requested_at: Instant) -> SessionIdentity {
         let mut cache = match self.cache.lock() {
             Ok(cache) => cache,
             Err(poisoned) => poisoned.into_inner(),
@@ -170,7 +215,11 @@ impl ProcessMatcher {
         if !snapshot_covers_request(cache.fetched_at, requested_at) {
             self.refresh(&mut cache);
         }
-        self.identities_in_cache(&mut cache, protocol, src, dst)
+        SessionIdentity {
+            names: self.identities_in_cache(&mut cache, protocol, src, dst),
+            #[cfg(windows)]
+            udp_owner: (protocol == IpProtocol::Udp).then(|| udp_owner(&cache.entries, src)).flatten(),
+        }
     }
 
     /// Look the session up against the current snapshot, resolving and memoizing
@@ -267,10 +316,25 @@ fn snapshot() -> crate::Result<Vec<SocketEntry>> {
     use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, get_sockets_info};
 
     let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
+    #[cfg(windows)]
+    let udp_entries = match windows_udp::snapshot() {
+        Ok(entries) => Some(entries),
+        Err(error) => {
+            log::debug!("UDP socket generations unavailable; disabling endpoint sharing for this snapshot: {error}");
+            None
+        }
+    };
+    #[cfg(not(windows))]
     let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
+    #[cfg(windows)]
+    let proto_flags = if udp_entries.is_some() {
+        ProtocolFlags::TCP
+    } else {
+        ProtocolFlags::TCP | ProtocolFlags::UDP
+    };
     let sockets = get_sockets_info(af_flags, proto_flags).map_err(|e| crate::Error::from(e.to_string()))?;
 
-    let entries = sockets
+    let entries: Vec<_> = sockets
         .into_iter()
         .map(|si| {
             let pids = si.associated_pids;
@@ -287,9 +351,17 @@ fn snapshot() -> crate::Result<Vec<SocketEntry>> {
                 local,
                 remote,
                 pids,
+                #[cfg(windows)]
+                udp_owner: None,
             }
         })
         .collect();
+    #[cfg(windows)]
+    let entries = {
+        let mut entries = entries;
+        entries.extend(udp_entries.unwrap_or_default());
+        entries
+    };
     Ok(entries)
 }
 
@@ -302,7 +374,14 @@ fn snapshot() -> crate::Result<Vec<SocketEntry>> {
 /// rows do not expose a remote endpoint, so matching falls back from the exact
 /// IP to an unspecified address and finally to another same-family local IP.
 fn candidate_pids(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr, dst: SocketAddr) -> Vec<u32> {
-    let concrete: Vec<u32> = entries
+    candidate_entries(entries, protocol, src, dst)
+        .into_iter()
+        .flat_map(|entry| entry.pids.iter().copied())
+        .collect()
+}
+
+fn candidate_entries(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr, dst: SocketAddr) -> Vec<&SocketEntry> {
+    let concrete: Vec<_> = entries
         .iter()
         .filter(|e| {
             e.protocol == protocol
@@ -310,7 +389,6 @@ fn candidate_pids(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr
                 && e.local.ip() == src.ip()
                 && (protocol == IpProtocol::Udp || e.remote == Some(dst))
         })
-        .flat_map(|e| e.pids.iter().copied())
         .collect();
     if !concrete.is_empty() {
         return concrete;
@@ -322,14 +400,12 @@ fn candidate_pids(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr
             .filter(|e| {
                 e.protocol == protocol && e.local.port() == src.port() && e.local.is_ipv4() == src.is_ipv4() && e.remote == Some(dst)
             })
-            .flat_map(|e| e.pids.iter().copied())
             .collect();
     }
 
-    let unspecified: Vec<u32> = entries
+    let unspecified: Vec<_> = entries
         .iter()
         .filter(|e| e.protocol == protocol && e.local.port() == src.port() && e.local.ip().is_unspecified())
-        .flat_map(|e| e.pids.iter().copied())
         .collect();
     if !unspecified.is_empty() {
         return unspecified;
@@ -338,7 +414,6 @@ fn candidate_pids(entries: &[SocketEntry], protocol: IpProtocol, src: SocketAddr
     entries
         .iter()
         .filter(|e| e.protocol == protocol && e.local.port() == src.port() && e.local.is_ipv4() == src.is_ipv4())
-        .flat_map(|e| e.pids.iter().copied())
         .collect()
 }
 
@@ -570,6 +645,8 @@ mod tests {
             local: SocketAddr::new(ip, port),
             remote,
             pids: vec![pid],
+            #[cfg(windows)]
+            udp_owner: None,
         }
     }
 

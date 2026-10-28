@@ -97,6 +97,8 @@ mod session_info;
 pub mod socket_transfer;
 mod socks;
 mod traffic_status;
+#[cfg(windows)]
+mod udp_bypass;
 #[cfg(feature = "udpgw")]
 pub mod udpgw;
 mod virtual_dns;
@@ -891,6 +893,35 @@ where
 
     let session_counts = Arc::new(SessionCounts::default());
 
+    #[cfg(windows)]
+    let udp_bypass = Arc::new(udp_bypass::Pool::new(args.max_sessions));
+    #[cfg(windows)]
+    managed_tasks.spawn({
+        let pool = udp_bypass.clone();
+        let egress = egress_updates.clone();
+        let shutdown = shutdown_token.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        if pool.is_empty() { continue; }
+                        let owners = tokio::task::spawn_blocking(process::UdpOwners::snapshot).await;
+                        let interface = egress.as_ref().map(|egress| Arc::clone(&egress.borrow()));
+                        match owners {
+                            Ok(Ok(owners)) => pool.maintain(Some(&owners), interface.as_deref()),
+                            error => {
+                                log::debug!("Cannot validate UDP bypass owners; closing shared endpoints: {error:?}");
+                                pool.maintain(None, interface.as_deref());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     // Concurrent sessions are the term that multiplies every per-session buffer,
     // and `tcp_timeout` keeps idle ones alive for minutes. Without a periodic
     // reading there is no way to tell a busy device from a memory problem, since
@@ -1144,6 +1175,8 @@ where
                 });
             }
             IpStackStream::Udp(udp) => {
+                #[cfg(windows)]
+                let udp_bypass = udp_bypass.clone();
                 let Some(session_permit) = session_counts.try_acquire(IpProtocol::Udp, max_sessions) else {
                     if args.exit_on_fatal_error {
                         log::info!("Too many sessions that over {max_sessions}, exiting...");
@@ -1201,6 +1234,8 @@ where
                     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                     let bypass = local_multicast || policy.as_ref().is_some_and(process::SessionPolicy::bypass);
                     #[cfg(windows)]
+                    let udp_owner = policy.as_ref().and_then(|policy| policy.udp_owner);
+                    #[cfg(windows)]
                     let dns_override = dns_routing::ProcessDns {
                         origins: dns_override
                             .origins
@@ -1225,6 +1260,15 @@ where
                         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                         if bypass {
                             restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await?;
+                            #[cfg(windows)]
+                            if !local_multicast && let Some(owner) = udp_owner {
+                                let interface =
+                                    direct_bind.ok_or_else(|| std::io::Error::other("UDP bypass physical interface unavailable"))?;
+                                let flow = tokio::time::timeout(udp_setup_timeout, udp_bypass.open(info.src, info.dst, owner, interface))
+                                    .await
+                                    .map_err(|_| std::io::Error::new(ErrorKind::TimedOut, "UDP bypass setup timed out"))??;
+                                return flow.relay(udp).await;
+                            }
                             let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
                             return handle_udp_associate_session(
                                 udp,
@@ -1338,6 +1382,13 @@ where
                     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
                     let result = Some(relay.await);
 
+                    #[cfg(windows)]
+                    if result.is_none()
+                        && bypass
+                        && let Some(owner) = udp_owner
+                    {
+                        udp_bypass.invalidate(info.src, owner);
+                    }
                     if let Some(Err(err)) = result {
                         if matches!(&err, Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut) {
                             log::debug!("Ending idle {info}: {err}");
@@ -1387,6 +1438,8 @@ where
             shutdown_started.elapsed()
         );
     }
+    #[cfg(windows)]
+    udp_bypass.shutdown().await;
     forwarding_result?;
     Ok(active_sessions)
 }
