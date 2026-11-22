@@ -103,6 +103,12 @@ pub struct Args {
     #[arg(long, value_name = "IP", default_value = "8.8.8.8")]
     pub dns_addr: IpAddr,
 
+    /// Optional fallback for physical DNS and bypassed destination resolution.
+    /// Standalone callers retain the legacy behavior of using `dns_addr`.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_dns_fallback: Option<IpAddr>,
+
     /// IP address pool to be used by virtual DNS in CIDR notation.
     #[arg(long, value_name = "CIDR", default_value = "198.18.0.0/15")]
     pub virtual_dns_pool: IpCidr,
@@ -264,6 +270,7 @@ impl Default for Args {
             upstream_bypass: None,
             dns: ArgDns::default(),
             dns_addr: "8.8.8.8".parse().unwrap(),
+            direct_dns_fallback: None,
             bypass: vec![],
             bypass_process: vec![],
             bind_interface: None,

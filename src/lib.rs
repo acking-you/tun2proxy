@@ -731,6 +731,7 @@ where
 
     let key = args.proxy.credentials.clone();
     let dns_addr = args.dns_addr;
+    let direct_dns_fallback = args.direct_dns_fallback.unwrap_or(dns_addr);
     let ipv6_enabled = args.ipv6_enabled;
     let udp_strategy = args.udp_strategy;
     let virtual_dns_portals = Arc::new(args.virtual_dns_portals.clone());
@@ -999,7 +1000,7 @@ where
                     #[cfg(windows)]
                     origins: dns_origins.clone(),
                     interface: direct_bind.clone(),
-                    configured_dns: dns_addr,
+                    configured_dns: direct_dns_fallback,
                     ipv6: ipv6_enabled,
                 };
                 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -1034,7 +1035,7 @@ where
                         let result = run_until_process_policy_change(
                             async {
                                 match direct_bind.as_deref() {
-                                    Some(iface) => physical_dns::tcp(&mut tcp, dns_addr, iface, ipv6_enabled).await,
+                                    Some(iface) => physical_dns::tcp(&mut tcp, direct_dns_fallback, iface, ipv6_enabled).await,
                                     None => Err(std::io::Error::other("physical DNS interface unavailable")),
                                 }
                             },
@@ -1113,7 +1114,7 @@ where
                     let (handler_result, bind): (HandlerResult, Option<DirectBind>) = {
                         let mut info = info;
                         let bypass_destination = if bypass {
-                            restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await
+                            restore_bypass_destination(&mut info, virtual_dns.as_ref(), direct_dns_fallback, direct_bind.as_ref()).await
                         } else {
                             Ok(())
                         };
@@ -1195,7 +1196,7 @@ where
                     #[cfg(windows)]
                     origins: dns_origins.clone(),
                     interface: direct_bind.clone(),
-                    configured_dns: dns_addr,
+                    configured_dns: direct_dns_fallback,
                     ipv6: ipv6_enabled,
                 };
                 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -1246,11 +1247,13 @@ where
                         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                         if info.dst.port() == DNS_PORT && (dns == ArgDns::Physical || bypass) {
                             let iface = direct_bind.ok_or_else(|| std::io::Error::other("physical DNS interface unavailable"))?;
-                            return physical_dns::udp(udp, dns_addr, iface, ipv6_enabled).await.map_err(Into::into);
+                            return physical_dns::udp(udp, direct_dns_fallback, iface, ipv6_enabled)
+                                .await
+                                .map_err(Into::into);
                         }
                         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                         if bypass {
-                            restore_bypass_destination(&mut info, virtual_dns.as_ref(), dns_addr, direct_bind.as_ref()).await?;
+                            restore_bypass_destination(&mut info, virtual_dns.as_ref(), direct_dns_fallback, direct_bind.as_ref()).await?;
                             #[cfg(windows)]
                             if !local_multicast && let Some(policy) = udp_policy {
                                 let flow = tokio::time::timeout(udp_setup_timeout, udp_bypass.open(info.src, info.dst, policy))
@@ -1336,7 +1339,12 @@ where
                             } else {
                                 None
                             };
-                            restore_direct_udp_destination(&mut info, domain_name.as_deref(), dns_addr, &mgr, &socket_queue, dns_bind)
+                            let resolver = if proxy_type == ProxyType::None {
+                                direct_dns_fallback
+                            } else {
+                                dns_addr
+                            };
+                            restore_direct_udp_destination(&mut info, domain_name.as_deref(), resolver, &mgr, &socket_queue, dns_bind)
                                 .await?;
                             let proxy_handler = no_proxy_mgr.new_proxy_handler(info, None, true).await?;
                             return handle_udp_associate_session(
